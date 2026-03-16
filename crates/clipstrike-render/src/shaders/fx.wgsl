@@ -6,8 +6,10 @@ struct FxUniforms {
     contrast: f32,
     saturation: f32,
     alpha: f32,
-    grayscale: f32, // 0.0 to 1.0
-    blur_radius: f32, // 0.0 to 10.0
+    grayscale: f32,
+    blur_radius: f32,
+    pixelate_size: f32,
+    color_tint: vec3<f32>,
     transform: mat4x4<f32>,
 }
 @group(0) @binding(2) var<uniform> uniforms: FxUniforms;
@@ -19,13 +21,19 @@ fn luma(color: vec3<f32>) -> f32 {
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let dims = textureDimensions(t_in);
-    let coords = vec2<i32>(global_id.xy);
+    var coords = vec2<i32>(global_id.xy);
 
     if (coords.x >= i32(dims.x) || coords.y >= i32(dims.y)) {
         return;
     }
 
-    // Task 10.9: Simple Box Blur (Approximation of Gaussian for performance)
+    // Task 10.13: Pixelate
+    if (uniforms.pixelate_size > 1.0) {
+        let p_size = i32(uniforms.pixelate_size);
+        coords = (coords / p_size) * p_size;
+    }
+
+    // Task 10.9: Blur (current box blur, optimization pending)
     var color = vec3<f32>(0.0);
     var total_weight = 0.0;
     let radius = i32(uniforms.blur_radius);
@@ -45,6 +53,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     } else {
         color = textureLoad(t_in, coords, 0).rgb;
     }
+
+    // Task 10.4: Color Correction (Tint)
+    color = color * uniforms.color_tint;
 
     // Apply brightness
     color = color * uniforms.brightness;

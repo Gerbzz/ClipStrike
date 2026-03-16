@@ -15,8 +15,7 @@ pub struct Keyframe {
     pub value: f32,
     pub mode: InterpolationMode,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct KeyframedProperty {
     pub keyframes: Vec<Keyframe>,
     pub default_value: f32,

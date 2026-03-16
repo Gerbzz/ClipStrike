@@ -156,15 +156,24 @@ enum AnimatedProperty {
     Rotation,
     Opacity,
     Speed,
+    PixelateSize,
+    ColorTintR,
+    ColorTintG,
+    ColorTintB,
 }
 
 impl AnimatedProperty {
-    const VISUALS: [Self; 5] = [
+    pub const COLOR_TINT_B: Self = Self::ColorTintB;
+    pub const VISUALS: [Self; 9] = [
         Self::Brightness,
         Self::Contrast,
         Self::Saturation,
         Self::Grayscale,
         Self::BlurRadius,
+        Self::PixelateSize,
+        Self::ColorTintR,
+        Self::ColorTintG,
+        Self::ColorTintB,
     ];
     const AUDIO: [Self; 1] = [Self::Volume];
     const TRANSFORMS: [Self; 6] = [
@@ -192,6 +201,10 @@ impl AnimatedProperty {
             Self::Rotation => "Rotation",
             Self::Opacity => "Opacity",
             Self::Speed => "Speed",
+            Self::PixelateSize => "Pixelate Size",
+            Self::ColorTintR => "Tint Red",
+            Self::ColorTintG => "Tint Green",
+            Self::ColorTintB => "Tint Blue",
         }
     }
 
@@ -205,6 +218,8 @@ impl AnimatedProperty {
             Self::ScaleX | Self::ScaleY => (0.0, 5.0),
             Self::Rotation => (-180.0, 180.0),
             Self::Speed => (0.0, 4.0),
+            Self::PixelateSize => (1.0, 100.0),
+            Self::ColorTintR | Self::ColorTintG | Self::ColorTintB => (0.0, 2.0),
         }
     }
 }
@@ -224,6 +239,10 @@ fn property_ref(clip: &Clip, property: AnimatedProperty) -> &KeyframedProperty {
         AnimatedProperty::Rotation => &clip.rotation,
         AnimatedProperty::Opacity => &clip.opacity,
         AnimatedProperty::Speed => &clip.speed,
+        AnimatedProperty::PixelateSize => &clip.pixelate_size,
+        AnimatedProperty::ColorTintR => &clip.color_tint_r,
+        AnimatedProperty::ColorTintG => &clip.color_tint_g,
+        AnimatedProperty::ColorTintB => &clip.color_tint_b,
     }
 }
 
@@ -242,6 +261,10 @@ fn property_mut(clip: &mut Clip, property: AnimatedProperty) -> &mut KeyframedPr
         AnimatedProperty::Rotation => &mut clip.rotation,
         AnimatedProperty::Opacity => &mut clip.opacity,
         AnimatedProperty::Speed => &mut clip.speed,
+        AnimatedProperty::PixelateSize => &mut clip.pixelate_size,
+        AnimatedProperty::ColorTintR => &mut clip.color_tint_r,
+        AnimatedProperty::ColorTintG => &mut clip.color_tint_g,
+        AnimatedProperty::ColorTintB => &mut clip.color_tint_b,
     }
 }
 
@@ -784,6 +807,12 @@ impl ClipStrikeApp {
             saturation: clip.saturation.get_value_at(self.playhead_ms),
             grayscale: clip.grayscale.get_value_at(self.playhead_ms),
             blur_radius: clip.blur_radius.get_value_at(self.playhead_ms),
+            pixelate_size: clip.pixelate_size.get_value_at(self.playhead_ms),
+            color_tint: [
+                clip.color_tint_r.get_value_at(self.playhead_ms),
+                clip.color_tint_g.get_value_at(self.playhead_ms),
+                clip.color_tint_b.get_value_at(self.playhead_ms),
+            ],
             alpha: clip.opacity.get_value_at(self.playhead_ms),
             ..Default::default()
         };
@@ -1688,6 +1717,10 @@ impl eframe::App for ClipStrikeApp {
                                 rotation: KeyframedProperty::new(0.0),
                                 opacity: KeyframedProperty::new(1.0),
                                 speed: KeyframedProperty::new(1.0),
+                                pixelate_size: KeyframedProperty::new(1.0),
+                                color_tint_r: KeyframedProperty::new(1.0),
+                                color_tint_g: KeyframedProperty::new(1.0),
+                                color_tint_b: KeyframedProperty::new(1.0),
                                 reverse: false,
                                 freeze_frame_ms: None,
                                 audio_enabled: false,
@@ -1750,6 +1783,10 @@ impl eframe::App for ClipStrikeApp {
                             rotation: KeyframedProperty::new(0.0),
                             opacity: KeyframedProperty::new(1.0),
                             speed: KeyframedProperty::new(1.0),
+                            pixelate_size: KeyframedProperty::new(1.0),
+                            color_tint_r: KeyframedProperty::new(1.0),
+                            color_tint_g: KeyframedProperty::new(1.0),
+                            color_tint_b: KeyframedProperty::new(1.0),
                             reverse: false,
                             freeze_frame_ms: None,
                             audio_enabled: false,
@@ -2482,7 +2519,12 @@ impl eframe::App for ClipStrikeApp {
                                                 rotation: KeyframedProperty::new(0.0),
                                                 opacity: KeyframedProperty::new(1.0),
                                                 speed: KeyframedProperty::new(1.0),
+                                                pixelate_size: KeyframedProperty::new(1.0),
+                                                color_tint_r: KeyframedProperty::new(1.0),
+                                                color_tint_g: KeyframedProperty::new(1.0),
+                                                color_tint_b: KeyframedProperty::new(1.0),
                                                 reverse: false,
+
                                                 freeze_frame_ms: None,
                                                 audio_enabled: true,
                                                 video_enabled: true,
@@ -2551,7 +2593,12 @@ impl eframe::App for ClipStrikeApp {
                                                     rotation: KeyframedProperty::new(0.0),
                                                     opacity: KeyframedProperty::new(1.0),
                                                     speed: KeyframedProperty::new(1.0),
+                                                    pixelate_size: KeyframedProperty::new(1.0),
+                                                    color_tint_r: KeyframedProperty::new(1.0),
+                                                    color_tint_g: KeyframedProperty::new(1.0),
+                                                    color_tint_b: KeyframedProperty::new(1.0),
                                                     reverse: false,
+
                                                     freeze_frame_ms: None,
                                                     audio_enabled: false,
                                                     video_enabled: true,
@@ -3076,7 +3123,12 @@ impl eframe::App for ClipStrikeApp {
                                         rotation: KeyframedProperty::new(0.0),
                                         opacity: KeyframedProperty::new(1.0),
                                         speed: KeyframedProperty::new(1.0),
+                                        pixelate_size: KeyframedProperty::new(1.0),
+                                        color_tint_r: KeyframedProperty::new(1.0),
+                                        color_tint_g: KeyframedProperty::new(1.0),
+                                        color_tint_b: KeyframedProperty::new(1.0),
                                         reverse: false,
+
                                         freeze_frame_ms: None,
                                         audio_enabled: false,
                                         video_enabled: true,
@@ -3219,7 +3271,12 @@ impl eframe::App for ClipStrikeApp {
                                                 rotation: KeyframedProperty::new(0.0),
                                                 opacity: KeyframedProperty::new(1.0),
                                                 speed: KeyframedProperty::new(1.0),
+                                                pixelate_size: KeyframedProperty::new(1.0),
+                                                color_tint_r: KeyframedProperty::new(1.0),
+                                                color_tint_g: KeyframedProperty::new(1.0),
+                                                color_tint_b: KeyframedProperty::new(1.0),
                                                 reverse: false,
+
                                                 freeze_frame_ms: None,
                                                 audio_enabled: false,
                                                 video_enabled: true,
@@ -3408,7 +3465,12 @@ impl eframe::App for ClipStrikeApp {
                                                 rotation: KeyframedProperty::new(0.0),
                                                 opacity: KeyframedProperty::new(1.0),
                                                 speed: KeyframedProperty::new(1.0),
+                                                pixelate_size: KeyframedProperty::new(1.0),
+                                                color_tint_r: KeyframedProperty::new(1.0),
+                                                color_tint_g: KeyframedProperty::new(1.0),
+                                                color_tint_b: KeyframedProperty::new(1.0),
                                                 reverse: false,
+
                                                 freeze_frame_ms: None,
                                                 audio_enabled: false,
                                                 video_enabled: true,
@@ -4037,7 +4099,12 @@ mod tests {
             rotation: KeyframedProperty::new(0.0),
             opacity: KeyframedProperty::new(1.0),
             speed: KeyframedProperty::new(1.0),
+            pixelate_size: KeyframedProperty::new(1.0),
+            color_tint_r: KeyframedProperty::new(1.0),
+            color_tint_g: KeyframedProperty::new(1.0),
+            color_tint_b: KeyframedProperty::new(1.0),
             reverse: false,
+
             freeze_frame_ms: None,
             audio_enabled: false,
             video_enabled: true,

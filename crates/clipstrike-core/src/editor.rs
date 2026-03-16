@@ -5,7 +5,7 @@ use crate::commands::{
 };
 use crate::keyframes::{InterpolationMode, KeyframedProperty};
 use crate::project::{Marker, MarkerToggleResult, MediaAsset, Project, TransitionMaskAsset};
-use crate::timeline::{Clip, Timeline};
+use crate::timeline::{Clip, Timeline, BlendMode};
 use crate::transitions::{TransitionType, fade_in_points, fade_out_points};
 
 pub struct EditorSession {
@@ -101,6 +101,7 @@ impl EditorSession {
             id: rand::random::<usize>(),
             asset_id,
             track_id,
+            blend_mode: BlendMode::Normal,
             start,
             end,
             brightness: KeyframedProperty::new(1.0),
@@ -116,17 +117,24 @@ impl EditorSession {
             rotation: KeyframedProperty::new(0.0),
             opacity: KeyframedProperty::new(1.0),
             speed: KeyframedProperty::new(1.0),
+            pixelate_size: KeyframedProperty::new(1.0),
+            color_tint_r: KeyframedProperty::new(1.0),
+            color_tint_g: KeyframedProperty::new(1.0),
+            color_tint_b: KeyframedProperty::new(1.0),
             reverse: false,
             freeze_frame_ms: None,
             audio_enabled: true,
             video_enabled: true,
+            stabilization_enabled: false,
+            motion_tracking_enabled: false,
+            object_detection_enabled: false,
         }
     }
 
     pub fn add_clip(&mut self, clip: Clip) -> usize {
         let clip_id = clip.id;
         self.undo_stack
-            .push(Box::new(AddClipCommand { clip }), &mut self.timeline);
+            .push(Box::new(AddClipCommand { clip }), &mut self.project, &mut self.timeline);
         clip_id
     }
 
@@ -139,7 +147,7 @@ impl EditorSession {
             .cloned()
             .ok_or_else(|| format!("Clip {clip_id} not found"))?;
         self.undo_stack
-            .push(Box::new(RemoveClipCommand { clip }), &mut self.timeline);
+            .push(Box::new(RemoveClipCommand { clip }), &mut self.project, &mut self.timeline);
         Ok(())
     }
 
@@ -164,6 +172,7 @@ impl EditorSession {
                 new_start,
                 new_end,
             }),
+            &mut self.project,
             &mut self.timeline,
         );
         Ok(())
@@ -190,17 +199,18 @@ impl EditorSession {
                 new_start,
                 new_end,
             }),
+            &mut self.project,
             &mut self.timeline,
         );
         Ok(())
     }
 
     pub fn undo(&mut self) {
-        self.undo_stack.undo(&mut self.timeline);
+        self.undo_stack.undo(&mut self.project, &mut self.timeline);
     }
 
     pub fn redo(&mut self) {
-        self.undo_stack.redo(&mut self.timeline);
+        self.undo_stack.redo(&mut self.project, &mut self.timeline);
     }
 
     pub fn apply_track_mutation<F>(&mut self, mutate: F) -> Result<(), String>
@@ -420,6 +430,7 @@ mod tests {
             id,
             asset_id: id,
             track_id,
+            blend_mode: BlendMode::Normal,
             start,
             end,
             brightness: KeyframedProperty::new(1.0),
@@ -435,10 +446,17 @@ mod tests {
             rotation: KeyframedProperty::new(0.0),
             opacity: KeyframedProperty::new(1.0),
             speed: KeyframedProperty::new(1.0),
+            pixelate_size: KeyframedProperty::new(1.0),
+            color_tint_r: KeyframedProperty::new(1.0),
+            color_tint_g: KeyframedProperty::new(1.0),
+            color_tint_b: KeyframedProperty::new(1.0),
             reverse: false,
             freeze_frame_ms: None,
             audio_enabled: true,
             video_enabled: true,
+            stabilization_enabled: false,
+            motion_tracking_enabled: false,
+            object_detection_enabled: false,
         }
     }
 
