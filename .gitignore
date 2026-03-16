@@ -1,0 +1,20 @@
+/target
+
+# Node
+node_modules/
+.npm-cache/
+
+# Logs and Build artifacts
+*.log
+*.tmp
+*.msi
+*.zip
+gst_extracted/
+test-results/
+
+# Temporary check/output files
+*_check*.txt
+build_*.txt
+test_out.txt
+test_results.txt
+final_*.txt

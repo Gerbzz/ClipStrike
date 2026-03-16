@@ -1,0 +1,18 @@
+[package]
+name = "clipstrike-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+gstreamer-backend = [
+    "dep:glib",
+    "dep:gstreamer",
+    "dep:gstreamer-app",
+]
+
+[dependencies]
+glib = { workspace = true, optional = true }
+gstreamer = { workspace = true, optional = true }
+gstreamer-app = { workspace = true, optional = true }

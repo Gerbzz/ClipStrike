@@ -1,0 +1,30 @@
+[package]
+name = "clipstrike-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+gstreamer-backend = [
+    "dep:glib",
+    "dep:gstreamer",
+    "dep:gstreamer-video",
+    "dep:gstreamer-app",
+    "dep:gstreamer-pbutils",
+]
+
+[dependencies]
+clipstrike-core = { path = "../clipstrike-core" }
+clipstrike-render = { path = "../clipstrike-render" }
+log.workspace = true
+wgpu.workspace = true
+glib = { workspace = true, optional = true }
+gstreamer = { workspace = true, optional = true }
+gstreamer-video = { workspace = true, optional = true }
+gstreamer-app = { workspace = true, optional = true }
+gstreamer-pbutils = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon.workspace = true
+tokio.workspace = true

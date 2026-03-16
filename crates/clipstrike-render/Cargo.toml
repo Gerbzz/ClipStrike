@@ -1,0 +1,11 @@
+[package]
+name = "clipstrike-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+eframe.workspace = true
+glam.workspace = true
+wgpu.workspace = true
