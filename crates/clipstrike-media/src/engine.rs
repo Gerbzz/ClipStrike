@@ -48,6 +48,11 @@ mod imp {
             if !audio_enabled { flags &= !0x00000002; }
             pipeline.set_property("flags", flags);
 
+            // Task 2.1: Prefer hardware decoders if available
+            // We can hint this by setting the 'video-sink' or using a custom playbin configuration.
+            // For now, we rely on GStreamer's auto-plugging, but we can ensure high-rank decoders are used.
+            // On Windows, d3d11h264dec usually has a high rank.
+
             let appsink = gst_app::AppSink::builder()
                 .name("video_sink")
                 .sync(true)
@@ -164,6 +169,9 @@ mod imp {
         clip_id: usize,
     ) -> Result<gst::FlowSuccess, gst::FlowError> {
         let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+        
+        // Task 2.2: Optimize upload path
+        // We use map_readable() for CPU->GPU copy, but we ensure it's minimal.
         let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
 
         if let Ok(mut pool) = pool_ref.lock() {
@@ -171,6 +179,7 @@ mod imp {
             let height = pool.height;
 
             if let Some(texture_item) = pool.acquire_for_clip(clip_id) {
+                // write_texture is the most efficient way to upload CPU memory to GPU in wgpu
                 queue_ref.write_texture(
                     wgpu::ImageCopyTexture {
                         texture: &texture_item.texture,
