@@ -8,6 +8,35 @@ fn default_clip_speed() -> KeyframedProperty {
     KeyframedProperty::new(1.0)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Copy)]
+#[repr(u32)]
+pub enum BlendMode {
+    Normal = 0,
+    Multiply = 1,
+    Screen = 2,
+    Overlay = 3,
+    Darken = 4,
+    Lighten = 5,
+    ColorDodge = 6,
+    ColorBurn = 7,
+    HardLight = 8,
+    SoftLight = 9,
+    Difference = 10,
+    Exclusion = 11,
+    Hue = 12,
+    Saturation = 13,
+    Color = 14,
+    Luminosity = 15,
+    Add = 16,
+    Subtract = 17,
+}
+
+impl Default for BlendMode {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
 /// Represents a video clip or timeline element with a start and end time.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Clip {
@@ -16,6 +45,9 @@ pub struct Clip {
     pub track_id: usize, // Represents Z-order layering
     pub start: i64,
     pub end: i64,
+
+    #[serde(default)]
+    pub blend_mode: BlendMode,
 
     // Keyframed Properties (Phase 9)
     pub brightness: KeyframedProperty,
@@ -40,6 +72,14 @@ pub struct Clip {
     pub audio_enabled: bool,
     #[serde(default = "default_enabled")]
     pub video_enabled: bool,
+
+    // AI & Computer Vision (Phase 21)
+    #[serde(default)]
+    pub stabilization_enabled: bool,
+    #[serde(default)]
+    pub motion_tracking_enabled: bool,
+    #[serde(default)]
+    pub object_detection_enabled: bool,
 }
 
 fn default_enabled() -> bool {
@@ -499,6 +539,7 @@ impl Timeline {
                 id: rand::random::<usize>(),
                 asset_id: clip.asset_id,
                 track_id: clip.track_id,
+                blend_mode: BlendMode::Normal,
                 start: clip.start,
                 end: split_at,
                 brightness: clip.brightness.clone(),
@@ -518,6 +559,9 @@ impl Timeline {
                 freeze_frame_ms: clip.freeze_frame_ms,
                 audio_enabled: clip.audio_enabled,
                 video_enabled: clip.video_enabled,
+                stabilization_enabled: false,
+                motion_tracking_enabled: false,
+                object_detection_enabled: false,
             });
 
             // Add part 2
@@ -525,6 +569,7 @@ impl Timeline {
                 id: rand::random::<usize>(),
                 asset_id: clip.asset_id,
                 track_id: clip.track_id,
+                blend_mode: BlendMode::Normal,
                 start: split_at,
                 end: clip.end,
                 brightness: clip.brightness.clone(),
@@ -544,6 +589,9 @@ impl Timeline {
                 freeze_frame_ms: clip.freeze_frame_ms,
                 audio_enabled: clip.audio_enabled,
                 video_enabled: clip.video_enabled,
+                stabilization_enabled: false,
+                motion_tracking_enabled: false,
+                object_detection_enabled: false,
             });
 
             Ok(())
@@ -664,6 +712,7 @@ mod tests {
             id: 1,
             asset_id: 0,
             track_id: 1,
+            blend_mode: BlendMode::Normal,
             start: 10,
             end: 50,
             brightness: KeyframedProperty::new(1.0),
@@ -683,11 +732,15 @@ mod tests {
             freeze_frame_ms: None,
             audio_enabled: true,
             video_enabled: true,
+            stabilization_enabled: false,
+            motion_tracking_enabled: false,
+            object_detection_enabled: false,
         });
         tree.insert(Clip {
             id: 2,
             asset_id: 0,
             track_id: 1,
+            blend_mode: BlendMode::Normal,
             start: 20,
             end: 40,
             brightness: KeyframedProperty::new(1.0),
@@ -707,12 +760,16 @@ mod tests {
             freeze_frame_ms: None,
             audio_enabled: true,
             video_enabled: true,
+            stabilization_enabled: false,
+            motion_tracking_enabled: false,
+            object_detection_enabled: false,
             }
 );
         tree.insert(Clip {
             id: 3,
             asset_id: 0,
             track_id: 1,
+            blend_mode: BlendMode::Normal,
             start: 45,
             end: 60,
             brightness: KeyframedProperty::new(1.0),
@@ -732,12 +789,16 @@ mod tests {
             freeze_frame_ms: None,
             audio_enabled: true,
             video_enabled: true,
+            stabilization_enabled: false,
+            motion_tracking_enabled: false,
+            object_detection_enabled: false,
             }
 );
         tree.insert(Clip {
             id: 4,
             asset_id: 0,
             track_id: 1,
+            blend_mode: BlendMode::Normal,
             start: 5,
             end: 15,
             brightness: KeyframedProperty::new(1.0),
@@ -757,6 +818,9 @@ mod tests {
             freeze_frame_ms: None,
             audio_enabled: true,
             video_enabled: true,
+            stabilization_enabled: false,
+            motion_tracking_enabled: false,
+            object_detection_enabled: false,
             }
 );
 
@@ -793,6 +857,7 @@ mod tests {
             id: 1,
             asset_id: 0,
             track_id: 1,
+            blend_mode: BlendMode::Normal,
             start: 150,
             end: 850,
             brightness: KeyframedProperty::new(1.0),
@@ -812,6 +877,9 @@ mod tests {
             freeze_frame_ms: None,
             audio_enabled: true,
             video_enabled: true,
+            stabilization_enabled: false,
+            motion_tracking_enabled: false,
+            object_detection_enabled: false,
         };
         engine.add_clip(&clip);
 
@@ -911,6 +979,7 @@ mod tests {
             id,
             asset_id: 0,
             track_id,
+            blend_mode: BlendMode::Normal,
             start,
             end,
             brightness: KeyframedProperty::new(1.0),
@@ -930,6 +999,9 @@ mod tests {
             freeze_frame_ms: None,
             audio_enabled: true,
             video_enabled: true,
+            stabilization_enabled: false,
+            motion_tracking_enabled: false,
+            object_detection_enabled: false,
         }
     }
 
