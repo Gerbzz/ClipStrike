@@ -1,4 +1,49 @@
 use std::path::{Path, PathBuf};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ExportFormat {
+    MP4,
+    WebM,
+    MOV,
+    MKV,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum VideoCodec {
+    H264,
+    H265,
+    VP9,
+    AV1,
+    ProRes,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExportSettings {
+    pub format: ExportFormat,
+    pub codec: VideoCodec,
+    pub width: u32,
+    pub height: u32,
+    pub fps_num: i32,
+    pub fps_den: i32,
+    pub bitrate_kbps: u32,
+    pub use_hardware_acceleration: bool,
+}
+
+impl Default for ExportSettings {
+    fn default() -> Self {
+        Self {
+            format: ExportFormat::MP4,
+            codec: VideoCodec::H264,
+            width: 1920,
+            height: 1080,
+            fps_num: 30,
+            fps_den: 1,
+            bitrate_kbps: 8000,
+            use_hardware_acceleration: true,
+        }
+    }
+}
 
 #[cfg(feature = "gstreamer-backend")]
 mod imp {
