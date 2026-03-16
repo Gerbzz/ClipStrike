@@ -1,4 +1,4 @@
-use crate::timeline::{Clip, Timeline};
+use crate::timeline::{Clip, Timeline, BlendMode};
 use crate::transitions::Transition;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -45,6 +45,9 @@ pub enum TitleTemplate {
     Centered,
     LowerThird,
     TopLeft,
+    EndCredits,
+    Subtitle,
+    Watermark,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -353,6 +356,7 @@ mod tests {
             id,
             asset_id: id,
             track_id,
+            blend_mode: BlendMode::Normal,
             start,
             end,
             brightness: KeyframedProperty::new(1.0),
@@ -372,6 +376,9 @@ mod tests {
             freeze_frame_ms: None,
             audio_enabled: true,
             video_enabled: true,
+            stabilization_enabled: false,
+            motion_tracking_enabled: false,
+            object_detection_enabled: false,
         }
     }
 
