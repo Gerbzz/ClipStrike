@@ -12,12 +12,15 @@ gstreamer-backend = [
     "dep:gstreamer-video",
     "dep:gstreamer-app",
     "dep:gstreamer-pbutils",
+    "clipstrike-audio/gstreamer-backend",
 ]
 
 [dependencies]
 clipstrike-core = { path = "../clipstrike-core" }
 clipstrike-render = { path = "../clipstrike-render" }
+clipstrike-audio = { path = "../clipstrike-audio" }
 log.workspace = true
+bytemuck = "1.21"
 wgpu.workspace = true
 glib = { workspace = true, optional = true }
 gstreamer = { workspace = true, optional = true }

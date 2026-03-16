@@ -11,6 +11,8 @@ mod imp {
     pub struct VideoEngine {
         pipeline: gst::Pipeline,
         appsink: AppSink,
+        audio_appsink: Option<AppSink>,
+        audio_samples: Arc<Mutex<Vec<f32>>>,
         texture_pool: Arc<Mutex<TexturePool>>,
         queue: Arc<wgpu::Queue>,
         clip_id: usize,
@@ -87,9 +89,33 @@ mod imp {
                 })
                 .map_err(|_| "Failed to add bus watch".to_string())?;
 
+            let mut audio_appsink = None;
+            let audio_samples = Arc::new(Mutex::new(Vec::new()));
+
+            if audio_enabled {
+                let sink = gst_app::AppSink::builder()
+                    .name("audio_sink")
+                    .sync(true)
+                    .max_buffers(10)
+                    .drop(true)
+                    .caps(
+                        &gst::Caps::builder("audio/x-raw")
+                            .field("format", "F32LE")
+                            .field("layout", "interleaved")
+                            .field("channels", 2)
+                            .field("rate", 44100)
+                            .build(),
+                    )
+                    .build();
+                pipeline.set_property("audio-sink", &sink);
+                audio_appsink = Some(sink);
+            }
+
             let engine = Self {
                 pipeline,
                 appsink,
+                audio_appsink,
+                audio_samples,
                 texture_pool,
                 queue,
                 clip_id,
@@ -120,6 +146,27 @@ mod imp {
                     })
                     .build(),
             );
+
+            if let Some(audio_sink) = &self.audio_appsink {
+                let samples_ref = Arc::clone(&self.audio_samples);
+                audio_sink.set_callbacks(
+                    gst_app::AppSinkCallbacks::builder()
+                        .new_sample(move |sink| {
+                            let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                            let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+                            let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+                            
+                            // Convert bytes to f32 samples
+                            let f32_samples: &[f32] = bytemuck::cast_slice(&map);
+                            if let Ok(mut samples) = samples_ref.lock() {
+                                samples.extend_from_slice(f32_samples);
+                            }
+                            
+                            Ok(gst::FlowSuccess::Ok)
+                        })
+                        .build(),
+                );
+            }
         }
 
         pub fn play(&self) -> Result<(), String> {
@@ -153,6 +200,14 @@ mod imp {
         pub fn set_volume(&self, volume: f64) -> Result<(), String> {
             self.pipeline.set_property("volume", volume.clamp(0.0, 4.0));
             Ok(())
+        }
+
+        pub fn get_audio_samples(&self) -> Arc<Vec<f32>> {
+            if let Ok(samples) = self.audio_samples.lock() {
+                Arc::new(samples.clone())
+            } else {
+                Arc::new(Vec::new())
+            }
         }
     }
 

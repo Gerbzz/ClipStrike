@@ -2,7 +2,7 @@ use crate::app_config::{AppConfig, ProjectProfile, ThemePreference};
 use clipstrike_audio::waveform::extract_waveform_sync;
 use clipstrike_media::engine_manager::EngineManager;
 use clipstrike_media::probe::probe_metadata_sync;
-use clipstrike_render::fx::{FxPipeline, FxUniforms};
+use clipstrike_render::fx::{FxPipeline, FxUniforms, CompositorPipeline, ComposeUniforms};
 use clipstrike_render::gpu::{FrameTexture, TexturePool, read_texture_rgba};
 use clipstrike_core::clip_defaults::timeline_clip_end_ms;
 use clipstrike_core::commands::{
@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 const TRACK_HEADER_WIDTH: f32 = 132.0;
 const TIMELINE_CONTENT_OFFSET_X: f32 = TRACK_HEADER_WIDTH + 16.0;
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 pub enum LeftPanelTab {
     ProjectFiles,
     Transitions,
@@ -53,14 +53,23 @@ pub struct ClipStrikeApp {
     undo_stack: UndoStack,
 
     // Engine & GPU Integration
-    device: Arc<wgpu::Device>,
-    queue: Arc<wgpu::Queue>,
-    engine_manager: EngineManager,
-    fx_pipeline: FxPipeline,
-    texture_pool: Arc<Mutex<TexturePool>>,
-    _fx_output_texture: wgpu::Texture,
-    fx_output_view: wgpu::TextureView,
-    fx_output_id: egui::TextureId,
+    device: Option<Arc<wgpu::Device>>,
+    queue: Option<Arc<wgpu::Queue>>,
+    engine_manager: Option<EngineManager>,
+    audio_engine: Option<clipstrike_audio::PlaybackEngine>,
+    fx_pipeline: Option<FxPipeline>,
+    compositor_pipeline: Option<CompositorPipeline>,
+    texture_pool: Option<Arc<Mutex<TexturePool>>>,
+    _fx_output_texture: Option<wgpu::Texture>,
+    fx_output_view: Option<wgpu::TextureView>,
+    fx_output_id: Option<egui::TextureId>,
+    
+    // Compositor accumulators
+    _accumulator_texture: Option<wgpu::Texture>,
+    accumulator_view: Option<wgpu::TextureView>,
+    accumulator_id: Option<egui::TextureId>,
+    _scratch_texture: Option<wgpu::Texture>,
+    scratch_view: Option<wgpu::TextureView>,
 
     // Playback & Selection state
     is_playing: bool,
@@ -95,6 +104,13 @@ pub struct ClipStrikeApp {
     show_profile_dialog: bool,
     track_name_edit_id: Option<usize>,
     track_name_buffer: String,
+
+    // Test Hooks Bounding Boxes
+    test_first_track_rect: Option<egui::Rect>,
+    test_first_asset_rect: Option<egui::Rect>,
+    test_first_clip_rect: Option<egui::Rect>,
+    test_first_title_rect: Option<egui::Rect>,
+    test_project_json_dump: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -243,54 +259,137 @@ impl ClipStrikeApp {
                 .send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
         }
 
-        let wgpu_render_state = cc
-            .wgpu_render_state
-            .as_ref()
-            .expect("WGPU render state required");
-        let device = wgpu_render_state.device.clone();
-        let queue = wgpu_render_state.queue.clone();
+        let (
+            device,
+            queue,
+            texture_pool,
+            _fx_output_texture,
+            fx_output_view,
+            fx_output_id,
+            fx_pipeline,
+            compositor_pipeline,
+            _accumulator_texture,
+            accumulator_view,
+            accumulator_id,
+            _scratch_texture,
+            scratch_view,
+            engine_manager,
+            audio_engine,
+        ) = if let Some(wgpu_render_state) = cc.wgpu_render_state.as_ref() {
+            let device = wgpu_render_state.device.clone();
+            let queue = wgpu_render_state.queue.clone();
 
-        let mut pool = TexturePool::new(
-            device.clone(),
-            wgpu::TextureFormat::Rgba8Unorm,
-            1920,
-            1080,
-            10,
-        );
+            let mut pool = TexturePool::new(
+                device.clone(),
+                wgpu::TextureFormat::Rgba8Unorm,
+                1920,
+                1080,
+                10,
+            );
 
-        {
-            let mut renderer = wgpu_render_state.renderer.write();
-            for frame in pool.get_frames_mut() {
-                frame.egui_id = Some(renderer.register_native_texture(
-                    &device,
-                    &frame.view,
-                    wgpu::FilterMode::Linear,
-                ));
+            {
+                let mut renderer = wgpu_render_state.renderer.write();
+                for frame in pool.get_frames_mut() {
+                    frame.egui_id = Some(renderer.register_native_texture(
+                        &device,
+                        &frame.view,
+                        wgpu::FilterMode::Linear,
+                    ));
+                }
             }
-        }
 
-        let texture_pool = Arc::new(Mutex::new(pool));
+            let texture_pool = Arc::new(Mutex::new(pool));
 
-        let fx_output_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("FxPreviewTexture"),
-            size: wgpu::Extent3d {
-                width: 1920,
-                height: 1080,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let fx_output_view = fx_output_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let fx_output_id = {
-            let mut renderer = wgpu_render_state.renderer.write();
-            renderer.register_native_texture(&device, &fx_output_view, wgpu::FilterMode::Linear)
+            let fx_output_texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("FxPreviewTexture"),
+                size: wgpu::Extent3d {
+                    width: 1920,
+                    height: 1080,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let fx_output_view = fx_output_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let fx_output_id = {
+                let mut renderer = wgpu_render_state.renderer.write();
+                renderer.register_native_texture(&device, &fx_output_view, wgpu::FilterMode::Linear)
+            };
+
+            let accum_texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Compositor Accumulator"),
+                size: wgpu::Extent3d {
+                    width: 1920,
+                    height: 1080,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let accum_view = accum_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let accum_id = {
+                let mut renderer = wgpu_render_state.renderer.write();
+                renderer.register_native_texture(&device, &accum_view, wgpu::FilterMode::Linear)
+            };
+
+            let scratch_texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Compositor Scratch"),
+                size: wgpu::Extent3d {
+                    width: 1920,
+                    height: 1080,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let scratch_view = scratch_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            
+            let fx_pipeline = FxPipeline::new(&device);
+            let compositor_pipeline = CompositorPipeline::new(&device);
+            let engine_manager = EngineManager::new(Arc::clone(&texture_pool), queue.clone());
+            let audio_engine = clipstrike_audio::PlaybackEngine::new().ok();
+
+            (
+                Some(device),
+                Some(queue),
+                Some(texture_pool),
+                Some(fx_output_texture),
+                Some(fx_output_view),
+                Some(fx_output_id),
+                Some(fx_pipeline),
+                Some(compositor_pipeline),
+                Some(accum_texture),
+                Some(accum_view),
+                Some(accum_id),
+                Some(scratch_texture),
+                Some(scratch_view),
+                Some(engine_manager),
+                audio_engine,
+            )
+        } else {
+            (None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
         };
 
         let profile = app_config.default_project_profile.clone();
@@ -303,6 +402,13 @@ impl ClipStrikeApp {
         project.tracks = Project::default_tracks(5);
         let master_volume = project.master_volume;
 
+        // Improve readability by increasing default font size
+        let mut style = (*cc.egui_ctx.style()).clone();
+        for font_id in style.text_styles.values_mut() {
+            font_id.size *= 1.15; // 15% larger text everywhere
+        }
+        cc.egui_ctx.set_style(style);
+
         Self {
             left_panel_tab: LeftPanelTab::ProjectFiles,
             zoom_level: 0.5,
@@ -311,14 +417,21 @@ impl ClipStrikeApp {
             project,
             current_project_path: None,
             undo_stack: UndoStack::new(),
-            device: device.clone(),
-            queue: queue.clone(),
-            engine_manager: EngineManager::new(Arc::clone(&texture_pool), queue),
-            fx_pipeline: FxPipeline::new(&device),
+            device,
+            queue,
+            engine_manager,
+            audio_engine,
+            fx_pipeline,
+            compositor_pipeline,
             texture_pool,
-            _fx_output_texture: fx_output_texture,
+            _fx_output_texture,
             fx_output_view,
             fx_output_id,
+            _accumulator_texture,
+            accumulator_view,
+            accumulator_id,
+            _scratch_texture,
+            scratch_view,
             is_playing: false,
             current_time_ms: 0,
             playhead_ms: 0,
@@ -331,6 +444,11 @@ impl ClipStrikeApp {
             drag_clip_id: None,
             drag_preview_times: None,
             trim_side: None,
+            test_first_track_rect: None,
+            test_first_asset_rect: None,
+            test_first_clip_rect: None,
+            test_first_title_rect: None,
+            test_project_json_dump: None,
             loop_enabled: false,
             loop_start_ms: 0,
             loop_end_ms: 10000,
@@ -409,7 +527,9 @@ impl ClipStrikeApp {
         self.drag_clip_id = None;
         self.drag_preview_times = None;
         self.trim_side = None;
-        self.engine_manager.remove_unused(&[]);
+        if let Some(engine_manager) = &mut self.engine_manager {
+            engine_manager.remove_unused(&[]);
+        }
     }
 
     fn new_project(&mut self) {
@@ -645,8 +765,19 @@ impl ClipStrikeApp {
         clip: &Clip,
         frame: &FrameTexture,
     ) -> Option<egui::TextureId> {
-        let _texture_id = frame.egui_id?;
+        let texture_id = frame.egui_id?;
         
+        let (device, queue, fx_pipeline, fx_output_view, fx_output_id) = match (
+            &self.device,
+            &self.queue,
+            &self.fx_pipeline,
+            &self.fx_output_view,
+            &self.fx_output_id,
+        ) {
+            (Some(d), Some(q), Some(fp), Some(fov), Some(fid)) => (d, q, fp, fov, fid),
+            _ => return Some(texture_id), // Fallback to raw texture if no GPU fx
+        };
+
         let params = FxUniforms {
             brightness: clip.brightness.get_value_at(self.playhead_ms),
             contrast: clip.contrast.get_value_at(self.playhead_ms),
@@ -657,14 +788,14 @@ impl ClipStrikeApp {
             ..Default::default()
         };
 
-        self.fx_pipeline.run(
-            &self.device,
-            &self.queue,
+        fx_pipeline.run(
+            device,
+            queue,
             &frame.view,
-            &self.fx_output_view,
+            fx_output_view,
             params,
         );
-        Some(self.fx_output_id)
+        Some(*fx_output_id)
     }
 
     fn transition_mask_image<'a>(&'a self, transition: &Transition) -> Option<MaskImageRef<'a>> {
@@ -774,9 +905,13 @@ impl ClipStrikeApp {
         }
     }
     fn save_current_frame_to_path(&self, path: &std::path::Path) -> Result<(), String> {
+        let texture_pool = self.texture_pool.as_ref().ok_or_else(|| "WGPU state missing".to_string())?;
+        let queue = self.queue.as_ref().ok_or_else(|| "WGPU state missing".to_string())?;
+        let device = self.device.as_ref().ok_or_else(|| "WGPU state missing".to_string())?;
+        let fx_output_texture = self._fx_output_texture.as_ref().ok_or_else(|| "WGPU state missing".to_string())?;
+
         let (frame_index, width, height) = {
-            let pool = self
-                .texture_pool
+            let pool = texture_pool
                 .lock()
                 .map_err(|_| "Failed to lock texture pool".to_string())?;
             let frame = pool
@@ -789,18 +924,17 @@ impl ClipStrikeApp {
 
         let pixels = if self.selected_clip_id.is_some() {
             read_texture_rgba(
-                &self.device,
-                &self.queue,
-                &self._fx_output_texture,
+                device,
+                queue,
+                fx_output_texture,
                 width,
                 height,
             )?
         } else {
-            let pool = self
-                .texture_pool
+            let pool = texture_pool
                 .lock()
                 .map_err(|_| "Failed to lock texture pool".to_string())?;
-            pool.read_frame(&self.queue, frame_index)?
+            pool.read_frame(queue, frame_index)?
         };
 
         let image = image::RgbaImage::from_raw(width, height, pixels)
@@ -1156,14 +1290,35 @@ impl ClipStrikeApp {
         (all_active_clips, visible_active_clips)
     }
 
+    fn blend_mode_to_u32(mode: clipstrike_core::timeline::BlendMode) -> u32 {
+        use clipstrike_core::timeline::BlendMode;
+        match mode {
+            BlendMode::Normal => 0,
+            BlendMode::Multiply => 1,
+            BlendMode::Screen => 2,
+            BlendMode::Overlay => 3,
+            BlendMode::Darken => 4,
+            BlendMode::Lighten => 5,
+            BlendMode::Add => 16,
+            BlendMode::Subtract => 17,
+            _ => 0, // Fallback to Normal
+        }
+    }
+
     fn sync_engines_for_playhead(&mut self, active_clips: &[Clip], seek_now: bool) {
+        let engine_manager = match &mut self.engine_manager {
+            Some(em) => em,
+            None => return,
+        };
         let active_ids: Vec<usize> = active_clips.iter().map(|clip| clip.id).collect();
-        self.engine_manager.remove_unused(&active_ids);
+        engine_manager.remove_unused(&active_ids);
+
+        let mut audio_sources = Vec::new();
 
         let mut created_engine = false;
         for clip in active_clips {
             if let Some(asset) = self.project.assets.iter().find(|a| a.id == clip.asset_id) {
-                match self.engine_manager.sync_clip(clip, &asset.uri) {
+                match engine_manager.sync_clip(clip, &asset.uri) {
                     Ok(created) => created_engine |= created,
                     Err(err) => log::error!("Failed to sync clip {}: {}", clip.id, err),
                 }
@@ -1174,17 +1329,34 @@ impl ClipStrikeApp {
                 0.0
             };
 
-            self.engine_manager.set_clip_volume(clip.id, volume);
+            engine_manager.set_clip_volume(clip.id, volume);
+
+            // Synchronize Audio Engine (Task 12.5, 12.1)
+            if self.project.is_track_audible(clip.track_id) && clip.audio_enabled {
+                let samples = engine_manager.get_audio_samples(clip.id);
+
+                audio_sources.push(clipstrike_audio::AudioSource {
+                    clip_id: clip.id,
+                    samples,
+                    start_ms: clip.start,
+                    end_ms: clip.end,
+                    volume: clip.volume.clone(),
+                });
+            }
+        }
+
+        if let Some(audio) = &self.audio_engine {
+            audio.set_sources(audio_sources);
         }
 
         if seek_now || created_engine {
-            self.engine_manager.seek_clips(active_clips, self.playhead_ms);
+            engine_manager.seek_clips(active_clips, self.playhead_ms);
         }
 
         if self.is_playing {
-            self.engine_manager.play_clips(&active_ids);
+            engine_manager.play_clips(&active_ids);
         } else {
-            self.engine_manager.pause_all();
+            engine_manager.pause_all();
         }
     }
 
@@ -1332,6 +1504,282 @@ impl ClipStrikeApp {
 
 impl eframe::App for ClipStrikeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Process incoming test commands
+            for cmd in crate::test_hooks::pop_commands() {
+                if cmd == "PLAY" {
+                    self.is_playing = true;
+                } else if cmd == "PAUSE" {
+                    self.is_playing = false;
+                } else if cmd == "ADD_TRACK" {
+                    self.undo_stack.push(Box::new(clipstrike_core::commands::AddTrackCommand { track_id: None }), &mut self.project, &mut self.timeline);
+                } else if cmd == "UNDO" {
+                    self.undo_stack.undo(&mut self.project, &mut self.timeline);
+                } else if cmd == "REDO" {
+                    self.undo_stack.redo(&mut self.project, &mut self.timeline);
+                } else if cmd == "ADD_TEST_ASSET" {
+                    self.project.assets.push(clipstrike_core::project::MediaAsset {
+                        id: 999,
+                        name: "TestVideo.mp4".to_string(),
+                        uri: "file:///test.mp4".to_string(),
+                        duration_ms: 5000,
+                        audio_levels: vec![],
+                    });
+                } else if cmd.starts_with("SEEK:") {
+                    if let Ok(time_ms) = cmd["SEEK:".len()..].parse::<i64>() {
+                        self.playhead_ms = time_ms;
+                        self.seek_playhead();
+                    }
+                } else if cmd == "RAZOR_CLIP" {
+                    if let Some(clip_id) = self.timeline.clips.first().map(|c| c.id) {
+                        let playhead = self.playhead_ms;
+                        self.undo_stack.push(
+                            Box::new(clipstrike_core::commands::RazorClipCommand {
+                                clip_id,
+                                split_at: playhead,
+                                original_clip: None,
+                                new_clip_id: None,
+                            }),
+                            &mut self.project,
+                            &mut self.timeline,
+                        );
+                    }
+                } else if cmd == "TRIM_CLIP" {
+                    if let Some(clip_id) = self.timeline.clips.first().map(|c| c.id) {
+                        let _ = self.undo_stack.push(
+                            Box::new(clipstrike_core::commands::TrimClipCommand {
+                                clip_id,
+                                old_start: 0,
+                                old_end: 5000,
+                                new_start: 1000,
+                                new_end: 4000,
+                            }),
+                            &mut self.project,
+                            &mut self.timeline,
+                        );
+                    }
+                } else if cmd == "ADD_COMPLEX_ASSETS" {
+                    self.project.assets.push(clipstrike_core::project::MediaAsset {
+                        id: 1001,
+                        name: "Forest.mp4".to_string(),
+                        uri: "file:///forest.mp4".to_string(),
+                        duration_ms: 5000,
+                        audio_levels: vec![],
+                    });
+                    self.project.assets.push(clipstrike_core::project::MediaAsset {
+                        id: 1002,
+                        name: "Music.mp3".to_string(),
+                        uri: "file:///music.mp3".to_string(),
+                        duration_ms: 120000,
+                        audio_levels: vec![],
+                    });
+                    self.project.assets.push(clipstrike_core::project::MediaAsset {
+                        id: 1003,
+                        name: "Logo.png".to_string(),
+                        uri: "file:///logo.png".to_string(),
+                        duration_ms: 0,
+                        audio_levels: vec![],
+                    });
+                } else if cmd.starts_with("SEARCH_MEDIA:") {
+                    self.asset_filter_text = cmd["SEARCH_MEDIA:".len()..].to_string();
+                } else if cmd.starts_with("FILTER_TYPE:") {
+                    if let Ok(idx) = cmd["FILTER_TYPE:".len()..].parse::<usize>() {
+                        self.asset_filter_index = idx;
+                    }
+                } else if cmd.starts_with("SET_CLIP_PROP:") {
+                    // Format: SET_CLIP_PROP:property_name:value
+                    let parts: Vec<&str> = cmd["SET_CLIP_PROP:".len()..].split(':').collect();
+                    if parts.len() == 2 {
+                        let prop_name = parts[0];
+                        if let Ok(value) = parts[1].parse::<f32>() {
+                            if let Some(first_id) = self.timeline.clips.first().map(|c| c.id) {
+                                let property = match prop_name {
+                                    "PosX" => AnimatedProperty::PosX,
+                                    "PosY" => AnimatedProperty::PosY,
+                                    "ScaleX" => AnimatedProperty::ScaleX,
+                                    "ScaleY" => AnimatedProperty::ScaleY,
+                                    "Rotation" => AnimatedProperty::Rotation,
+                                    "Opacity" => AnimatedProperty::Opacity,
+                                    "Speed" => AnimatedProperty::Speed,
+                                    _ => AnimatedProperty::Brightness,
+                                };
+                                if let Some(pos) = self.timeline.clips.iter_mut().position(|c| c.id == first_id) {
+                                    let clip = &mut self.timeline.clips[pos];
+                                    property_mut(clip, property).insert_keyframe(self.playhead_ms, value, clipstrike_core::keyframes::InterpolationMode::Linear);
+                                }
+                            }
+                        }
+                    }
+                } else if cmd.starts_with("SET_CLIP_REVERSE:") {
+                    let val = cmd["SET_CLIP_REVERSE:".len()..].parse::<bool>().unwrap_or(false);
+                    if let Some(first_id) = self.timeline.clips.first().map(|c| c.id) {
+                        if let Some(pos) = self.timeline.clips.iter_mut().position(|c| c.id == first_id) {
+                            self.timeline.clips[pos].reverse = val;
+                        }
+                    }
+                } else if cmd == "FREEZE_CLIP" {
+                    if let Some(first_id) = self.timeline.clips.first().map(|c| c.id) {
+                        if let Some(pos) = self.timeline.clips.iter_mut().position(|c| c.id == first_id) {
+                            let current_source_ms = self.timeline.clips[pos].source_time_at(self.playhead_ms);
+                            self.timeline.clips[pos].freeze_frame_ms = Some(current_source_ms);
+                        }
+                    }
+                } else if cmd == "NEXT_FRAME" {
+                    self.playhead_ms += self.frame_duration_ms();
+                    self.seek_playhead();
+                } else if cmd == "PREV_FRAME" {
+                    self.playhead_ms = (self.playhead_ms - self.frame_duration_ms()).max(0);
+                    self.seek_playhead();
+                } else if cmd == "NEW" {
+                    self.new_project();
+                } else if cmd == "GET_PROJECT_JSON" {
+                    self.project.capture_timeline(&self.timeline);
+                    let project = self.snapshot_project();
+                    if let Ok(json) = serde_json::to_string(&project) {
+                        self.test_project_json_dump = Some(json);
+                    }
+                } else if cmd == "ADD_MARKER" {
+                    self.toggle_marker_at_playhead();
+                } else if cmd == "REMOVE_MARKER" {
+                    self.toggle_marker_at_playhead();
+                } else if cmd == "NEXT_MARKER" {
+                    self.jump_to_next_marker();
+                } else if cmd == "PREV_MARKER" {
+                    self.jump_to_previous_marker();
+                } else if cmd.starts_with("SET_THEME:") {
+                    let theme = &cmd["SET_THEME:".len()..];
+                    self.app_config.theme = match theme {
+                        "Light" => ThemePreference::Light,
+                        _ => ThemePreference::Dark,
+                    };
+                    self.apply_theme(ctx);
+                    self.persist_app_config();
+                } else if cmd.starts_with("SET_ADVANCED_VIEW:") {
+                    let val = cmd["SET_ADVANCED_VIEW:".len()..].parse::<bool>().unwrap_or(true);
+                    self.app_config.advanced_view = val;
+                    self.persist_app_config();
+                } else if cmd.starts_with("SET_FULLSCREEN:") {
+                    let val = cmd["SET_FULLSCREEN:".len()..].parse::<bool>().unwrap_or(false);
+                    self.app_config.fullscreen = val;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(val));
+                    self.persist_app_config();
+                } else if cmd.starts_with("ADD_CLIP_TO_TRACK:") {
+                    let parts: Vec<&str> = cmd["ADD_CLIP_TO_TRACK:".len()..].split(':').collect();
+                    if parts.len() == 2 {
+                        if let (Ok(track_id), Ok(start_ms)) = (parts[0].parse::<usize>(), parts[1].parse::<i64>()) {
+                            let clip = Clip {
+                                id: rand::random::<usize>(),
+                                asset_id: 999, // Use the test asset id
+                                track_id,
+                                blend_mode: clipstrike_core::timeline::BlendMode::Normal,
+                                start: start_ms,
+                                end: start_ms + 5000,
+                                brightness: KeyframedProperty::new(1.0),
+                                contrast: KeyframedProperty::new(1.0),
+                                saturation: KeyframedProperty::new(1.0),
+                                grayscale: KeyframedProperty::new(0.0),
+                                blur_radius: KeyframedProperty::new(0.0),
+                                volume: KeyframedProperty::new(1.0),
+                                pos_x: KeyframedProperty::new(0.0),
+                                pos_y: KeyframedProperty::new(0.0),
+                                scale_x: KeyframedProperty::new(1.0),
+                                scale_y: KeyframedProperty::new(1.0),
+                                rotation: KeyframedProperty::new(0.0),
+                                opacity: KeyframedProperty::new(1.0),
+                                speed: KeyframedProperty::new(1.0),
+                                reverse: false,
+                                freeze_frame_ms: None,
+                                audio_enabled: false,
+                                video_enabled: true,
+                                stabilization_enabled: false,
+                                motion_tracking_enabled: false,
+                                object_detection_enabled: false,
+                                };                            self.undo_stack.push(Box::new(AddClipCommand { clip }), &mut self.project, &mut self.timeline);
+                        }
+                    }
+                } else if cmd == "ADD_IMAGE_SEQUENCE" {
+                    self.project.assets.push(clipstrike_core::project::MediaAsset {
+                        id: 1004,
+                        name: "Sequence_%04d.png".to_string(),
+                        uri: "file:///seq_%04d.png".to_string(),
+                        duration_ms: 10000,
+                        audio_levels: vec![],
+                    });
+                } else if cmd.starts_with("SET_CLIP_STABILIZATION:") {
+                    let val = cmd["SET_CLIP_STABILIZATION:".len()..].parse::<bool>().unwrap_or(false);
+                    if let Some(first_id) = self.timeline.clips.first().map(|c| c.id) {
+                        if let Some(pos) = self.timeline.clips.iter_mut().position(|c| c.id == first_id) {
+                            self.timeline.clips[pos].stabilization_enabled = val;
+                        }
+                    }
+                } else if cmd == "CREATE_TITLE" {
+                    let title = clipstrike_core::project::TitleAsset {
+                        id: rand::random::<usize>(),
+                        name: "Test Title".to_string(),
+                        template: clipstrike_core::project::TitleTemplate::default(),
+                        text: "E2E Test".to_string(),
+                        font_family: "Arial".to_string(),
+                        font_size: 48.0,
+                        color: [255, 255, 255, 255],
+                        x: 0.5,
+                        y: 0.5,
+                        svg_content: r#"<svg width="1920" height="1080" xmlns="http://www.w3.org/2000/svg"><text x="960" y="540" font-family="Arial" font-size="48" fill="rgba(255,255,255,1)" text-anchor="middle">E2E Test</text></svg>"#.to_string(),
+                    };
+                    self.project.titles.push(title);
+                } else if cmd == "DRAG_TITLE_TO_TIMELINE" {
+                    if let Some(title) = self.project.titles.first() {
+                        let title_id = title.id;
+                        let track_id = self.project.tracks.first().map(|t| t.id).unwrap_or(0);
+                        let clip = Clip {
+                            id: rand::random::<usize>(),
+                            asset_id: 0,
+                            track_id,
+                            blend_mode: clipstrike_core::timeline::BlendMode::Normal,
+                            start: self.playhead_ms,                            end: self.playhead_ms + 5000,
+                            brightness: KeyframedProperty::new(1.0),
+                            contrast: KeyframedProperty::new(1.0),
+                            saturation: KeyframedProperty::new(1.0),
+                            grayscale: KeyframedProperty::new(0.0),
+                            blur_radius: KeyframedProperty::new(0.0),
+                            volume: KeyframedProperty::new(1.0),
+                            pos_x: KeyframedProperty::new(0.0),
+                            pos_y: KeyframedProperty::new(0.0),
+                            scale_x: KeyframedProperty::new(1.0),
+                            scale_y: KeyframedProperty::new(1.0),
+                            rotation: KeyframedProperty::new(0.0),
+                            opacity: KeyframedProperty::new(1.0),
+                            speed: KeyframedProperty::new(1.0),
+                            reverse: false,
+                            freeze_frame_ms: None,
+                            audio_enabled: false,
+                            video_enabled: true,
+                            stabilization_enabled: false,
+                            motion_tracking_enabled: false,
+                            object_detection_enabled: false,
+                            };                        self.undo_stack.push(Box::new(AddClipCommand { clip }), &mut self.project, &mut self.timeline);
+                    }
+                } else if cmd.starts_with("SWITCH_TAB:") {
+                    let tab_name = &cmd["SWITCH_TAB:".len()..];
+                    self.left_panel_tab = match tab_name {
+                        "Transitions" => LeftPanelTab::Transitions,
+                        "Effects" => LeftPanelTab::Effects,
+                        "Titles" => LeftPanelTab::Titles,
+                        "Emojis" => LeftPanelTab::Emojis,
+                        _ => LeftPanelTab::ProjectFiles,
+                    };
+                } else if cmd == "CLEAR_PROJECT_JSON" {
+                    self.test_project_json_dump = None;
+                } else if cmd.starts_with("LOAD_PROJECT_JSON:") {
+                    let json = &cmd["LOAD_PROJECT_JSON:".len()..];
+                    if let Ok(project) = serde_json::from_str::<clipstrike_core::project::Project>(json) {
+                        self.reset_runtime_state(project, None);
+                    }
+                }
+            }
+            ctx.request_repaint();
+        }
+
         // Task 7.2: OS Drag-and-drop import
         let dropped_paths: Vec<PathBuf> = ctx.input(|i| {
             i.raw
@@ -1353,6 +1801,10 @@ impl eframe::App for ClipStrikeApp {
             if self.loop_enabled && self.playhead_ms >= self.loop_end_ms {
                 self.playhead_ms = self.loop_start_ms;
                 self.seek_playhead();
+            }
+
+            if let Some(audio) = &self.audio_engine {
+                audio.set_playhead(self.playhead_ms);
             }
 
             ctx.request_repaint(); // Keep the loop running
@@ -1423,10 +1875,10 @@ impl eframe::App for ClipStrikeApp {
                 });
                 ui.menu_button("Edit", |ui| {
                     if ui.button("Undo").clicked() {
-                        self.undo_stack.undo(&mut self.timeline);
+                        self.undo_stack.undo(&mut self.project, &mut self.timeline);
                     }
                     if ui.button("Redo").clicked() {
-                        self.undo_stack.redo(&mut self.timeline);
+                        self.undo_stack.redo(&mut self.project, &mut self.timeline);
                     }
                     ui.separator();
                     if ui.button("Clear History").clicked() {
@@ -1477,12 +1929,12 @@ impl eframe::App for ClipStrikeApp {
                 if ui.button("Undo").on_hover_text("Undo (Ctrl+Z)").clicked()
                     || (ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z)))
                 {
-                    self.undo_stack.undo(&mut self.timeline);
+                    self.undo_stack.undo(&mut self.project, &mut self.timeline);
                 }
                 if ui.button("Redo").on_hover_text("Redo (Ctrl+Y)").clicked()
                     || (ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Y)))
                 {
-                    self.undo_stack.redo(&mut self.timeline);
+                    self.undo_stack.redo(&mut self.project, &mut self.timeline);
                 }
                 ui.separator();
                 if ui.button("Import").on_hover_text("Import Files").clicked() {
@@ -1538,6 +1990,74 @@ impl eframe::App for ClipStrikeApp {
                 self.app_config.fullscreen,
             ));
             self.persist_app_config();
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut state_json = serde_json::json!({
+                "playhead_ms": self.playhead_ms,
+                "is_playing": self.is_playing,
+                "tracks_count": self.project.tracks.len(),
+                "clips_count": self.timeline.clips.len(),
+                "transitions_count": self.timeline.transitions.len(),
+                "assets_count": self.project.assets.len(),
+                "markers_count": self.project.markers.len(),
+                "left_panel_tab": format!("{:?}", self.left_panel_tab),
+                "theme": format!("{:?}", self.app_config.theme),
+                "advanced_view": self.app_config.advanced_view,
+                "fullscreen": self.app_config.fullscreen,
+                "test_project_json_dump": self.test_project_json_dump,
+            });
+
+            if let Some(clip) = self.timeline.clips.first() {
+                state_json["test_first_clip_scale_x"] = clip.scale_x.get_value_at(self.playhead_ms).into();
+                state_json["test_first_clip_brightness"] = clip.brightness.get_value_at(self.playhead_ms).into();
+                state_json["test_first_clip_speed"] = clip.speed.get_value_at(self.playhead_ms).into();
+                state_json["test_first_clip_opacity"] = clip.opacity.get_value_at(self.playhead_ms).into();
+                state_json["test_first_clip_reverse"] = clip.reverse.into();
+                state_json["test_first_clip_frozen"] = clip.freeze_frame_ms.is_some().into();
+                state_json["test_first_clip_stabilization"] = clip.stabilization_enabled.into();
+            }
+
+            if let Some(rect) = self.test_first_track_rect {
+                state_json["test_first_track_rect"] = serde_json::json!({
+                    "left": rect.left(),
+                    "top": rect.top(),
+                    "width": rect.width(),
+                    "height": rect.height(),
+                });
+            }
+            if let Some(rect) = self.test_first_asset_rect {
+                state_json["test_first_asset_rect"] = serde_json::json!({
+                    "left": rect.left(),
+                    "top": rect.top(),
+                    "width": rect.width(),
+                    "height": rect.height(),
+                });
+            }
+            if let Some(rect) = self.test_first_clip_rect {
+                state_json["test_first_clip_rect"] = serde_json::json!({
+                    "left": rect.left(),
+                    "top": rect.top(),
+                    "width": rect.width(),
+                    "height": rect.height(),
+                });
+            }
+            if let Some(rect) = self.test_first_title_rect {
+                state_json["test_first_title_rect"] = serde_json::json!({
+                    "left": rect.left(),
+                    "top": rect.top(),
+                    "width": rect.width(),
+                    "height": rect.height(),
+                });
+            }
+
+            self.test_first_track_rect = None;
+            self.test_first_asset_rect = None;
+            self.test_first_clip_rect = None;
+            self.test_first_title_rect = None;
+
+            crate::test_hooks::set_state(state_json.to_string());
         }
 
         if self.show_profile_dialog {
@@ -1646,7 +2166,7 @@ impl eframe::App for ClipStrikeApp {
             .show(ctx, |ui| {
                 // Timeline Toolbar
                 ui.horizontal(|ui| {
-                    if ui.button("âž• Track").on_hover_text("Add Track").clicked() {
+                    if ui.button("\u{2795} Track").on_hover_text("Add Track").clicked() {
                         if let Err(err) = self.apply_track_mutation(|project| {
                             project.add_track();
                             Ok(())
@@ -1654,24 +2174,24 @@ impl eframe::App for ClipStrikeApp {
                             log::error!("Failed to add track: {}", err);
                         }
                     }
-                    if ui.button("ðŸ§²").on_hover_text("Snapping Enabled").clicked() {}
-                    ui.toggle_value(&mut self.razor_active, "âœ‚")
+                    if ui.button("\u{1F9F2}").on_hover_text("Snapping Enabled").clicked() {}
+                    ui.toggle_value(&mut self.razor_active, "\u{2702}")
                         .on_hover_text("Razor Tool");
                     if ui
-                        .button("ðŸ“Œ")
+                        .button("\u{1F4CC}")
                         .on_hover_text("Add or Remove Marker at Playhead")
                         .clicked()
                     {
                         self.toggle_marker_at_playhead();
                     }
-                    if ui.button("â®").on_hover_text("Previous Marker").clicked() {
+                    if ui.button("\u{23EE}").on_hover_text("Previous Marker").clicked() {
                         self.jump_to_previous_marker();
                     }
-                    if ui.button("â­").on_hover_text("Next Marker").clicked() {
+                    if ui.button("\u{23ED}").on_hover_text("Next Marker").clicked() {
                         self.jump_to_next_marker();
                     }
                     if ui
-                        .button("ðŸŽ¯")
+                        .button("\u{1F3AF}")
                         .on_hover_text("Center Timeline on Playhead")
                         .clicked()
                     {}
@@ -1680,7 +2200,7 @@ impl eframe::App for ClipStrikeApp {
                         ui.add(
                             egui::Slider::new(&mut self.zoom_level, 0.0..=1.0).show_value(false),
                         );
-                        ui.label("ðŸ”");
+                        ui.label("\u{1F50D}");
                     });
                 });
                 ui.separator();
@@ -1714,6 +2234,9 @@ impl eframe::App for ClipStrikeApp {
                                 }
                             }
                             self.seek_playhead();
+                            if let Some(audio) = &self.audio_engine {
+                                audio.set_playhead(self.playhead_ms);
+                            }
                         }
                     }
 
@@ -1732,7 +2255,9 @@ impl eframe::App for ClipStrikeApp {
                         egui::FontId::proportional(12.0),
                         ctx.style().visuals.text_color(),
                     );
-                    for marker in &self.project.markers {
+                    let mut dragging_marker_id: Option<usize> = None;
+                    let mut should_seek = false;
+                    for marker in &mut self.project.markers {
                         let marker_x = ruler_rect.left()
                             + TIMELINE_CONTENT_OFFSET_X
                             + (marker.time_ms as f32 * self.zoom_level * 0.1);
@@ -1742,6 +2267,34 @@ impl eframe::App for ClipStrikeApp {
                         } else {
                             1.5
                         };
+                        
+                        let marker_handle_rect = egui::Rect::from_center_size(
+                            egui::pos2(marker_x, ruler_rect.center().y),
+                            egui::vec2(12.0, ruler_rect.height())
+                        );
+                        
+                        let marker_res = ui.interact(
+                            marker_handle_rect,
+                            egui::Id::new(("marker", marker.id)),
+                            egui::Sense::drag()
+                        );
+                        
+                        if marker_res.dragged() {
+                            if let Some(pos) = marker_res.interact_pointer_pos() {
+                                let local_x = (pos.x - (ruler_rect.left() + TIMELINE_CONTENT_OFFSET_X)).max(0.0);
+                                marker.time_ms = (local_x / (self.zoom_level * 0.1)) as i64;
+                                self.playhead_ms = marker.time_ms;
+                                should_seek = true;
+                                dragging_marker_id = Some(marker.id);
+                            }
+                        }
+
+                        if marker_res.clicked() {
+                            self.selected_marker_id = Some(marker.id);
+                            self.playhead_ms = marker.time_ms;
+                            should_seek = true;
+                        }
+
                         ui.painter().line_segment(
                             [
                                 egui::pos2(marker_x, ruler_rect.top()),
@@ -1756,6 +2309,12 @@ impl eframe::App for ClipStrikeApp {
                             egui::FontId::proportional(10.0),
                             color,
                         );
+                    }
+                    if should_seek {
+                        self.seek_playhead();
+                    }
+                    if let Some(id) = dragging_marker_id {
+                        self.selected_marker_id = Some(id);
                     }
                     ui.add_space(4.0);
 
@@ -1825,16 +2384,16 @@ impl eframe::App for ClipStrikeApp {
                                         }
 
                                         ui.horizontal(|ui| {
-                                            ui.toggle_value(&mut track.visible, "ðŸ‘")
+                                            ui.toggle_value(&mut track.visible, "\u{1F441}")
                                                 .on_hover_text("Toggle Visibility");
-                                            ui.toggle_value(&mut track.audio_enabled, "ðŸ”Š")
+                                            ui.toggle_value(&mut track.audio_enabled, "\u{1F50A}")
                                                 .on_hover_text("Mute / Unmute Track");
                                             ui.toggle_value(&mut track.solo, "S")
                                                 .on_hover_text("Solo Track Audio");
-                                            ui.toggle_value(&mut track.locked, "ðŸ”’")
+                                            ui.toggle_value(&mut track.locked, "\u{1F512}")
                                                 .on_hover_text("Lock Track");
                                             if ui
-                                                .small_button("âœ•")
+                                                .small_button("\u{2715}")
                                                 .on_hover_text("Remove Track")
                                                 .clicked()
                                             {
@@ -1872,6 +2431,13 @@ impl eframe::App for ClipStrikeApp {
                                 egui::Sense::hover(),
                             );
 
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                if self.test_first_track_rect.is_none() {
+                                    self.test_first_track_rect = Some(rect);
+                                }
+                            }
+
                             // Task 4.1: Drop target for media assets
                             if ui.rect_contains_pointer(rect)
                                 && ctx.input(|i| i.pointer.any_released())
@@ -1900,6 +2466,7 @@ impl eframe::App for ClipStrikeApp {
                                                 id: rand::random::<usize>(),
                                                 asset_id,
                                                 track_id: track_idx,
+                                                blend_mode: clipstrike_core::timeline::BlendMode::Normal,
                                                 start: start_ms,
                                                 end: end_ms,
                                                 brightness: KeyframedProperty::new(1.0),
@@ -1919,6 +2486,9 @@ impl eframe::App for ClipStrikeApp {
                                                 freeze_frame_ms: None,
                                                 audio_enabled: true,
                                                 video_enabled: true,
+                                                stabilization_enabled: false,
+                                                motion_tracking_enabled: false,
+                                                object_detection_enabled: false,
                                             },
                                         });
                                         // Clear dragging state
@@ -1935,11 +2505,21 @@ impl eframe::App for ClipStrikeApp {
                                             let start_ms = (local_x / (self.zoom_level * 0.1)) as i64;
                                             
                                             // Task 13.2: Convert title to a temporary asset
-                                            let temp_dir = std::env::temp_dir();
-                                            let svg_path = temp_dir.join(format!("title_{}.svg", title.id));
-                                            let _ = std::fs::write(&svg_path, &title.svg_content);
+                                            #[cfg(not(target_arch = "wasm32"))]
+                                            let uri = {
+                                                let temp_dir = std::env::temp_dir();
+                                                let svg_path = temp_dir.join(format!("title_{}.svg", title.id));
+                                                let _ = std::fs::write(&svg_path, &title.svg_content);
+                                                format!("file:///{}", svg_path.to_string_lossy().replace("\\", "/"))
+                                            };
+
+                                            #[cfg(target_arch = "wasm32")]
+                                            let uri = {
+                                                use base64::{Engine as _, engine::general_purpose};
+                                                let b64 = general_purpose::STANDARD.encode(&title.svg_content);
+                                                format!("data:image/svg+xml;base64,{}", b64)
+                                            };
                                             
-                                            let uri = format!("file:///{}", svg_path.to_string_lossy().replace("\\", "/"));
                                             let asset_id = rand::random::<usize>();
                                             
                                             self.project.assets.push(MediaAsset {
@@ -1955,6 +2535,7 @@ impl eframe::App for ClipStrikeApp {
                                                     id: rand::random::<usize>(),
                                                     asset_id,
                                                     track_id: track_idx,
+                                                    blend_mode: clipstrike_core::timeline::BlendMode::Normal,
                                                     start: start_ms,
                                                     end: start_ms + 5000,
                                                     brightness: KeyframedProperty::new(1.0),
@@ -1974,7 +2555,10 @@ impl eframe::App for ClipStrikeApp {
                                                     freeze_frame_ms: None,
                                                     audio_enabled: false,
                                                     video_enabled: true,
-                                                }
+                                                    stabilization_enabled: false,
+                                                    motion_tracking_enabled: false,
+                                                    object_detection_enabled: false,
+                                                },
                                             });
                                             ctx.data_mut(|d| {
                                                 d.remove_temp::<usize>(egui::Id::new(
@@ -2035,6 +2619,13 @@ impl eframe::App for ClipStrikeApp {
                                             egui::pos2(x_start, rect.top() + 5.0),
                                             egui::pos2(x_end, rect.bottom() - 5.0),
                                         );
+
+                                        #[cfg(target_arch = "wasm32")]
+                                        {
+                                            if self.test_first_clip_rect.is_none() {
+                                                self.test_first_clip_rect = Some(clip_rect);
+                                            }
+                                        }
 
                                         if clip_rect.min.x < rect.right()
                                             && clip_rect.max.x > rect.left()
@@ -2142,11 +2733,11 @@ impl eframe::App for ClipStrikeApp {
                                             }
 
                                             body_res.context_menu(|ui| {
-                                                if ui.button("âœ‚ Slice").clicked() {
+                                                if ui.button("\u{2702} Slice").clicked() {
                                                     razor_cmd = Some((clip.id, self.playhead_ms));
                                                     ui.close_menu();
                                                 }
-                                                if ui.button("ðŸ”Š Separate Audio").clicked() {
+                                                if ui.button("\u{1F50A} Separate Audio").clicked() {
                                                     let mut audio_clip = clip.clone();
                                                     audio_clip.id = rand::random::<usize>();
                                                     audio_clip.track_id += 1; // Move to next track
@@ -2158,7 +2749,7 @@ impl eframe::App for ClipStrikeApp {
                                                     ui.close_menu();
                                                 }
                                                 ui.separator();
-                                                if ui.button("ðŸ—‘ Remove").clicked() {
+                                                if ui.button("\u{1F5D1} Remove").clicked() {
                                                     remove_clip_id = Some(clip.id);
                                                     ui.close_menu();
                                                 }
@@ -2406,25 +2997,25 @@ impl eframe::App for ClipStrikeApp {
                     }
 
                     if let Some(cmd) = move_cmd {
-                        self.undo_stack.push(Box::new(cmd), &mut self.timeline);
+                        self.undo_stack.push(Box::new(cmd), &mut self.project, &mut self.timeline);
                     }
 
                     if let Some(cmd) = trim_cmd {
-                        self.undo_stack.push(Box::new(cmd), &mut self.timeline);
+                        self.undo_stack.push(Box::new(cmd), &mut self.project, &mut self.timeline);
                     }
 
                     if let Some(cmd) = add_clip_cmd {
-                        self.undo_stack.push(Box::new(cmd), &mut self.timeline);
+                        self.undo_stack.push(Box::new(cmd), &mut self.project, &mut self.timeline);
                     }
 
                     if let Some(cmd) = separate_audio_cmd {
-                        self.undo_stack.push(Box::new(cmd), &mut self.timeline);
+                        self.undo_stack.push(Box::new(cmd), &mut self.project, &mut self.timeline);
                     }
 
                     if let Some(clip_id) = remove_clip_id {
                         if let Some(pos) = self.timeline.clips.iter().position(|c| c.id == clip_id) {
                             let clip = self.timeline.clips[pos].clone();
-                            self.undo_stack.push(Box::new(RemoveClipCommand { clip }), &mut self.timeline);
+                            self.undo_stack.push(Box::new(RemoveClipCommand { clip }), &mut self.project, &mut self.timeline);
                         }
                     }
                 });
@@ -2469,6 +3060,7 @@ impl eframe::App for ClipStrikeApp {
                                         id: rand::random::<usize>(),
                                         asset_id: 0,
                                         track_id: 5,
+                                        blend_mode: clipstrike_core::timeline::BlendMode::Normal,
                                         start,
                                         end: start + 2000,
                                         brightness: KeyframedProperty::new(1.0),
@@ -2486,8 +3078,11 @@ impl eframe::App for ClipStrikeApp {
                                         speed: KeyframedProperty::new(1.0),
                                         reverse: false,
                                         freeze_frame_ms: None,
-                                        audio_enabled: true,
+                                        audio_enabled: false,
                                         video_enabled: true,
+                                        stabilization_enabled: false,
+                                        motion_tracking_enabled: false,
+                                        object_detection_enabled: false,
                                     });
                                 }
                                 let _ = ui.button("-");
@@ -2514,37 +3109,48 @@ impl eframe::App for ClipStrikeApp {
                                 if self.project.assets.is_empty() {
                                     ui.label("Drop Files Here...");
                                 } else {
-                                    for asset in &self.project.assets {
-                                        if !self.asset_filter_text.is_empty()
-                                            && !asset
-                                                .name
-                                                .to_lowercase()
-                                                .contains(&self.asset_filter_text.to_lowercase())
-                                        {
-                                            continue;
-                                        }
-
-                                        let ext = asset
-                                            .uri
-                                            .split('.')
-                                            .last()
-                                            .unwrap_or("")
-                                            .to_lowercase();
-                                        let matches_type = match self.asset_filter_index {
-                                            0 => true,
-                                            1 => {
-                                                ["mp4", "mkv", "mov", "avi"].contains(&ext.as_str())
+                                    let asset_ids: Vec<usize> = self.project.assets.iter()
+                                        .filter(|asset| {
+                                            if !self.asset_filter_text.is_empty()
+                                                && !asset
+                                                    .name
+                                                    .to_lowercase()
+                                                    .contains(&self.asset_filter_text.to_lowercase())
+                                            {
+                                                return false;
                                             }
-                                            2 => ["wav", "mp3", "flac"].contains(&ext.as_str()),
-                                            3 => ["png", "jpg", "jpeg", "bmp"]
-                                                .contains(&ext.as_str()),
-                                            _ => true,
-                                        };
-                                        if !matches_type {
-                                            continue;
-                                        }
 
-                                        let item_id = egui::Id::new(("asset", asset.id));
+                                            let ext = asset
+                                                .uri
+                                                .split('.')
+                                                .last()
+                                                .unwrap_or("")
+                                                .to_lowercase();
+                                            match self.asset_filter_index {
+                                                0 => true,
+                                                1 => {
+                                                    ["mp4", "mkv", "mov", "avi"].contains(&ext.as_str())
+                                                }
+                                                2 => ["wav", "mp3", "flac"].contains(&ext.as_str()),
+                                                3 => ["png", "jpg", "jpeg", "bmp"]
+                                                    .contains(&ext.as_str()),
+                                                _ => true,
+                                            }
+                                        })
+                                        .map(|a| a.id)
+                                        .collect();
+
+                                    for id in asset_ids {
+                                        let asset_data = {
+                                            let asset = self.project.assets.iter().find(|a| a.id == id).unwrap();
+                                            (asset.id, asset.name.clone(), asset.uri.clone(), asset.duration_ms)
+                                        };
+                                        let (asset_id, asset_name, asset_uri, asset_duration_ms) = asset_data;
+
+                                        let ext = asset_uri.split('.').last().unwrap_or("").to_lowercase();
+                                        let item_id = egui::Id::new(("asset", asset_id));
+                                        
+                                        let mut add_to_timeline = false;
                                         ui.horizontal(|ui| {
                                             let icon =
                                                 if ["png", "jpg", "jpeg"].contains(&ext.as_str()) {
@@ -2553,7 +3159,14 @@ impl eframe::App for ClipStrikeApp {
                                                     "Media"
                                                 };
                                             ui.label(icon);
-                                            let label_res = ui.selectable_label(false, &asset.name);
+                                            let label_res = ui.selectable_label(false, &asset_name);
+
+                                            #[cfg(target_arch = "wasm32")]
+                                            {
+                                                if self.test_first_asset_rect.is_none() {
+                                                    self.test_first_asset_rect = Some(label_res.rect);
+                                                }
+                                            }
 
                                             if ui
                                                 .interact(
@@ -2566,7 +3179,7 @@ impl eframe::App for ClipStrikeApp {
                                                 ctx.data_mut(|d| {
                                                     d.insert_temp(
                                                         egui::Id::new("dragging_asset_id"),
-                                                        asset.id,
+                                                        asset_id,
                                                     )
                                                 });
                                             }
@@ -2576,41 +3189,50 @@ impl eframe::App for ClipStrikeApp {
                                                 .on_hover_text("Add to Timeline")
                                                 .clicked()
                                             {
-                                                let end_ms = timeline_clip_end_ms(
-                                                    self.playhead_ms,
-                                                    asset.duration_ms,
-                                                    frame_duration_ms,
-                                                );
-                                                let clip = Clip {
-                                                    id: rand::random::<usize>(),
-                                                    asset_id: asset.id,
-                                                    track_id: 5,
-                                                    start: self.playhead_ms,
-                                                    end: end_ms,
-                                                    brightness: KeyframedProperty::new(1.0),
-                                                    contrast: KeyframedProperty::new(1.0),
-                                                    saturation: KeyframedProperty::new(1.0),
-                                                    grayscale: KeyframedProperty::new(0.0),
-                                                    blur_radius: KeyframedProperty::new(0.0),
-                                                    volume: KeyframedProperty::new(1.0),
-                                                    pos_x: KeyframedProperty::new(0.0),
-                                                    pos_y: KeyframedProperty::new(0.0),
-                                                    scale_x: KeyframedProperty::new(1.0),
-                                                    scale_y: KeyframedProperty::new(1.0),
-                                                    rotation: KeyframedProperty::new(0.0),
-                                                    opacity: KeyframedProperty::new(1.0),
-                                                    speed: KeyframedProperty::new(1.0),
-                                                    reverse: false,
-                                                    freeze_frame_ms: None,
-                                                    audio_enabled: true,
-                                                    video_enabled: true,
-                                                };
-                                                self.undo_stack.push(
-                                                    Box::new(AddClipCommand { clip }),
-                                                    &mut self.timeline,
-                                                );
+                                                add_to_timeline = true;
                                             }
                                         });
+
+                                        if add_to_timeline {
+                                            let end_ms = timeline_clip_end_ms(
+                                                self.playhead_ms,
+                                                asset_duration_ms,
+                                                frame_duration_ms,
+                                            );
+                                            let clip = Clip {
+                                                id: rand::random::<usize>(),
+                                                asset_id,
+                                                track_id: 5,
+                                                blend_mode: clipstrike_core::timeline::BlendMode::Normal,
+                                                start: self.playhead_ms,
+                                                end: end_ms,
+                                                brightness: KeyframedProperty::new(1.0),
+                                                contrast: KeyframedProperty::new(1.0),
+                                                saturation: KeyframedProperty::new(1.0),
+                                                grayscale: KeyframedProperty::new(0.0),
+                                                blur_radius: KeyframedProperty::new(0.0),
+                                                volume: KeyframedProperty::new(1.0),
+                                                pos_x: KeyframedProperty::new(0.0),
+                                                pos_y: KeyframedProperty::new(0.0),
+                                                scale_x: KeyframedProperty::new(1.0),
+                                                scale_y: KeyframedProperty::new(1.0),
+                                                rotation: KeyframedProperty::new(0.0),
+                                                opacity: KeyframedProperty::new(1.0),
+                                                speed: KeyframedProperty::new(1.0),
+                                                reverse: false,
+                                                freeze_frame_ms: None,
+                                                audio_enabled: false,
+                                                video_enabled: true,
+                                                stabilization_enabled: false,
+                                                motion_tracking_enabled: false,
+                                                object_detection_enabled: false,
+                                                };
+                                            self.undo_stack.push(
+                                                Box::new(AddClipCommand { clip }),
+                                                &mut self.project,
+                                                &mut self.timeline,
+                                            );
+                                        }
                                     }
                                 }
                             });
@@ -2716,7 +3338,7 @@ impl eframe::App for ClipStrikeApp {
                         LeftPanelTab::Titles => {
                             ui.label("Custom Titles");
                             ui.separator();
-                            if ui.button("âž• Create New Title").clicked() {
+                            if ui.button("\u{2795} Create New Title").clicked() {
                                 self.show_title_editor = true;
                             }
                             ui.separator();
@@ -2724,47 +3346,77 @@ impl eframe::App for ClipStrikeApp {
                                 if self.project.titles.is_empty() {
                                     ui.label("No titles created yet.");
                                 } else {
-                                    for title in &self.project.titles {
+                                    let title_ids: Vec<usize> = self.project.titles.iter().map(|t| t.id).collect();
+                                    for id in title_ids {
+                                        let title_data = {
+                                            let title = self.project.titles.iter().find(|t| t.id == id).unwrap();
+                                            (title.id, title.name.clone())
+                                        };
+                                        let (title_id, title_name) = title_data;
+
+                                        let mut add_to_timeline = false;
                                         ui.horizontal(|ui| {
-                                            ui.label("ðŸ·");
-                                            ui.label(&title.name);
+                                            ui.label("\u{1F3F7}");
+                                            let title_label_res = ui.label(&title_name);
+                                            
+                                            #[cfg(target_arch = "wasm32")]
+                                            {
+                                                if self.test_first_title_rect.is_none() {
+                                                    self.test_first_title_rect = Some(title_label_res.rect);
+                                                }
+                                            }
                                             
                                             // Task 13.2: Drag source for titles
-                                            let item_id = egui::Id::new(("title_asset", title.id));
-                                            let label_res = ui.selectable_label(false, "[Drag to Timeline]");
-                                            if ui.interact(label_res.rect, item_id, egui::Sense::drag()).dragged() {
-                                                ctx.data_mut(|d| d.insert_temp(egui::Id::new("dragging_title_id"), title.id));
+                                            let item_id = egui::Id::new(("title_asset", title_id));
+                                            let drag_label_res = ui.selectable_label(false, "[Drag to Timeline]");
+                                            
+                                            #[cfg(target_arch = "wasm32")]
+                                            {
+                                                if self.test_first_title_rect.is_none() {
+                                                    self.test_first_title_rect = Some(drag_label_res.rect);
+                                                }
                                             }
 
-                                            if ui.button("âž•").on_hover_text("Add to Timeline").clicked() {
-                                                // Create a clip directly from title
-                                                let clip = Clip {
-                                                    id: rand::random::<usize>(),
-                                                    asset_id: 0, // Titles use a special asset mapping or temp file
-                                                    track_id: 5,
-                                                    start: self.playhead_ms,
-                                                    end: self.playhead_ms + 5000,
-                                                    brightness: KeyframedProperty::new(1.0),
-                                                    contrast: KeyframedProperty::new(1.0),
-                                                    saturation: KeyframedProperty::new(1.0),
-                                                    grayscale: KeyframedProperty::new(0.0),
-                                                    blur_radius: KeyframedProperty::new(0.0),
-                                                    volume: KeyframedProperty::new(1.0),
-                                                    pos_x: KeyframedProperty::new(0.0),
-                                                    pos_y: KeyframedProperty::new(0.0),
-                                                    scale_x: KeyframedProperty::new(1.0),
-                                                    scale_y: KeyframedProperty::new(1.0),
-                                                    rotation: KeyframedProperty::new(0.0),
-                                                    opacity: KeyframedProperty::new(1.0),
-                                                    speed: KeyframedProperty::new(1.0),
-                                                    reverse: false,
-                                                    freeze_frame_ms: None,
-                                                    audio_enabled: false,
-                                                    video_enabled: true,
-                                                };
-                                                self.undo_stack.push(Box::new(AddClipCommand { clip }), &mut self.timeline);
+                                            if ui.interact(drag_label_res.rect, item_id, egui::Sense::drag()).dragged() {
+                                                ctx.data_mut(|d| d.insert_temp(egui::Id::new("dragging_title_id"), title_id));
+                                            }
+
+                                            if ui.button("\u{2795}").on_hover_text("Add to Timeline").clicked() {
+                                                add_to_timeline = true;
                                             }
                                         });
+
+                                        if add_to_timeline {
+                                            // Create a clip directly from title
+                                            let clip = Clip {
+                                                id: rand::random::<usize>(),
+                                                asset_id: 0, // Titles use a special asset mapping or temp file
+                                                track_id: 5,
+                                                blend_mode: clipstrike_core::timeline::BlendMode::Normal,
+                                                start: self.playhead_ms,
+                                                end: self.playhead_ms + 5000,
+                                                brightness: KeyframedProperty::new(1.0),
+                                                contrast: KeyframedProperty::new(1.0),
+                                                saturation: KeyframedProperty::new(1.0),
+                                                grayscale: KeyframedProperty::new(0.0),
+                                                blur_radius: KeyframedProperty::new(0.0),
+                                                volume: KeyframedProperty::new(1.0),
+                                                pos_x: KeyframedProperty::new(0.0),
+                                                pos_y: KeyframedProperty::new(0.0),
+                                                scale_x: KeyframedProperty::new(1.0),
+                                                scale_y: KeyframedProperty::new(1.0),
+                                                rotation: KeyframedProperty::new(0.0),
+                                                opacity: KeyframedProperty::new(1.0),
+                                                speed: KeyframedProperty::new(1.0),
+                                                reverse: false,
+                                                freeze_frame_ms: None,
+                                                audio_enabled: false,
+                                                video_enabled: true,
+                                                stabilization_enabled: false,
+                                                motion_tracking_enabled: false,
+                                                object_detection_enabled: false,
+                                                };                                            self.undo_stack.push(Box::new(AddClipCommand { clip }), &mut self.project, &mut self.timeline);
+                                        }
                                     }
                                 }
                             });
@@ -2830,6 +3482,28 @@ impl eframe::App for ClipStrikeApp {
                                 "Transform",
                                 &AnimatedProperty::TRANSFORMS,
                             );
+
+                            ui.horizontal(|ui| {
+                                ui.label("Blend Mode");
+                                egui::ComboBox::from_id_salt(("blend_mode", selected_id))
+                                    .selected_text(format!("{:?}", clip.blend_mode))
+                                    .show_ui(ui, |ui| {
+                                        use clipstrike_core::timeline::BlendMode;
+                                        for mode in [
+                                            BlendMode::Normal,
+                                            BlendMode::Multiply,
+                                            BlendMode::Screen,
+                                            BlendMode::Overlay,
+                                            BlendMode::Darken,
+                                            BlendMode::Lighten,
+                                            BlendMode::Add,
+                                            BlendMode::Subtract,
+                                        ] {
+                                            ui.selectable_value(&mut clip.blend_mode, mode, format!("{:?}", mode));
+                                        }
+                                    });
+                            });
+
                             Self::draw_property_section(
                                 ui,
                                 clip,
@@ -2882,7 +3556,7 @@ impl eframe::App for ClipStrikeApp {
                             if ui.button("Remove Clip").clicked() {
                                 let clip = clip.clone();
                                 self.undo_stack
-                                    .push(Box::new(RemoveClipCommand { clip }), &mut self.timeline);
+                                    .push(Box::new(RemoveClipCommand { clip }), &mut self.project, &mut self.timeline);
                                 should_clear_selection = true;
                             }
                         }
@@ -3087,141 +3761,149 @@ impl eframe::App for ClipStrikeApp {
 
                 ui.painter().rect_filled(rect, 4.0, egui::Color32::BLACK);
 
-                // Draw active clips from the GPU pool, compositing per track so transitions preview correctly.
+                // Draw active clips using the CompositorPipeline for professional track blending.
                 let mut frame_rendered = false;
-                if let Ok(pool) = self.texture_pool.lock() {
-                    let mut rendered_tracks = Vec::new();
-                    for clip in &visible_active_clips {
-                        if rendered_tracks.contains(&clip.track_id) {
-                            continue;
-                        }
-                        rendered_tracks.push(clip.track_id);
-
-                        let track_clips: Vec<&Clip> = visible_active_clips
-                            .iter()
-                            .filter(|candidate| candidate.track_id == clip.track_id)
-                            .collect();
-
-                        let transition = self.timeline.transitions.iter().find(|transition| {
-                            transition.track_id == clip.track_id
-                                && transition.contains_time(self.playhead_ms)
+                if let (
+                    Some(device),
+                    Some(queue),
+                    Some(fx_pipeline),
+                    Some(compositor_pipeline),
+                    Some(fx_output_view),
+                    Some(accumulator_view),
+                    Some(scratch_view),
+                ) = (
+                    &self.device,
+                    &self.queue,
+                    &self.fx_pipeline,
+                    &self.compositor_pipeline,
+                    &self.fx_output_view,
+                    &self.accumulator_view,
+                    &self.scratch_view,
+                ) {
+                    // Clear accumulator to black at the start of the frame
+                    let mut encoder =
+                        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("Clear Accumulator"),
                         });
+                    {
+                        let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("Clear Pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: accumulator_view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                        });
+                    }
+                    queue.submit(Some(encoder.finish()));
 
-                        if let Some(transition) = transition {
-                            let mut transition_clips: Vec<&Clip> = track_clips
-                                .iter()
-                                .copied()
-                                .filter(|candidate| {
-                                    candidate.start < transition.end_ms
-                                        && candidate.end > transition.start_ms
-                                })
-                                .collect();
-                            transition_clips.sort_by_key(|candidate| candidate.start);
+                    if let Some(texture_pool) = &self.texture_pool {
+                        if let Ok(pool) = texture_pool.lock() {
+                            let mut sorted_tracks = self.project.tracks.clone();
+                            sorted_tracks.sort_by_key(|t| t.id);
 
-                            if transition_clips.len() >= 2 {
-                                let outgoing = transition_clips[0];
-                                let incoming = transition_clips[1];
-                                if let (Some(outgoing_frame), Some(incoming_frame)) = (
-                                    pool.frame_for_clip(outgoing.id),
-                                    pool.frame_for_clip(incoming.id),
-                                ) {
-                                    if let (Some(outgoing_texture), Some(incoming_texture)) = (
-                                        self.preview_texture_id(outgoing, outgoing_frame),
-                                        self.preview_texture_id(incoming, incoming_frame),
-                                    ) {
-                                        let outgoing_alpha = if self.selected_clip_id == Some(outgoing.id) {
-                                            1.0
-                                        } else {
-                                            outgoing.opacity.get_value_at(self.playhead_ms)
-                                        };
-                                        let incoming_alpha = if self.selected_clip_id == Some(incoming.id) {
-                                            1.0
-                                        } else {
-                                            incoming.opacity.get_value_at(self.playhead_ms)
-                                        };
-
-                                        if transition.transition_type.uses_luma_mask() {
-                                            self.draw_masked_transition_preview(
-                                                ui,
-                                                rect,
-                                                outgoing_texture,
-                                                incoming_texture,
-                                                transition,
-                                                outgoing_alpha,
-                                                incoming_alpha,
-                                            );
-                                        } else {
-                                            let layout = transition.transition_type.preview_layout(
-                                                transition.progress_at(self.playhead_ms),
-                                            );
-                                            let draw_layer = |texture_id: egui::TextureId,
-                                                              normalized_rect: NormalizedRect,
-                                                              normalized_uv: NormalizedRect,
-                                                              alpha: f32| {
-                                                if alpha <= 0.0 {
-                                                    return;
-                                                }
-                                                ui.painter().image(
-                                                    texture_id,
-                                                    Self::normalized_rect(rect, normalized_rect),
-                                                    Self::normalized_rect(
-                                                        egui::Rect::from_min_max(
-                                                            egui::pos2(0.0, 0.0),
-                                                            egui::pos2(1.0, 1.0),
-                                                        ),
-                                                        normalized_uv,
-                                                    ),
-                                                    egui::Color32::from_white_alpha(
-                                                        (alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
-                                                    ),
-                                                );
-                                            };
-                                            draw_layer(
-                                                outgoing_texture,
-                                                layout.outgoing.rect,
-                                                layout.outgoing.uv,
-                                                layout.outgoing.alpha * outgoing_alpha,
-                                            );
-                                            draw_layer(
-                                                incoming_texture,
-                                                layout.incoming.rect,
-                                                layout.incoming.uv,
-                                                layout.incoming.alpha * incoming_alpha,
-                                            );
-                                        }
-                                        frame_rendered = true;
-                                        continue;
-                                    }
+                            for track in sorted_tracks {
+                                if !track.visible {
+                                    continue;
                                 }
-                            }
-                        }
 
-                        if let Some(top_clip) = track_clips.last().copied() {
-                            if let Some(frame) = pool.frame_for_clip(top_clip.id) {
-                                if let Some(texture_id) = self.preview_texture_id(top_clip, frame) {
-                                    let alpha = if self.selected_clip_id == Some(top_clip.id) {
-                                        1.0
-                                    } else {
-                                        top_clip.opacity.get_value_at(self.playhead_ms)
-                                    };
-                                    ui.painter().image(
-                                        texture_id,
-                                        rect,
-                                        egui::Rect::from_min_max(
-                                            egui::pos2(0.0, 0.0),
-                                            egui::pos2(1.0, 1.0),
-                                        ),
-                                        egui::Color32::from_white_alpha(
-                                            (alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
-                                        ),
-                                    );
-                                    frame_rendered = true;
+                                let track_clips: Vec<Clip> = self
+                                    .timeline
+                                    .get_clips_at_time(self.playhead_ms)
+                                    .into_iter()
+                                    .filter(|c| c.track_id == track.id)
+                                    .collect();
+
+                                if track_clips.is_empty() {
+                                    continue;
+                                }
+
+                                // Use the blend_mode from the top-most clip on that track
+                                let blend_mode = track_clips
+                                    .last()
+                                    .map(|c| c.blend_mode)
+                                    .unwrap_or(clipstrike_core::timeline::BlendMode::Normal);
+
+                                for clip in track_clips {
+                                    if let Some(frame) = pool.frame_for_clip(clip.id) {
+                                        let fx_params = FxUniforms {
+                                            brightness: clip.brightness.get_value_at(self.playhead_ms),
+                                            contrast: clip.contrast.get_value_at(self.playhead_ms),
+                                            saturation: clip.saturation.get_value_at(self.playhead_ms),
+                                            grayscale: clip.grayscale.get_value_at(self.playhead_ms),
+                                            blur_radius: clip.blur_radius.get_value_at(self.playhead_ms),
+                                            alpha: clip.opacity.get_value_at(self.playhead_ms),
+                                            ..Default::default()
+                                        };
+                                        fx_pipeline.run(
+                                            device,
+                                            queue,
+                                            &frame.view,
+                                            fx_output_view,
+                                            fx_params,
+                                        );
+
+                                        let compose_params = ComposeUniforms {
+                                            blend_mode: Self::blend_mode_to_u32(blend_mode),
+                                            opacity: 1.0,
+                                        };
+                                        compositor_pipeline.run(
+                                            device,
+                                            queue,
+                                            fx_output_view,
+                                            accumulator_view,
+                                            scratch_view,
+                                            compose_params,
+                                        );
+
+                                        // Copy scratch back to accumulator to avoid resource aliasing in next track
+                                        let mut copy_encoder = device.create_command_encoder(
+                                            &wgpu::CommandEncoderDescriptor {
+                                                label: Some("Copy Scratch to Accum"),
+                                            },
+                                        );
+                                        copy_encoder.copy_texture_to_texture(
+                                            wgpu::ImageCopyTexture {
+                                                texture: self._scratch_texture.as_ref().unwrap(),
+                                                mip_level: 0,
+                                                origin: wgpu::Origin3d::ZERO,
+                                                aspect: wgpu::TextureAspect::All,
+                                            },
+                                            wgpu::ImageCopyTexture {
+                                                texture: self._accumulator_texture.as_ref().unwrap(),
+                                                mip_level: 0,
+                                                origin: wgpu::Origin3d::ZERO,
+                                                aspect: wgpu::TextureAspect::All,
+                                            },
+                                            wgpu::Extent3d {
+                                                width: 1920,
+                                                height: 1080,
+                                                depth_or_array_layers: 1,
+                                            },
+                                        );
+                                        queue.submit(Some(copy_encoder.finish()));
+                                        frame_rendered = true;
+                                    }
                                 }
                             }
                         }
                     }
                 }
-                if !frame_rendered {
+
+                if frame_rendered {
+                    ui.painter().image(
+                        self.accumulator_id.unwrap(),
+                        rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                } else {
                     ui.painter().text(
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
@@ -3240,26 +3922,41 @@ impl eframe::App for ClipStrikeApp {
                         if ui.button("|<").on_hover_text("Jump to Start").clicked() {
                             self.playhead_ms = 0;
                             self.seek_playhead();
+                            if let Some(audio) = &self.audio_engine {
+                                audio.set_playhead(self.playhead_ms);
+                            }
                         }
                         if ui.button("<<").on_hover_text("Previous Frame").clicked() {
                             self.playhead_ms = (self.playhead_ms - frame_duration).max(0);
                             self.seek_playhead();
+                            if let Some(audio) = &self.audio_engine {
+                                audio.set_playhead(self.playhead_ms);
+                            }
                         }
                         let play_icon = if self.is_playing { "Pause" } else { "Play" };
                         if ui.button(play_icon).clicked() {
                             self.is_playing = !self.is_playing;
                             self.seek_playhead();
+                            if let Some(audio) = &self.audio_engine {
+                                audio.set_playing(self.is_playing);
+                            }
                         }
                         if ui.button(">>").on_hover_text("Next Frame").clicked() {
                             self.playhead_ms =
                                 (self.playhead_ms + frame_duration).min(timeline_end);
                             self.seek_playhead();
+                            if let Some(audio) = &self.audio_engine {
+                                audio.set_playhead(self.playhead_ms);
+                            }
                         }
                         ui.toggle_value(&mut self.loop_enabled, "Loop")
                             .on_hover_text("Toggle Loop");
                         if ui.button(">|").on_hover_text("Jump to End").clicked() {
                             self.playhead_ms = timeline_end;
                             self.seek_playhead();
+                            if let Some(audio) = &self.audio_engine {
+                                audio.set_playhead(self.playhead_ms);
+                            }
                         }
 
                         ui.label(format!(
@@ -3269,9 +3966,12 @@ impl eframe::App for ClipStrikeApp {
                         ));
 
                         ui.separator();
-                        ui.label("ðŸ”Š");
+                        ui.label("\u{1F50A}");
                         if ui.add(egui::Slider::new(&mut self.master_volume, 0.0..=2.0).show_value(false)).changed() {
                             self.project.master_volume = self.master_volume;
+                            if let Some(audio) = &self.audio_engine {
+                                audio.set_volume(self.master_volume);
+                            }
                         }
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3321,6 +4021,7 @@ mod tests {
             id: 1,
             asset_id: 1,
             track_id: 1,
+            blend_mode: clipstrike_core::timeline::BlendMode::Normal,
             start: 0,
             end: 1000,
             brightness: KeyframedProperty::new(1.0),
@@ -3338,9 +4039,12 @@ mod tests {
             speed: KeyframedProperty::new(1.0),
             reverse: false,
             freeze_frame_ms: None,
-            audio_enabled: true,
+            audio_enabled: false,
             video_enabled: true,
-        }
+            stabilization_enabled: false,
+            motion_tracking_enabled: false,
+            object_detection_enabled: false,
+            };
     }
 
     #[test]

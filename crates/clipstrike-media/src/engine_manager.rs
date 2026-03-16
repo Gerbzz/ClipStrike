@@ -75,6 +75,14 @@ impl EngineManager {
         }
     }
 
+    pub fn get_audio_samples(&self, clip_id: usize) -> Arc<Vec<f32>> {
+        if let Some(engine) = self.engines.get(&clip_id) {
+            engine.get_audio_samples()
+        } else {
+            Arc::new(Vec::new())
+        }
+    }
+
     pub fn remove_unused(&mut self, active_ids: &[usize]) {
         let removed_ids: Vec<usize> = self
             .engines
