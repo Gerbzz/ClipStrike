@@ -11,6 +11,9 @@ pub enum TransitionType {
     WipeDown,
     WipeDiagonal,
     WipeClock,
+    RadialWipe,
+    MatrixWipe,
+    SpiralWipe,
     CustomMask,
 }
 
@@ -127,6 +130,9 @@ impl TransitionType {
             Self::WipeDown => "Wipe Down",
             Self::WipeDiagonal => "Wipe Diagonal",
             Self::WipeClock => "Wipe Clock",
+            Self::RadialWipe => "Radial Wipe",
+            Self::MatrixWipe => "Matrix Wipe",
+            Self::SpiralWipe => "Spiral Wipe",
             Self::CustomMask => "Custom Mask",
         }
     }
@@ -182,6 +188,26 @@ pub fn sample_mask_value(
             let dy = v - 0.5;
             let angle = (dx.atan2(-dy) + 2.0 * PI) % (2.0 * PI);
             (angle / (2.0 * PI)).clamp(0.0, 1.0)
+        }
+        TransitionType::RadialWipe => {
+            let dx = u - 0.5;
+            let dy = v - 0.5;
+            let dist = (dx * dx + dy * dy).sqrt() * 2.0;
+            dist.clamp(0.0, 1.0)
+        }
+        TransitionType::MatrixWipe => {
+            let cols = 8.0;
+            let rows = 6.0;
+            let cu = (u * cols).floor() / cols;
+            let cv = (v * rows).floor() / rows;
+            ((cu + cv) * 0.5).clamp(0.0, 1.0)
+        }
+        TransitionType::SpiralWipe => {
+            let dx = u - 0.5;
+            let dy = v - 0.5;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let angle = dx.atan2(dy);
+            ((dist * 10.0 + angle / (2.0 * PI)) % 1.0).abs()
         }
         TransitionType::CustomMask => {
             let Some(mask) = custom_mask else {
