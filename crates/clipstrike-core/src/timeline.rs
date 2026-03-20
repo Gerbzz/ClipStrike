@@ -67,19 +67,42 @@ pub struct Clip {
     #[serde(default)]
     pub pixelate_size: KeyframedProperty,
     #[serde(default)]
+    pub gamma: KeyframedProperty,
+    #[serde(default)]
+    pub hue: KeyframedProperty,
+    #[serde(default)]
     pub color_tint_r: KeyframedProperty,
     #[serde(default)]
     pub color_tint_g: KeyframedProperty,
     #[serde(default)]
     pub color_tint_b: KeyframedProperty,
     #[serde(default)]
+    pub chroma_key_threshold: KeyframedProperty,
+    #[serde(default)]
+    pub chroma_key_fuzziness: KeyframedProperty,
+    #[serde(default)]
+    pub chroma_key_r: KeyframedProperty,
+    #[serde(default)]
+    pub chroma_key_g: KeyframedProperty,
+    #[serde(default)]
+    pub chroma_key_b: KeyframedProperty,
+    #[serde(default)]
+    pub lut_enabled: KeyframedProperty,
+    #[serde(default)]
+    pub lut_path: Option<String>,
+    #[serde(default)]
+    pub lut_size: u32,
+    #[serde(default)]
     pub reverse: bool,
     #[serde(default)]
     pub freeze_frame_ms: Option<i64>,
     #[serde(default = "default_enabled")]
-    pub audio_enabled: bool,
-    #[serde(default = "default_enabled")]
     pub video_enabled: bool,
+    #[serde(default = "default_enabled")]
+    pub audio_enabled: bool,
+
+    #[serde(default)]
+    pub effects: Vec<crate::effects::Effect>,
 
     // AI & Computer Vision (Phase 21)
     #[serde(default)]
@@ -87,7 +110,13 @@ pub struct Clip {
     #[serde(default)]
     pub motion_tracking_enabled: bool,
     #[serde(default)]
+    pub stabilization_strength: KeyframedProperty,
+    #[serde(default)]
     pub object_detection_enabled: bool,
+    #[serde(default)]
+    pub tracking_data: Vec<crate::effects::MotionTrack>,
+    #[serde(default)]
+    pub detections: Vec<crate::effects::DetectedObject>,
 }
 
 fn default_enabled() -> bool {
@@ -95,6 +124,55 @@ fn default_enabled() -> bool {
 }
 
 impl Clip {
+    pub fn new(id: usize, asset_id: usize, track_id: usize, start: i64, end: i64) -> Self {
+        Self {
+            id,
+            asset_id,
+            track_id,
+            start,
+            end,
+            blend_mode: BlendMode::Normal,
+            brightness: KeyframedProperty::new(1.0),
+            contrast: KeyframedProperty::new(1.0),
+            saturation: KeyframedProperty::new(1.0),
+            grayscale: KeyframedProperty::new(0.0),
+            blur_radius: KeyframedProperty::new(0.0),
+            volume: KeyframedProperty::new(1.0),
+            pos_x: KeyframedProperty::new(0.0),
+            pos_y: KeyframedProperty::new(0.0),
+            scale_x: KeyframedProperty::new(1.0),
+            scale_y: KeyframedProperty::new(1.0),
+            rotation: KeyframedProperty::new(0.0),
+            opacity: KeyframedProperty::new(1.0),
+            speed: KeyframedProperty::new(1.0),
+            pixelate_size: KeyframedProperty::new(1.0),
+            gamma: KeyframedProperty::new(1.0),
+            hue: KeyframedProperty::new(0.0),
+            color_tint_r: KeyframedProperty::new(1.0),
+            color_tint_g: KeyframedProperty::new(1.0),
+            color_tint_b: KeyframedProperty::new(1.0),
+            chroma_key_threshold: KeyframedProperty::new(0.0),
+            chroma_key_fuzziness: KeyframedProperty::new(0.1),
+            chroma_key_r: KeyframedProperty::new(0.0),
+            chroma_key_g: KeyframedProperty::new(1.0),
+            chroma_key_b: KeyframedProperty::new(0.0),
+            lut_enabled: KeyframedProperty::new(0.0),
+            lut_path: None,
+            lut_size: 0,
+            reverse: false,
+            freeze_frame_ms: None,
+            video_enabled: true,
+            audio_enabled: true,
+            effects: Vec::new(),
+            stabilization_enabled: false,
+            motion_tracking_enabled: false,
+            stabilization_strength: KeyframedProperty::new(0.0),
+            object_detection_enabled: false,
+            tracking_data: Vec::new(),
+            detections: Vec::new(),
+        }
+    }
+
     pub fn duration_ms(&self) -> i64 {
         (self.end - self.start).max(1)
     }
@@ -531,6 +609,17 @@ impl Timeline {
         }
     }
 
+    pub fn move_clip_to_track(&mut self, id: usize, new_track_id: usize) -> Result<(), String> {
+        if let Some(pos) = self.clips.iter().position(|c| c.id == id) {
+            self.clips[pos].track_id = new_track_id;
+            self.rebuild_tree();
+            self.check_for_transitions();
+            Ok(())
+        } else {
+            Err("Clip not found".into())
+        }
+    }
+
     /// Splits a clip at the given position, creating two new clips.
     pub fn razor(&mut self, id: usize, split_at: i64) -> Result<(), String> {
         if let Some(pos) = self.clips.iter().position(|c| c.id == id) {
@@ -567,14 +656,27 @@ impl Timeline {
                 color_tint_r: clip.color_tint_r.clone(),
                 color_tint_g: clip.color_tint_g.clone(),
                 color_tint_b: clip.color_tint_b.clone(),
+                chroma_key_threshold: clip.chroma_key_threshold.clone(),
+                chroma_key_fuzziness: clip.chroma_key_fuzziness.clone(),
+                chroma_key_r: clip.chroma_key_r.clone(),
+                chroma_key_g: clip.chroma_key_g.clone(),
+                chroma_key_b: clip.chroma_key_b.clone(),
+                gamma: clip.gamma.clone(),
+                hue: clip.hue.clone(),
+                lut_enabled: clip.lut_enabled.clone(),
+                lut_path: clip.lut_path.clone(),
+                lut_size: clip.lut_size,
                 reverse: clip.reverse,
-
                 freeze_frame_ms: clip.freeze_frame_ms,
                 audio_enabled: clip.audio_enabled,
                 video_enabled: clip.video_enabled,
-                stabilization_enabled: false,
-                motion_tracking_enabled: false,
-                object_detection_enabled: false,
+                stabilization_enabled: clip.stabilization_enabled,
+                motion_tracking_enabled: clip.motion_tracking_enabled,
+                stabilization_strength: clip.stabilization_strength.clone(),
+                object_detection_enabled: clip.object_detection_enabled,
+                tracking_data: clip.tracking_data.clone(),
+                detections: clip.detections.clone(),
+                effects: clip.effects.clone(),
             });
 
             // Add part 2
@@ -599,17 +701,30 @@ impl Timeline {
                 opacity: clip.opacity.clone(),
                 speed: clip.speed.clone(),
                 pixelate_size: clip.pixelate_size.clone(),
+                gamma: clip.gamma.clone(),
+                hue: clip.hue.clone(),
                 color_tint_r: clip.color_tint_r.clone(),
                 color_tint_g: clip.color_tint_g.clone(),
                 color_tint_b: clip.color_tint_b.clone(),
+                chroma_key_threshold: clip.chroma_key_threshold.clone(),
+                chroma_key_fuzziness: clip.chroma_key_fuzziness.clone(),
+                chroma_key_r: clip.chroma_key_r.clone(),
+                chroma_key_g: clip.chroma_key_g.clone(),
+                chroma_key_b: clip.chroma_key_b.clone(),
+                lut_enabled: clip.lut_enabled.clone(),
+                lut_path: clip.lut_path.clone(),
+                lut_size: clip.lut_size,
                 reverse: clip.reverse,
-
                 freeze_frame_ms: clip.freeze_frame_ms,
                 audio_enabled: clip.audio_enabled,
                 video_enabled: clip.video_enabled,
-                stabilization_enabled: false,
-                motion_tracking_enabled: false,
-                object_detection_enabled: false,
+                stabilization_enabled: clip.stabilization_enabled,
+                motion_tracking_enabled: clip.motion_tracking_enabled,
+                stabilization_strength: clip.stabilization_strength.clone(),
+                object_detection_enabled: clip.object_detection_enabled,
+                tracking_data: clip.tracking_data.clone(),
+                detections: clip.detections.clone(),
+                effects: clip.effects.clone(),
             });
 
             Ok(())
@@ -726,137 +841,10 @@ mod tests {
     #[test]
     fn test_interval_tree_point_query() {
         let mut tree = IntervalTree::new();
-        tree.insert(Clip {
-            id: 1,
-            asset_id: 0,
-            track_id: 1,
-            blend_mode: BlendMode::Normal,
-            start: 10,
-            end: 50,
-            brightness: KeyframedProperty::new(1.0),
-            contrast: KeyframedProperty::new(1.0),
-            saturation: KeyframedProperty::new(1.0),
-            grayscale: KeyframedProperty::new(0.0),
-            blur_radius: KeyframedProperty::new(0.0),
-            volume: KeyframedProperty::new(1.0),
-            pos_x: KeyframedProperty::new(0.0),
-            pos_y: KeyframedProperty::new(0.0),
-            scale_x: KeyframedProperty::new(1.0),
-            scale_y: KeyframedProperty::new(1.0),
-            rotation: KeyframedProperty::new(0.0),
-            opacity: KeyframedProperty::new(1.0),
-            speed: KeyframedProperty::new(1.0),
-            pixelate_size: KeyframedProperty::new(1.0),
-            color_tint_r: KeyframedProperty::new(1.0),
-            color_tint_g: KeyframedProperty::new(1.0),
-            color_tint_b: KeyframedProperty::new(1.0),
-            reverse: false,
-            freeze_frame_ms: None,
-            audio_enabled: true,
-            video_enabled: true,
-            stabilization_enabled: false,
-            motion_tracking_enabled: false,
-            object_detection_enabled: false,
-        });
-        tree.insert(Clip {
-            id: 2,
-            asset_id: 0,
-            track_id: 1,
-            blend_mode: BlendMode::Normal,
-            start: 20,
-            end: 40,
-            brightness: KeyframedProperty::new(1.0),
-            contrast: KeyframedProperty::new(1.0),
-            saturation: KeyframedProperty::new(1.0),
-            grayscale: KeyframedProperty::new(0.0),
-            blur_radius: KeyframedProperty::new(0.0),
-            volume: KeyframedProperty::new(1.0),
-            pos_x: KeyframedProperty::new(0.0),
-            pos_y: KeyframedProperty::new(0.0),
-            scale_x: KeyframedProperty::new(1.0),
-            scale_y: KeyframedProperty::new(1.0),
-            rotation: KeyframedProperty::new(0.0),
-            opacity: KeyframedProperty::new(1.0),
-            speed: KeyframedProperty::new(1.0),
-            pixelate_size: KeyframedProperty::new(1.0),
-            color_tint_r: KeyframedProperty::new(1.0),
-            color_tint_g: KeyframedProperty::new(1.0),
-            color_tint_b: KeyframedProperty::new(1.0),
-            reverse: false,
-            freeze_frame_ms: None,
-            audio_enabled: true,
-            video_enabled: true,
-            stabilization_enabled: false,
-            motion_tracking_enabled: false,
-            object_detection_enabled: false,
-            }
-);
-        tree.insert(Clip {
-            id: 3,
-            asset_id: 0,
-            track_id: 1,
-            blend_mode: BlendMode::Normal,
-            start: 45,
-            end: 60,
-            brightness: KeyframedProperty::new(1.0),
-            contrast: KeyframedProperty::new(1.0),
-            saturation: KeyframedProperty::new(1.0),
-            grayscale: KeyframedProperty::new(0.0),
-            blur_radius: KeyframedProperty::new(0.0),
-            volume: KeyframedProperty::new(1.0),
-            pos_x: KeyframedProperty::new(0.0),
-            pos_y: KeyframedProperty::new(0.0),
-            scale_x: KeyframedProperty::new(1.0),
-            scale_y: KeyframedProperty::new(1.0),
-            rotation: KeyframedProperty::new(0.0),
-            opacity: KeyframedProperty::new(1.0),
-            speed: KeyframedProperty::new(1.0),
-            pixelate_size: KeyframedProperty::new(1.0),
-            color_tint_r: KeyframedProperty::new(1.0),
-            color_tint_g: KeyframedProperty::new(1.0),
-            color_tint_b: KeyframedProperty::new(1.0),
-            reverse: false,
-            freeze_frame_ms: None,
-            audio_enabled: true,
-            video_enabled: true,
-            stabilization_enabled: false,
-            motion_tracking_enabled: false,
-            object_detection_enabled: false,
-            }
-);
-        tree.insert(Clip {
-            id: 4,
-            asset_id: 0,
-            track_id: 1,
-            blend_mode: BlendMode::Normal,
-            start: 5,
-            end: 15,
-            brightness: KeyframedProperty::new(1.0),
-            contrast: KeyframedProperty::new(1.0),
-            saturation: KeyframedProperty::new(1.0),
-            grayscale: KeyframedProperty::new(0.0),
-            blur_radius: KeyframedProperty::new(0.0),
-            volume: KeyframedProperty::new(1.0),
-            pos_x: KeyframedProperty::new(0.0),
-            pos_y: KeyframedProperty::new(0.0),
-            scale_x: KeyframedProperty::new(1.0),
-            scale_y: KeyframedProperty::new(1.0),
-            rotation: KeyframedProperty::new(0.0),
-            opacity: KeyframedProperty::new(1.0),
-            speed: KeyframedProperty::new(1.0),
-            pixelate_size: KeyframedProperty::new(1.0),
-            color_tint_r: KeyframedProperty::new(1.0),
-            color_tint_g: KeyframedProperty::new(1.0),
-            color_tint_b: KeyframedProperty::new(1.0),
-            reverse: false,
-            freeze_frame_ms: None,
-            audio_enabled: true,
-            video_enabled: true,
-            stabilization_enabled: false,
-            motion_tracking_enabled: false,
-            object_detection_enabled: false,
-            }
-);
+        tree.insert(Clip::new(1, 0, 1, 10, 50));
+        tree.insert(Clip::new(2, 0, 1, 20, 40));
+        tree.insert(Clip::new(3, 0, 1, 45, 60));
+        tree.insert(Clip::new(4, 0, 1, 5, 15));
 
         let result = tree.query_point(30);
         assert_eq!(result.len(), 2);
@@ -911,13 +899,27 @@ mod tests {
             color_tint_r: KeyframedProperty::new(1.0),
             color_tint_g: KeyframedProperty::new(1.0),
             color_tint_b: KeyframedProperty::new(1.0),
+            chroma_key_threshold: KeyframedProperty::new(0.0),
+            chroma_key_fuzziness: KeyframedProperty::new(0.1),
+            chroma_key_r: KeyframedProperty::new(0.0),
+            chroma_key_g: KeyframedProperty::new(1.0),
+            chroma_key_b: KeyframedProperty::new(0.0),
+            gamma: KeyframedProperty::new(1.0),
+            hue: KeyframedProperty::new(0.0),
+            lut_enabled: KeyframedProperty::new(0.0),
+            lut_path: None,
+            lut_size: 0,
             reverse: false,
             freeze_frame_ms: None,
             audio_enabled: true,
             video_enabled: true,
             stabilization_enabled: false,
             motion_tracking_enabled: false,
+            stabilization_strength: KeyframedProperty::new(0.5),
             object_detection_enabled: false,
+            tracking_data: Vec::new(),
+            detections: Vec::new(),
+            effects: Vec::new(),
         };
         engine.add_clip(&clip);
 
@@ -1012,39 +1014,24 @@ mod tests {
         assert_eq!(spans, vec![(0, 40), (40, 100)]);
     }
 
+    #[test]
+    fn clip_new_initializes_ai_defaults() {
+        let clip = Clip::new(7, 42, 3, 10, 20);
+
+        assert_eq!(clip.id, 7);
+        assert_eq!(clip.asset_id, 42);
+        assert_eq!(clip.track_id, 3);
+        assert_eq!(clip.start, 10);
+        assert_eq!(clip.end, 20);
+        assert!(!clip.stabilization_enabled);
+        assert!(!clip.motion_tracking_enabled);
+        assert!(!clip.object_detection_enabled);
+        assert!(clip.tracking_data.is_empty());
+        assert!(clip.detections.is_empty());
+    }
+
     fn make_clip(id: usize, track_id: usize, start: i64, end: i64) -> Clip {
-        Clip {
-            id,
-            asset_id: 0,
-            track_id,
-            blend_mode: BlendMode::Normal,
-            start,
-            end,
-            brightness: KeyframedProperty::new(1.0),
-            contrast: KeyframedProperty::new(1.0),
-            saturation: KeyframedProperty::new(1.0),
-            grayscale: KeyframedProperty::new(0.0),
-            blur_radius: KeyframedProperty::new(0.0),
-            volume: KeyframedProperty::new(1.0),
-            pos_x: KeyframedProperty::new(0.0),
-            pos_y: KeyframedProperty::new(0.0),
-            scale_x: KeyframedProperty::new(1.0),
-            scale_y: KeyframedProperty::new(1.0),
-            rotation: KeyframedProperty::new(0.0),
-            opacity: KeyframedProperty::new(1.0),
-            speed: KeyframedProperty::new(1.0),
-            pixelate_size: KeyframedProperty::new(1.0),
-            color_tint_r: KeyframedProperty::new(1.0),
-            color_tint_g: KeyframedProperty::new(1.0),
-            color_tint_b: KeyframedProperty::new(1.0),
-            reverse: false,
-            freeze_frame_ms: None,
-            audio_enabled: true,
-            video_enabled: true,
-            stabilization_enabled: false,
-            motion_tracking_enabled: false,
-            object_detection_enabled: false,
-        }
+        Clip::new(id, 0, track_id, start, end)
     }
 
     #[test]
@@ -1093,19 +1080,21 @@ mod tests {
         let mut timeline = Timeline::new();
         timeline.add_clip(make_clip(1, 1, 0, 100));
         assert_eq!(timeline.clips.len(), 1);
-        
+
         let active_before = timeline.get_clips_at_time(50);
         assert_eq!(active_before.len(), 1);
 
         timeline.remove_clip(1);
         assert_eq!(timeline.clips.len(), 0);
-        
+
         // Tree should be rebuilt and empty
         let active_after = timeline.get_clips_at_time(50);
         assert_eq!(active_after.len(), 0);
 
         // Snap engine should be empty
-        let snap_edge = timeline.snap_engine.find_closest_edge_excluding(0, 100, &[]);
+        let snap_edge = timeline
+            .snap_engine
+            .find_closest_edge_excluding(0, 100, &[]);
         assert!(snap_edge.is_none());
     }
 
@@ -1121,12 +1110,16 @@ mod tests {
         assert_eq!(timeline.get_clips_at_time(250).len(), 1);
 
         // Snap engine should match 200 and 300
-        let snap_start = timeline.snap_engine.find_closest_edge_excluding(190, 20, &[]);
+        let snap_start = timeline
+            .snap_engine
+            .find_closest_edge_excluding(190, 20, &[]);
         assert_eq!(snap_start, Some(200));
 
-        let snap_end = timeline.snap_engine.find_closest_edge_excluding(310, 20, &[]);
+        let snap_end = timeline
+            .snap_engine
+            .find_closest_edge_excluding(310, 20, &[]);
         assert_eq!(snap_end, Some(300));
-        
+
         // Old edges should not snap
         let snap_old = timeline.snap_engine.find_closest_edge_excluding(0, 50, &[]);
         assert!(snap_old.is_none());
@@ -1145,15 +1138,24 @@ mod tests {
 
         // Snap engine should reflect new bounds
         assert_eq!(
-            timeline.snap_engine.find_closest_edge_excluding(40, 20, &[]),
+            timeline
+                .snap_engine
+                .find_closest_edge_excluding(40, 20, &[]),
             Some(50)
         );
         assert_eq!(
-            timeline.snap_engine.find_closest_edge_excluding(160, 20, &[]),
+            timeline
+                .snap_engine
+                .find_closest_edge_excluding(160, 20, &[]),
             Some(150)
         );
-        
+
         // Old edges should be removed
-        assert!(timeline.snap_engine.find_closest_edge_excluding(0, 10, &[]).is_none());
+        assert!(
+            timeline
+                .snap_engine
+                .find_closest_edge_excluding(0, 10, &[])
+                .is_none()
+        );
     }
 }

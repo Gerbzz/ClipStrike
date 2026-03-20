@@ -1,37 +1,68 @@
 use crate::engine::VideoEngine;
-use clipstrike_render::gpu::TexturePool;
+use clipstrike_audio::AudioHandle;
 use clipstrike_core::timeline::Clip;
+use clipstrike_render::gpu::FrameUploadRequest;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Manages multiple video engines for concurrent clip playback.
 pub struct EngineManager {
     engines: HashMap<usize, VideoEngine>, // Map clip_id -> Engine
-    texture_pool: Arc<Mutex<TexturePool>>,
-    queue: Arc<wgpu::Queue>,
+    frame_width: i32,
+    frame_height: i32,
+    #[cfg(not(target_arch = "wasm32"))]
+    frame_sender: Option<tokio::sync::mpsc::Sender<FrameUploadRequest>>,
+    audio_handle: Option<AudioHandle>,
 }
 
 impl EngineManager {
-    pub fn new(texture_pool: Arc<Mutex<TexturePool>>, queue: Arc<wgpu::Queue>) -> Self {
+    pub fn new(
+        frame_width: i32,
+        frame_height: i32,
+        #[cfg(not(target_arch = "wasm32"))] frame_sender: Option<
+            tokio::sync::mpsc::Sender<FrameUploadRequest>,
+        >,
+        audio_handle: Option<AudioHandle>,
+    ) -> Self {
         Self {
             engines: HashMap::new(),
-            texture_pool,
-            queue,
+            frame_width,
+            frame_height,
+            #[cfg(not(target_arch = "wasm32"))]
+            frame_sender,
+            audio_handle,
         }
     }
 
     /// Ensures an engine exists for the given clip and is prepared for the current time.
     pub fn sync_clip(&mut self, clip: &Clip, uri: &str) -> Result<bool, String> {
         if !self.engines.contains_key(&clip.id) {
+            #[cfg(not(target_arch = "wasm32"))]
+            let sender = self.frame_sender.clone();
+            #[cfg(target_arch = "wasm32")]
+            let sender = None;
+
+            log::debug!(
+                "EngineManager::sync_clip creating engine for clip_id={} uri={} video_enabled={} audio_enabled={}",
+                clip.id,
+                uri,
+                clip.video_enabled,
+                clip.audio_enabled
+            );
             let engine = VideoEngine::new(
                 uri,
                 clip.id,
-                Arc::clone(&self.texture_pool),
-                Arc::clone(&self.queue),
+                self.frame_width,
+                self.frame_height,
                 clip.video_enabled,
                 clip.audio_enabled,
+                sender,
+                self.audio_handle.clone(),
             )?;
+            log::info!(
+                "EngineManager::sync_clip created engine for clip_id={}",
+                clip.id
+            );
             self.engines.insert(clip.id, engine);
             return Ok(true);
         }
@@ -75,15 +106,24 @@ impl EngineManager {
         }
     }
 
-    pub fn get_audio_samples(&self, clip_id: usize) -> Arc<Vec<f32>> {
+    pub fn get_audio_samples(&self, clip_id: usize) -> std::sync::Arc<Vec<f32>> {
         if let Some(engine) = self.engines.get(&clip_id) {
             engine.get_audio_samples()
         } else {
-            Arc::new(Vec::new())
+            std::sync::Arc::new(Vec::new())
         }
     }
 
-    pub fn remove_unused(&mut self, active_ids: &[usize]) {
+    pub fn remove_clip_engine(&mut self, clip_id: usize) -> bool {
+        if let Some(engine) = self.engines.remove(&clip_id) {
+            let _ = engine.stop();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn remove_unused(&mut self, active_ids: &[usize]) -> Vec<usize> {
         let removed_ids: Vec<usize> = self
             .engines
             .keys()
@@ -97,10 +137,18 @@ impl EngineManager {
             }
         }
 
-        if let Ok(mut pool) = self.texture_pool.lock() {
-            for clip_id in removed_ids {
-                pool.release_clip_frames(clip_id);
-            }
-        }
+        removed_ids
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EngineManager;
+
+    #[test]
+    fn remove_clip_engine_returns_false_when_engine_is_missing() {
+        let mut manager = EngineManager::new(1920, 1080, None, None);
+
+        assert!(!manager.remove_clip_engine(42));
     }
 }

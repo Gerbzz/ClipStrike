@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use crate::commands::{
     AddClipCommand, MoveClipCommand, RemoveClipCommand, TrimClipCommand, UndoStack,
 };
+use crate::effects::MotionTrack;
 use crate::keyframes::{InterpolationMode, KeyframedProperty};
 use crate::project::{Marker, MarkerToggleResult, MediaAsset, Project, TransitionMaskAsset};
-use crate::timeline::{Clip, Timeline, BlendMode};
+use crate::timeline::{BlendMode, Clip, Timeline};
 use crate::transitions::{TransitionType, fade_in_points, fade_out_points};
 
 pub struct EditorSession {
@@ -118,23 +119,40 @@ impl EditorSession {
             opacity: KeyframedProperty::new(1.0),
             speed: KeyframedProperty::new(1.0),
             pixelate_size: KeyframedProperty::new(1.0),
+            gamma: KeyframedProperty::new(1.0),
+            hue: KeyframedProperty::new(0.0),
             color_tint_r: KeyframedProperty::new(1.0),
             color_tint_g: KeyframedProperty::new(1.0),
             color_tint_b: KeyframedProperty::new(1.0),
+            chroma_key_threshold: KeyframedProperty::new(0.0),
+            chroma_key_fuzziness: KeyframedProperty::new(0.1),
+            chroma_key_r: KeyframedProperty::new(0.0),
+            chroma_key_g: KeyframedProperty::new(1.0),
+            chroma_key_b: KeyframedProperty::new(0.0),
+            lut_enabled: KeyframedProperty::new(0.0),
+            lut_path: None,
+            lut_size: 0,
             reverse: false,
             freeze_frame_ms: None,
             audio_enabled: true,
             video_enabled: true,
             stabilization_enabled: false,
             motion_tracking_enabled: false,
+            stabilization_strength: KeyframedProperty::new(0.5),
             object_detection_enabled: false,
+            tracking_data: Vec::new(),
+            detections: Vec::new(),
+            effects: Vec::new(),
         }
     }
 
     pub fn add_clip(&mut self, clip: Clip) -> usize {
         let clip_id = clip.id;
-        self.undo_stack
-            .push(Box::new(AddClipCommand { clip }), &mut self.project, &mut self.timeline);
+        self.undo_stack.push(
+            Box::new(AddClipCommand { clip }),
+            &mut self.project,
+            &mut self.timeline,
+        );
         clip_id
     }
 
@@ -146,8 +164,11 @@ impl EditorSession {
             .find(|clip| clip.id == clip_id)
             .cloned()
             .ok_or_else(|| format!("Clip {clip_id} not found"))?;
-        self.undo_stack
-            .push(Box::new(RemoveClipCommand { clip }), &mut self.project, &mut self.timeline);
+        self.undo_stack.push(
+            Box::new(RemoveClipCommand { clip }),
+            &mut self.project,
+            &mut self.timeline,
+        );
         Ok(())
     }
 
@@ -171,6 +192,36 @@ impl EditorSession {
                 old_end: clip.end,
                 new_start,
                 new_end,
+                old_track_id: clip.track_id,
+                new_track_id: clip.track_id,
+            }),
+            &mut self.project,
+            &mut self.timeline,
+        );
+        Ok(())
+    }
+
+    pub fn move_clip_to_track(
+        &mut self,
+        clip_id: usize,
+        new_track_id: usize,
+    ) -> Result<(), String> {
+        let clip = self
+            .timeline
+            .clips
+            .iter()
+            .find(|clip| clip.id == clip_id)
+            .cloned()
+            .ok_or_else(|| format!("Clip {clip_id} not found"))?;
+        self.undo_stack.push(
+            Box::new(MoveClipCommand {
+                clip_id,
+                old_start: clip.start,
+                old_end: clip.end,
+                new_start: clip.start,
+                new_end: clip.end,
+                old_track_id: clip.track_id,
+                new_track_id,
             }),
             &mut self.project,
             &mut self.timeline,
@@ -306,6 +357,28 @@ impl EditorSession {
         Ok(())
     }
 
+    pub fn apply_motion_track(&mut self, clip_id: usize, track: MotionTrack) -> Result<(), String> {
+        let clip = self
+            .timeline
+            .clips
+            .iter_mut()
+            .find(|clip| clip.id == clip_id)
+            .ok_or_else(|| format!("Clip {clip_id} not found"))?;
+
+        clip.motion_tracking_enabled = true;
+
+        for point in &track.points {
+            clip.pos_x
+                .insert_keyframe(point.time_ms, point.x, InterpolationMode::Linear);
+            clip.pos_y
+                .insert_keyframe(point.time_ms, point.y, InterpolationMode::Linear);
+        }
+
+        clip.tracking_data.push(track);
+
+        Ok(())
+    }
+
     pub fn clip_source_time_at(
         &self,
         clip_id: usize,
@@ -423,6 +496,7 @@ impl EditorSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effects::{MotionTrack, TrackPoint};
     use proptest::prelude::*;
 
     fn make_clip(id: usize, track_id: usize, start: i64, end: i64) -> Clip {
@@ -447,16 +521,30 @@ mod tests {
             opacity: KeyframedProperty::new(1.0),
             speed: KeyframedProperty::new(1.0),
             pixelate_size: KeyframedProperty::new(1.0),
+            gamma: KeyframedProperty::new(1.0),
+            hue: KeyframedProperty::new(0.0),
             color_tint_r: KeyframedProperty::new(1.0),
             color_tint_g: KeyframedProperty::new(1.0),
             color_tint_b: KeyframedProperty::new(1.0),
+            chroma_key_threshold: KeyframedProperty::new(0.0),
+            chroma_key_fuzziness: KeyframedProperty::new(0.1),
+            chroma_key_r: KeyframedProperty::new(0.0),
+            chroma_key_g: KeyframedProperty::new(1.0),
+            chroma_key_b: KeyframedProperty::new(0.0),
+            lut_enabled: KeyframedProperty::new(0.0),
+            lut_path: None,
+            lut_size: 0,
             reverse: false,
             freeze_frame_ms: None,
             audio_enabled: true,
             video_enabled: true,
             stabilization_enabled: false,
             motion_tracking_enabled: false,
+            stabilization_strength: KeyframedProperty::new(0.5),
             object_detection_enabled: false,
+            tracking_data: Vec::new(),
+            detections: Vec::new(),
+            effects: Vec::new(),
         }
     }
 
@@ -544,6 +632,50 @@ mod tests {
                 .and_then(|clip| clip.opacity.keyframe(1_600))
                 .is_some()
         );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn session_save_reopen_smoke_test_preserves_project_path_and_timeline_state() {
+        let mut session = EditorSession::with_default_project("Smoke", 1280, 720, 30.0, 2);
+        let asset_id = session.add_asset("Clip", "file:///clip.mp4", 1_500);
+        let clip_id = session.add_clip(session.build_clip(asset_id, 2, 50, 550));
+
+        session.toggle_marker(400);
+        session
+            .apply_fade_in(clip_id)
+            .expect("fade in should apply");
+        session.sync_project_from_timeline();
+
+        let path = std::env::temp_dir().join("clipstrike-session-smoke.cstrike");
+        session
+            .save_to_path(&path)
+            .expect("session save should succeed");
+
+        assert_eq!(
+            session.current_project_path.as_deref(),
+            Some(path.as_path())
+        );
+
+        let reopened = EditorSession::open_from_path(&path).expect("session open should succeed");
+        assert_eq!(
+            reopened.current_project_path.as_deref(),
+            Some(path.as_path())
+        );
+        assert_eq!(reopened.project.name, "Smoke");
+        assert_eq!(reopened.project.tracks.len(), 2);
+        assert_eq!(reopened.project.markers.len(), 1);
+        assert_eq!(reopened.timeline.clips.len(), 1);
+
+        let reopened_clip = reopened
+            .timeline
+            .clips
+            .iter()
+            .next()
+            .expect("clip should exist");
+        assert_eq!((reopened_clip.start, reopened_clip.end), (50, 550));
+        assert!(reopened_clip.opacity.keyframe(50).is_some());
 
         let _ = std::fs::remove_file(path);
     }
@@ -689,11 +821,64 @@ mod tests {
     }
 
     #[test]
+    fn apply_motion_track_generates_position_keyframes() {
+        let mut session = EditorSession::with_default_project("Track", 1920, 1080, 60.0, 1);
+        let asset_id = session.add_asset("Clip", "file:///clip.mp4", 5_000);
+        let clip_id = session.add_clip(session.build_clip(asset_id, 1, 0, 1_000));
+        let track = MotionTrack {
+            id: 7,
+            name: "Object".to_string(),
+            points: vec![
+                TrackPoint {
+                    time_ms: 0,
+                    x: 0.1,
+                    y: 0.2,
+                    width: 0.3,
+                    height: 0.4,
+                },
+                TrackPoint {
+                    time_ms: 500,
+                    x: 0.4,
+                    y: 0.5,
+                    width: 0.3,
+                    height: 0.4,
+                },
+                TrackPoint {
+                    time_ms: 1_000,
+                    x: 0.7,
+                    y: 0.8,
+                    width: 0.3,
+                    height: 0.4,
+                },
+            ],
+        };
+
+        session
+            .apply_motion_track(clip_id, track)
+            .expect("tracking should apply");
+
+        let clip = session
+            .timeline
+            .clips
+            .iter()
+            .find(|clip| clip.id == clip_id)
+            .expect("clip should exist");
+
+        assert!(clip.motion_tracking_enabled);
+        assert_eq!(clip.tracking_data.len(), 1);
+        assert_eq!(clip.tracking_data[0].points.len(), 3);
+        assert_eq!(clip.pos_x.keyframes.len(), 3);
+        assert_eq!(clip.pos_y.keyframes.len(), 3);
+        assert!((clip.pos_x.keyframes[0].value - 0.1).abs() < f32::EPSILON);
+        assert!((clip.pos_y.keyframes[2].value - 0.8).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn test_editor_add_asset() {
         let mut session = EditorSession::with_default_project("AssetTest", 1920, 1080, 60.0, 1);
         let id1 = session.add_asset("Video 1", "file:///vid1.mp4", 1000);
         let id2 = session.add_asset("Video 2", "file:///vid2.mp4", 2000);
-        
+
         assert_eq!(session.project.assets.len(), 2);
         assert_eq!(session.project.assets[0].id, id1);
         assert_eq!(session.project.assets[1].id, id2);
@@ -705,17 +890,36 @@ mod tests {
         let asset_id = session.add_asset("Clip", "file:///clip.mp4", 5_000);
         let clip_id = session.add_clip(session.build_clip(asset_id, 1, 100, 5100));
 
-        session.apply_fade_in(clip_id).expect("fade in should apply");
-        session.apply_fade_out(clip_id).expect("fade out should apply");
+        session
+            .apply_fade_in(clip_id)
+            .expect("fade in should apply");
+        session
+            .apply_fade_out(clip_id)
+            .expect("fade out should apply");
 
-        let clip = session.timeline.clips.iter().find(|c| c.id == clip_id).unwrap();
-        
+        let clip = session
+            .timeline
+            .clips
+            .iter()
+            .find(|c| c.id == clip_id)
+            .unwrap();
+
         assert!(clip.opacity.keyframes.len() >= 4);
-        
-        let first_kf = clip.opacity.keyframes.iter().find(|kf| kf.time_ms == 100).unwrap();
+
+        let first_kf = clip
+            .opacity
+            .keyframes
+            .iter()
+            .find(|kf| kf.time_ms == 100)
+            .unwrap();
         assert_eq!(first_kf.value, 0.0);
-        
-        let last_kf = clip.opacity.keyframes.iter().find(|kf| kf.time_ms == 5100).unwrap();
+
+        let last_kf = clip
+            .opacity
+            .keyframes
+            .iter()
+            .find(|kf| kf.time_ms == 5100)
+            .unwrap();
         assert_eq!(last_kf.value, 0.0);
     }
 
@@ -723,11 +927,11 @@ mod tests {
     fn test_editor_clip_commands() {
         let mut session = EditorSession::with_default_project("CmdTest", 1920, 1080, 60.0, 1);
         let asset_id = session.add_asset("Clip", "file:///clip.mp4", 5_000);
-        
+
         // Add
         let clip_id = session.add_clip(session.build_clip(asset_id, 1, 0, 1000));
         assert_eq!(session.timeline.clips.len(), 1);
-        
+
         // Move
         session.move_clip(clip_id, 100, 1100).unwrap();
         assert_eq!(session.timeline.clips[0].start, 100);

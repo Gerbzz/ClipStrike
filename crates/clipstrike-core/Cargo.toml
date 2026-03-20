@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "clipstrike-core"
 version.workspace = true
 edition.workspace = true
@@ -8,12 +8,7 @@ license.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio.workspace = true
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 proptest.workspace = true

@@ -1,3 +1,4 @@
+use clipstrike_media::export::ExportPreset;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -89,6 +90,26 @@ impl ProjectProfile {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
+pub struct ShortcutBindings {
+    pub play_pause: String,
+    pub undo: String,
+    pub redo: String,
+    pub toggle_razor: String,
+}
+
+impl Default for ShortcutBindings {
+    fn default() -> Self {
+        Self {
+            play_pause: "Space".to_string(),
+            undo: "Ctrl+Z".to_string(),
+            redo: "Ctrl+Y".to_string(),
+            toggle_razor: "R".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct AppConfig {
     pub recent_projects: Vec<PathBuf>,
     pub default_project_profile: ProjectProfile,
@@ -97,6 +118,11 @@ pub struct AppConfig {
     pub autosave_enabled: bool,
     pub autosave_interval_minutes: u32,
     pub theme: ThemePreference,
+    pub blender_executable_path: String,
+    pub inkscape_executable_path: String,
+    pub export_presets: Vec<ExportPreset>,
+    pub last_export_directory: Option<PathBuf>,
+    pub shortcuts: ShortcutBindings,
 }
 
 impl Default for AppConfig {
@@ -109,6 +135,15 @@ impl Default for AppConfig {
             autosave_enabled: false,
             autosave_interval_minutes: 5,
             theme: ThemePreference::Dark,
+            blender_executable_path: String::new(),
+            inkscape_executable_path: String::new(),
+            export_presets: vec![
+                ExportPreset::youtube_1080p(),
+                ExportPreset::ultra_hd_4k(),
+                ExportPreset::mobile_social(),
+            ],
+            last_export_directory: None,
+            shortcuts: ShortcutBindings::default(),
         }
     }
 }
@@ -126,6 +161,21 @@ impl AppConfig {
 
     pub fn config_path() -> PathBuf {
         Self::config_dir().join("config.json")
+    }
+
+    pub fn recovery_dir() -> PathBuf {
+        Self::config_dir().join("recovery")
+    }
+
+    pub fn recovery_checkpoint_path_for_project<P: AsRef<Path>>(project_path: P) -> PathBuf {
+        let project_path = project_path.as_ref();
+        let mut checkpoint_path = project_path.to_path_buf();
+        checkpoint_path.set_extension("cstrike.recovery");
+        checkpoint_path
+    }
+
+    pub fn untitled_recovery_checkpoint_path() -> PathBuf {
+        Self::recovery_dir().join("untitled.cstrike.recovery")
     }
 
     pub fn load_or_default() -> Self {
@@ -192,6 +242,31 @@ mod tests {
     }
 
     #[test]
+    fn recovery_checkpoint_path_for_project_appends_recovery_extension() {
+        let path = AppConfig::recovery_checkpoint_path_for_project(PathBuf::from(
+            "C:/Projects/alpha.cstrike",
+        ));
+
+        assert_eq!(path, PathBuf::from("C:/Projects/alpha.cstrike.recovery"));
+    }
+
+    #[test]
+    fn untitled_recovery_checkpoint_path_uses_config_dir_recovery_subdir() {
+        let path = AppConfig::untitled_recovery_checkpoint_path();
+
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("untitled.cstrike.recovery")
+        );
+        assert_eq!(
+            path.parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str()),
+            Some("recovery")
+        );
+    }
+
+    #[test]
     fn save_and_load_round_trip() {
         let mut config = AppConfig::default();
         config.remember_recent_project(PathBuf::from("alpha.cstrike"));
@@ -201,6 +276,15 @@ mod tests {
         config.autosave_enabled = true;
         config.autosave_interval_minutes = 3;
         config.theme = ThemePreference::Light;
+        config.blender_executable_path = "C:/Tools/blender.exe".to_string();
+        config.inkscape_executable_path = "C:/Tools/inkscape.exe".to_string();
+        config.last_export_directory = Some(PathBuf::from("C:/Exports"));
+        config.shortcuts = ShortcutBindings {
+            play_pause: "P".to_string(),
+            undo: "Ctrl+Shift+Z".to_string(),
+            redo: "Ctrl+Y".to_string(),
+            toggle_razor: "Ctrl+R".to_string(),
+        };
         config.default_project_profile = ProjectProfile {
             name: "4K UHD 60 fps".to_string(),
             width: 3840,

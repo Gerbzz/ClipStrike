@@ -1,3 +1,5 @@
+pub mod analysis;
+pub mod decoder_affinity;
 pub mod engine;
 pub mod engine_manager;
 pub mod export;

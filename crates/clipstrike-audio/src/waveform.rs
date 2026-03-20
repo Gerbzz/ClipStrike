@@ -99,6 +99,12 @@ pub fn extract_waveform_sync(_uri: &str, _bins: usize) -> Result<Vec<f32>, Strin
     Ok(Vec::new())
 }
 
+pub async fn extract_waveform_async(uri: String, bins: usize) -> Result<Vec<f32>, String> {
+    tokio::task::spawn_blocking(move || extract_waveform_sync(&uri, bins))
+        .await
+        .map_err(|e: tokio::task::JoinError| e.to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

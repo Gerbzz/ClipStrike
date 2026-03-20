@@ -1,4 +1,4 @@
-[workspace]
+﻿[workspace]
 members = [
     "crates/clipstrike-audio",
     "crates/clipstrike-core",
@@ -24,7 +24,7 @@ license = "MIT"
 
 [workspace.dependencies]
 bytemuck = { version = "1.18", features = ["derive"] }
-eframe = { version = "0.30", default-features = false, features = ["accesskit", "default_fonts", "web_screen_reader", "wgpu"] }
+eframe = { version = "0.30", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "glow"] }
 egui = "0.30"
 egui_extras = { version = "0.30", features = ["image"] }
 env_logger = "0.11"
@@ -33,18 +33,20 @@ glam = "0.29"
 glib = "0.20"
 gstreamer = { version = "0.23", package = "gstreamer" }
 gstreamer-app = "0.23"
+gstreamer-gl = "0.23"
 gstreamer-pbutils = "0.23"
 gstreamer-video = "0.23"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+base64 = "0.22"
+cpal = "0.15"
 log = "0.4"
 proptest = "1.6"
 rand = "0.8"
 rfd = "0.15"
 rayon = "1.10"
+ringbuf = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.41", features = ["full"] }
+tokio = { version = "1.41", default-features = false, features = ["macros", "rt", "sync", "time"] }
 wgpu = "23.0"
 winit = "0.30"
-
-

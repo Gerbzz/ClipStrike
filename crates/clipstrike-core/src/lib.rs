@@ -1,6 +1,8 @@
+pub mod bridges;
 pub mod clip_defaults;
 pub mod commands;
 pub mod editor;
+pub mod effects;
 pub mod keyframes;
 pub mod labels;
 pub mod project;

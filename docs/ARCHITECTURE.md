@@ -1,4 +1,4 @@
-# ClipStrike Architecture
+﻿# ClipStrike Architecture
 
 ClipStrike is organized as a Cargo workspace so the Rust rewrite can mirror OpenShot's product boundaries without scattering logic across unrelated files.
 
@@ -40,6 +40,10 @@ ClipStrike is organized as a Cargo workspace so the Rust rewrite can mirror Open
 - App compile check: `cargo check -p clipstrike-app`
 - GStreamer-backed app check: `cargo check -p clipstrike-app --features gstreamer-backend`
 - Run the app with GStreamer on Windows: `run_clipstrike_gstreamer.cmd`
+
+## Local Windows Setup
+
+The current Windows GStreamer/MSVC SDK locations are documented in [docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md). Use that file when a fresh shell does not inherit the required `PATH`, `PKG_CONFIG_PATH`, or `GSTREAMER_1_0_ROOT_MSVC_X86_64` values.
 
 ## Current Boundary
 

@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "clipstrike-ui"
 version.workspace = true
 edition.workspace = true
@@ -7,6 +7,8 @@ license.workspace = true
 [features]
 default = []
 gstreamer-backend = [
+    "dep:gstreamer",
+    "dep:gstreamer-app",
     "clipstrike-audio/gstreamer-backend",
     "clipstrike-media/gstreamer-backend",
 ]
@@ -16,17 +18,24 @@ clipstrike-audio = { path = "../clipstrike-audio" }
 clipstrike-core = { path = "../clipstrike-core" }
 clipstrike-media = { path = "../clipstrike-media" }
 clipstrike-render = { path = "../clipstrike-render" }
+base64.workspace = true
 eframe.workspace = true
 egui.workspace = true
 egui_extras.workspace = true
+glam.workspace = true
 futures.workspace = true
 image.workspace = true
 log.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-wgpu.workspace = true
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rfd.workspace = true
 tokio.workspace = true
+url = "2"
+wgpu.workspace = true
+notify = "8.2.0"
+rfd.workspace = true
+gstreamer = { workspace = true, optional = true }
+gstreamer-app = { workspace = true, optional = true }
+
+[dev-dependencies]
+egui_kittest = "0.30.0"

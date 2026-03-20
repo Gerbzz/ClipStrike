@@ -1,11 +1,11 @@
-[package]
+﻿[package]
 name = "clipstrike-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [features]
 default = []
@@ -15,11 +15,5 @@ gstreamer-backend = ["clipstrike-ui/gstreamer-backend"]
 clipstrike-ui = { path = "../clipstrike-ui" }
 eframe.workspace = true
 egui.workspace = true
-log.workspace = true
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 env_logger.workspace = true
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
+log.workspace = true

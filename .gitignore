@@ -1,4 +1,4 @@
-/target
+﻿/target
 
 # Node
 node_modules/
@@ -18,3 +18,19 @@ build_*.txt
 test_out.txt
 test_results.txt
 final_*.txt
+
+# Local tooling and scratch files
+.gemini/
+.superpowers/
+.gitconfig
+skills/
+cgc-mcp.skill
+4053
+head_ui.rs
+head_ui_utf8.txt
+orig_ui_head.rs
+server.err
+server.out
+ui-debug-screenshot.png
+New Project.mp4
+PythonDatatempclipstrike-*

@@ -15,6 +15,10 @@ gstreamer-backend = [
 [dependencies]
 cpal = { workspace = true }
 clipstrike-core = { path = "../clipstrike-core" }
+log = { workspace = true }
+ringbuf = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync"] }
 glib = { workspace = true, optional = true }
 gstreamer = { workspace = true, optional = true }
 gstreamer-app = { workspace = true, optional = true }

@@ -1,4 +1,4 @@
-use crate::timeline::{Clip, Timeline, BlendMode};
+use crate::timeline::{Clip, Timeline};
 use crate::transitions::Transition;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -64,6 +64,25 @@ pub struct TitleAsset {
     pub svg_content: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+pub enum GeneratorType {
+    #[default]
+    SolidColor,
+    LinearGradient,
+    RadialGradient,
+    TestPattern,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GeneratorAsset {
+    pub id: usize,
+    pub name: String,
+    pub generator_type: GeneratorType,
+    pub color1: [f32; 4], // RGBA
+    pub color2: [f32; 4], // For gradients
+    pub params: HashMap<String, f32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Project {
     pub name: String,
@@ -74,10 +93,16 @@ pub struct Project {
     pub tracks: Vec<Track>,
     pub assets: Vec<MediaAsset>,
     pub titles: Vec<TitleAsset>,
+    pub generators: Vec<GeneratorAsset>,
     pub transition_masks: Vec<TransitionMaskAsset>,
     pub clips: Vec<Clip>,
     pub transitions: Vec<Transition>,
     pub markers: Vec<Marker>,
+    pub watermark_asset_id: Option<usize>,
+    pub watermark_opacity: f32,
+    pub watermark_scale: f32,
+    pub watermark_pos_x: f32,
+    pub watermark_pos_y: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -128,10 +153,16 @@ impl Project {
             tracks: Vec::new(),
             assets: Vec::new(),
             titles: Vec::new(),
+            generators: Vec::new(),
             transition_masks: Vec::new(),
             clips: Vec::new(),
             transitions: Vec::new(),
             markers: Vec::new(),
+            watermark_asset_id: None,
+            watermark_opacity: 0.5,
+            watermark_scale: 0.2,
+            watermark_pos_x: 0.8,
+            watermark_pos_y: 0.1,
         }
     }
 
@@ -245,6 +276,11 @@ impl Project {
             return MarkerToggleResult::Removed(self.markers.remove(pos));
         }
 
+        let marker = self.add_marker(time_ms);
+        MarkerToggleResult::Added(marker)
+    }
+
+    pub fn add_marker(&mut self, time_ms: i64) -> Marker {
         let marker = Marker {
             id: rand::random::<usize>(),
             time_ms,
@@ -253,7 +289,7 @@ impl Project {
         };
         self.markers.push(marker.clone());
         self.markers.sort_by_key(|marker| marker.time_ms);
-        MarkerToggleResult::Added(marker)
+        marker
     }
 
     pub fn previous_marker(&self, time_ms: i64) -> Option<&Marker> {
@@ -286,15 +322,21 @@ impl Project {
     }
 
     pub fn save<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
-        let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, json)?;
+        std::fs::write(path, self.to_json_bytes()?)?;
         Ok(())
     }
 
     pub fn load<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        let project: Project = serde_json::from_str(&content)?;
-        Ok(project)
+        let content = std::fs::read(path)?;
+        Ok(Self::from_json_bytes(&content)?)
+    }
+
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec_pretty(self)
+    }
+
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(bytes)
     }
 }
 
@@ -327,6 +369,7 @@ mod tests {
     use super::*;
     use crate::keyframes::InterpolationMode;
     use crate::keyframes::KeyframedProperty;
+    use crate::timeline::BlendMode;
     use crate::transitions::TransitionType;
 
     #[test]
@@ -372,13 +415,31 @@ mod tests {
             rotation: KeyframedProperty::new(0.0),
             opacity: KeyframedProperty::new(1.0),
             speed: KeyframedProperty::new(1.0),
+            pixelate_size: KeyframedProperty::new(1.0),
+            gamma: KeyframedProperty::new(1.0),
+            hue: KeyframedProperty::new(0.0),
+            color_tint_r: KeyframedProperty::new(1.0),
+            color_tint_g: KeyframedProperty::new(1.0),
+            color_tint_b: KeyframedProperty::new(1.0),
+            chroma_key_threshold: KeyframedProperty::new(0.0),
+            chroma_key_fuzziness: KeyframedProperty::new(0.1),
+            chroma_key_r: KeyframedProperty::new(0.0),
+            chroma_key_g: KeyframedProperty::new(1.0),
+            chroma_key_b: KeyframedProperty::new(0.0),
+            lut_enabled: KeyframedProperty::new(0.0),
+            lut_path: None,
+            lut_size: 0,
             reverse: false,
             freeze_frame_ms: None,
             audio_enabled: true,
             video_enabled: true,
+            tracking_data: Vec::new(),
+            detections: Vec::new(),
+            effects: Vec::new(),
             stabilization_enabled: false,
             motion_tracking_enabled: false,
             object_detection_enabled: false,
+            stabilization_strength: KeyframedProperty::new(0.0),
         }
     }
 
@@ -593,6 +654,25 @@ mod tests {
     }
 
     #[test]
+    fn add_marker_always_inserts_and_keeps_timeline_sorted() {
+        let mut project = Project::new("Test Project", 1920, 1080, 60.0);
+
+        let first = project.add_marker(1_000);
+        let second = project.add_marker(250);
+
+        assert_eq!(first.time_ms, 1_000);
+        assert_eq!(second.time_ms, 250);
+        assert_eq!(
+            project
+                .markers
+                .iter()
+                .map(|marker| marker.time_ms)
+                .collect::<Vec<_>>(),
+            vec![250, 1_000]
+        );
+    }
+
+    #[test]
     fn marker_navigation_finds_previous_and_next() {
         let mut project = Project::new("Test Project", 1920, 1080, 60.0);
         project.markers = vec![
@@ -646,7 +726,9 @@ mod tests {
         let mut proj = Project::new("Capture Test", 1920, 1080, 60.0);
         let mut timeline = Timeline::new();
         timeline.add_clip(make_clip(1, 1, 0, 100));
-        timeline.transitions.push(Transition::new(1, 1, 50, 100, TransitionType::Crossfade));
+        timeline
+            .transitions
+            .push(Transition::new(1, 1, 50, 100, TransitionType::Crossfade));
 
         proj.capture_timeline(&timeline);
 
@@ -654,5 +736,29 @@ mod tests {
         assert_eq!(proj.clips[0].id, 1);
         assert_eq!(proj.transitions.len(), 1);
         assert_eq!(proj.transitions[0].id, 1);
+    }
+
+    #[test]
+    fn project_json_bytes_round_trip_preserves_state() {
+        let mut proj = Project::new("Bytes", 1280, 720, 30.0);
+        proj.tracks = Project::default_tracks(2);
+        proj.assets.push(MediaAsset {
+            id: 9,
+            name: "Import.mp4".to_string(),
+            uri: "browser://Import.mp4".to_string(),
+            duration_ms: 1_500,
+            audio_levels: vec![0.1, 0.2, 0.3],
+        });
+        proj.markers.push(Marker {
+            id: 7,
+            time_ms: 250,
+            label: "Cue".to_string(),
+            color: [255, 0, 0, 255],
+        });
+
+        let bytes = proj.to_json_bytes().expect("project should serialize");
+        let loaded = Project::from_json_bytes(&bytes).expect("project should deserialize");
+
+        assert_eq!(proj, loaded);
     }
 }
