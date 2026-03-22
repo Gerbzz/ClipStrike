@@ -49,6 +49,7 @@ pub struct TexturePool {
     pub width: u32,
     pub height: u32,
     pool: Vec<FrameTexture>,
+    warned_native_import_failed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -344,6 +345,7 @@ impl TexturePool {
             width,
             height,
             pool,
+            warned_native_import_failed: false,
         }
     }
 
@@ -412,67 +414,80 @@ impl TexturePool {
         let height = self.height;
         let device = Arc::clone(&self.device);
         let format = self.format;
-        let frame = self
-            .acquire_for_clip(request.clip_id)
-            .ok_or_else(|| format!("No frame available for clip {}", request.clip_id))?;
-        let mut imported_native_preview = false;
 
         let state = frame_upload_state_from_request(&request);
-        if !request.pixels.is_empty() {
-            let bytes_per_row = width * 4;
-            if request.pixels.len() != (width as usize * height as usize * 4) {
-                return Err(format!(
-                    "Unexpected pixel payload size for clip {}: got {}, expected {}",
-                    request.clip_id,
-                    request.pixels.len(),
-                    width as usize * height as usize * 4,
-                ));
-            }
-            queue.write_texture(
-                wgpu::ImageCopyTexture {
-                    texture: &frame.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &request.pixels,
-                wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(bytes_per_row),
-                    rows_per_image: Some(height),
-                },
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
+        let mut imported_native_preview = false;
+        let mut native_import_err = None;
 
-        if let Some(shared_handle) = request.native_d3d12_shared_handle {
-            match import_native_d3d12_texture(&device, width, height, format, shared_handle) {
-                Ok((native_texture, native_view)) => {
-                    frame.native_texture = Some(native_texture);
-                    frame.native_view = Some(native_view);
-                    frame.native_d3d12_shared_handle = Some(shared_handle);
-                    imported_native_preview = true;
-                }
-                Err(err) => {
-                    log::warn!(
-                        "Falling back to CPU frame for clip {} after native import failed: {}",
+        {
+            let frame = self
+                .acquire_for_clip(request.clip_id)
+                .ok_or_else(|| format!("No frame available for clip {}", request.clip_id))?;
+
+            if !request.pixels.is_empty() {
+                let bytes_per_row = width * 4;
+                if request.pixels.len() != (width as usize * height as usize * 4) {
+                    return Err(format!(
+                        "Unexpected pixel payload size for clip {}: got {}, expected {}",
                         request.clip_id,
-                        err
-                    );
-                    frame.clear_preview_metadata();
+                        request.pixels.len(),
+                        width as usize * height as usize * 4,
+                    ));
                 }
+                queue.write_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &frame.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &request.pixels,
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(bytes_per_row),
+                        rows_per_image: Some(height),
+                    },
+                    wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                );
             }
-        } else {
-            frame.clear_preview_metadata();
+
+            if let Some(shared_handle) = request.native_d3d12_shared_handle {
+                match import_native_d3d12_texture(&device, width, height, format, shared_handle) {
+                    Ok((native_texture, native_view)) => {
+                        frame.native_texture = Some(native_texture);
+                        frame.native_view = Some(native_view);
+                        frame.native_d3d12_shared_handle = Some(shared_handle);
+                        imported_native_preview = true;
+                    }
+                    Err(err) => {
+                        native_import_err = Some(err);
+                        frame.clear_preview_metadata();
+                    }
+                }
+            } else {
+                frame.clear_preview_metadata();
+            }
+
+            frame.ready = state.ready;
+            frame.clip_id = state.clip_id;
+            frame.external_texture_id = state.external_texture_id;
         }
 
-        frame.ready = state.ready;
-        frame.clip_id = state.clip_id;
-        frame.external_texture_id = state.external_texture_id;
+        if let Some(err) = native_import_err {
+            if !self.warned_native_import_failed {
+                log::warn!(
+                    "Falling back to CPU frame for clip {} after native import failed: {}. This usually happens if the WGPU backend is not DX12 on Windows. Subsequent failures for this session will be silenced.",
+                    request.clip_id,
+                    err
+                );
+                self.warned_native_import_failed = true;
+            }
+        }
+
         Ok(imported_native_preview)
     }
 

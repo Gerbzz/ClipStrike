@@ -4,9 +4,16 @@ use clipstrike_ui::ui::ClipStrikeApp;
 use eframe::egui;
 
 pub fn run_native() -> eframe::Result {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,wgpu_hal::vulkan::instance=error,wgpu_hal::vulkan::adapter=error,wgpu_hal::vulkan::conv=error,wgpu_hal::auxil::dxgi::exception=error"))
         .format_timestamp_millis()
         .init();
+
+    #[cfg(target_os = "windows")]
+    if std::env::var("WGPU_BACKEND").is_err() {
+        unsafe {
+            std::env::set_var("WGPU_BACKEND", "dx12");
+        }
+    }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

@@ -50,6 +50,20 @@ mod imp {
         result
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum SeekMode {
+        Discrete,
+        Interactive,
+    }
+
+    pub(super) fn seek_flags(mode: SeekMode) -> gst::SeekFlags {
+        let mut flags = gst::SeekFlags::ACCURATE | gst::SeekFlags::FLUSH;
+        if matches!(mode, SeekMode::Interactive) {
+            flags |= gst::SeekFlags::TRICKMODE;
+        }
+        flags
+    }
+
     pub struct VideoEngine {
         pipeline: gst::Pipeline,
         appsink: gst_app::AppSink,
@@ -73,6 +87,9 @@ mod imp {
             audio_enabled: bool,
             frame_sender: Option<
                 tokio::sync::mpsc::Sender<clipstrike_render::gpu::FrameUploadRequest>,
+            >,
+            event_sender: Option<
+                tokio::sync::mpsc::UnboundedSender<crate::engine_manager::EngineEvent>,
             >,
             audio_handle: Option<AudioHandle>,
         ) -> Result<Self, String> {
@@ -230,6 +247,7 @@ mod imp {
             })?;
             let bus_stop = Arc::new(AtomicBool::new(false));
             let bus_stop_for_thread = Arc::clone(&bus_stop);
+            let event_sender_for_thread = event_sender.clone();
             let bus_task = thread::spawn(move || {
                 while !bus_stop_for_thread.load(Ordering::Relaxed) {
                     let Some(msg) = bus.timed_pop(Some(gst::ClockTime::from_mseconds(250))) else {
@@ -241,7 +259,13 @@ mod imp {
                             log::error!("GStreamer Error: {} ({:?})", err.error(), err.debug());
                         }
                         gst::MessageView::Eos(_) => {
-                            log::info!("GStreamer EOS reached");
+                            log::info!("GStreamer EOS reached for clip_id={}", clip_id);
+                            if let Some(sender) = &event_sender_for_thread {
+                                let _ =
+                                    sender.send(crate::engine_manager::EngineEvent::EndOfStream {
+                                        clip_id,
+                                    });
+                            }
                             break;
                         }
                         _ => {}
@@ -315,28 +339,41 @@ mod imp {
                 (&self.audio_appsink, &self.audio_handle)
             {
                 let handle_ref = audio_handle.clone();
+                let preroll_handle_ref = handle_ref.clone();
                 let cid = self.clip_id;
                 audio_sink.set_callbacks(
                     gst_app::AppSinkCallbacks::builder()
+                        .new_preroll(move |sink| {
+                            let sample = sink.pull_preroll().map_err(|_| gst::FlowError::Eos)?;
+                            Self::forward_audio_sink_sample(sample, &preroll_handle_ref, cid)
+                        })
                         .new_sample(move |sink| {
                             let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                            let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
-                            let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
-                            match decode_f32le_samples(map.as_ref()) {
-                                Ok(new_samples) => handle_ref.push_samples(cid, new_samples),
-                                Err(err) => {
-                                    log::warn!(
-                                        "Skipping audio buffer for clip {} because it could not be decoded safely: {}",
-                                        cid,
-                                        err
-                                    );
-                                }
-                            }
-                            Ok(gst::FlowSuccess::Ok)
+                            Self::forward_audio_sink_sample(sample, &handle_ref, cid)
                         })
                         .build(),
                 );
             }
+        }
+
+        fn forward_audio_sink_sample(
+            sample: gst::Sample,
+            handle_ref: &AudioHandle,
+            cid: usize,
+        ) -> Result<gst::FlowSuccess, gst::FlowError> {
+            let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+            let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+            match decode_f32le_samples(map.as_ref()) {
+                Ok(new_samples) => handle_ref.push_samples(cid, new_samples),
+                Err(err) => {
+                    log::warn!(
+                        "Skipping audio buffer for clip {} because it could not be decoded safely: {}",
+                        cid,
+                        err
+                    );
+                }
+            }
+            Ok(gst::FlowSuccess::Ok)
         }
 
         pub fn play(&self) -> Result<(), String> {
@@ -354,9 +391,21 @@ mod imp {
         }
 
         pub fn seek(&self, position: std::time::Duration) -> Result<(), String> {
+            self.seek_with_mode(position, SeekMode::Discrete)
+        }
+
+        pub fn seek_interactive(&self, position: std::time::Duration) -> Result<(), String> {
+            self.seek_with_mode(position, SeekMode::Interactive)
+        }
+
+        fn seek_with_mode(
+            &self,
+            position: std::time::Duration,
+            mode: SeekMode,
+        ) -> Result<(), String> {
             self.pipeline
                 .seek_simple(
-                    gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+                    seek_flags(mode),
                     gst::ClockTime::from_nseconds(position.as_nanos() as u64),
                 )
                 .map_err(|e| e.to_string())
@@ -376,6 +425,14 @@ mod imp {
 
         pub fn get_audio_samples(&self) -> Arc<Vec<f32>> {
             Arc::new(Vec::new())
+        }
+
+        /// Query GStreamer's actual playback position in milliseconds.
+        /// Returns `None` if the position is not available (e.g. pipeline not ready).
+        pub fn query_position_ms(&self) -> Option<i64> {
+            self.pipeline
+                .query_position::<gst::ClockTime>()
+                .map(|t| t.mseconds() as i64)
         }
     }
 
@@ -550,7 +607,7 @@ mod imp {
         use super::{
             frame_upload_request_from_buffer, frame_upload_request_from_sample,
             ghost_pad_from_static_pad, run_catching_panics, sample_external_texture_id,
-            video_sink_caps, video_sink_caps_with_gl_memory,
+            seek_flags, video_sink_caps, video_sink_caps_with_gl_memory, SeekMode,
         };
         use gstreamer as gst;
 
@@ -594,6 +651,25 @@ mod imp {
             );
         }
 
+
+        #[test]
+        fn discrete_seek_flushes_and_uses_accurate_positioning() {
+            let flags = seek_flags(SeekMode::Discrete);
+
+            assert!(flags.contains(gst::SeekFlags::FLUSH));
+            assert!(flags.contains(gst::SeekFlags::ACCURATE));
+            assert!(!flags.contains(gst::SeekFlags::KEY_UNIT));
+        }
+
+        #[test]
+        fn interactive_seek_flushes_and_uses_accurate_trickmode() {
+            let flags = seek_flags(SeekMode::Interactive);
+
+            assert!(flags.contains(gst::SeekFlags::FLUSH));
+            assert!(flags.contains(gst::SeekFlags::ACCURATE));
+            assert!(flags.contains(gst::SeekFlags::TRICKMODE));
+        }
+
         #[test]
         fn video_engine_new_can_configure_playbin3_for_preview_playback() {
             gst::init().expect("gstreamer init");
@@ -606,8 +682,9 @@ mod imp {
                 media_path.to_string_lossy().replace('\\', "/")
             );
 
-            let engine = super::VideoEngine::new(&uri, 77, 1920, 1080, true, false, None, None)
-                .expect("VideoEngine::new should not panic or fail for preview playback");
+            let engine =
+                super::VideoEngine::new(&uri, 77, 1920, 1080, true, false, None, None, None)
+                    .expect("VideoEngine::new should not panic or fail for preview playback");
 
             drop(engine);
         }
@@ -698,6 +775,9 @@ mod imp {
                 tokio::sync::mpsc::Sender<clipstrike_render::gpu::FrameUploadRequest>,
             >,
             #[cfg(target_arch = "wasm32")] _frame_sender: Option<()>,
+            _event_sender: Option<
+                tokio::sync::mpsc::UnboundedSender<crate::engine_manager::EngineEvent>,
+            >,
             _audio_handle: Option<AudioHandle>,
         ) -> Result<Self, String> {
             Ok(Self { _clip_id: clip_id })
@@ -715,6 +795,10 @@ mod imp {
             Ok(())
         }
 
+        pub fn seek_interactive(&self, _position: std::time::Duration) -> Result<(), String> {
+            Ok(())
+        }
+
         pub fn stop(&self) -> Result<(), String> {
             Ok(())
         }
@@ -725,6 +809,10 @@ mod imp {
 
         pub fn get_audio_samples(&self) -> Arc<Vec<f32>> {
             Arc::new(Vec::new())
+        }
+
+        pub fn query_position_ms(&self) -> Option<i64> {
+            None
         }
     }
 }

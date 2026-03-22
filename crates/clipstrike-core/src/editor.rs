@@ -4,9 +4,9 @@ use crate::commands::{
     AddClipCommand, MoveClipCommand, RemoveClipCommand, TrimClipCommand, UndoStack,
 };
 use crate::effects::MotionTrack;
-use crate::keyframes::{InterpolationMode, KeyframedProperty};
+use crate::keyframes::InterpolationMode;
 use crate::project::{Marker, MarkerToggleResult, MediaAsset, Project, TransitionMaskAsset};
-use crate::timeline::{BlendMode, Clip, Timeline};
+use crate::timeline::{Clip, Timeline};
 use crate::transitions::{TransitionType, fade_in_points, fade_out_points};
 
 pub struct EditorSession {
@@ -96,56 +96,17 @@ impl EditorSession {
         self.project.assets.push(asset);
         id
     }
-
     pub fn build_clip(&self, asset_id: usize, track_id: usize, start: i64, end: i64) -> Clip {
-        Clip {
-            id: rand::random::<usize>(),
+        Clip::new(
+            rand::random::<usize>(),
             asset_id,
             track_id,
-            blend_mode: BlendMode::Normal,
             start,
             end,
-            brightness: KeyframedProperty::new(1.0),
-            contrast: KeyframedProperty::new(1.0),
-            saturation: KeyframedProperty::new(1.0),
-            grayscale: KeyframedProperty::new(0.0),
-            blur_radius: KeyframedProperty::new(0.0),
-            volume: KeyframedProperty::new(1.0),
-            pos_x: KeyframedProperty::new(0.0),
-            pos_y: KeyframedProperty::new(0.0),
-            scale_x: KeyframedProperty::new(1.0),
-            scale_y: KeyframedProperty::new(1.0),
-            rotation: KeyframedProperty::new(0.0),
-            opacity: KeyframedProperty::new(1.0),
-            speed: KeyframedProperty::new(1.0),
-            pixelate_size: KeyframedProperty::new(1.0),
-            gamma: KeyframedProperty::new(1.0),
-            hue: KeyframedProperty::new(0.0),
-            color_tint_r: KeyframedProperty::new(1.0),
-            color_tint_g: KeyframedProperty::new(1.0),
-            color_tint_b: KeyframedProperty::new(1.0),
-            chroma_key_threshold: KeyframedProperty::new(0.0),
-            chroma_key_fuzziness: KeyframedProperty::new(0.1),
-            chroma_key_r: KeyframedProperty::new(0.0),
-            chroma_key_g: KeyframedProperty::new(1.0),
-            chroma_key_b: KeyframedProperty::new(0.0),
-            lut_enabled: KeyframedProperty::new(0.0),
-            lut_path: None,
-            lut_size: 0,
-            reverse: false,
-            freeze_frame_ms: None,
-            audio_enabled: true,
-            video_enabled: true,
-            stabilization_enabled: false,
-            motion_tracking_enabled: false,
-            stabilization_strength: KeyframedProperty::new(0.5),
-            object_detection_enabled: false,
-            tracking_data: Vec::new(),
-            detections: Vec::new(),
-            effects: Vec::new(),
-        }
+            0,
+            end - start,
+        )
     }
-
     pub fn add_clip(&mut self, clip: Clip) -> usize {
         let clip_id = clip.id;
         self.undo_stack.push(
@@ -498,56 +459,9 @@ mod tests {
     use super::*;
     use crate::effects::{MotionTrack, TrackPoint};
     use proptest::prelude::*;
-
     fn make_clip(id: usize, track_id: usize, start: i64, end: i64) -> Clip {
-        Clip {
-            id,
-            asset_id: id,
-            track_id,
-            blend_mode: BlendMode::Normal,
-            start,
-            end,
-            brightness: KeyframedProperty::new(1.0),
-            contrast: KeyframedProperty::new(1.0),
-            saturation: KeyframedProperty::new(1.0),
-            grayscale: KeyframedProperty::new(0.0),
-            blur_radius: KeyframedProperty::new(0.0),
-            volume: KeyframedProperty::new(1.0),
-            pos_x: KeyframedProperty::new(0.0),
-            pos_y: KeyframedProperty::new(0.0),
-            scale_x: KeyframedProperty::new(1.0),
-            scale_y: KeyframedProperty::new(1.0),
-            rotation: KeyframedProperty::new(0.0),
-            opacity: KeyframedProperty::new(1.0),
-            speed: KeyframedProperty::new(1.0),
-            pixelate_size: KeyframedProperty::new(1.0),
-            gamma: KeyframedProperty::new(1.0),
-            hue: KeyframedProperty::new(0.0),
-            color_tint_r: KeyframedProperty::new(1.0),
-            color_tint_g: KeyframedProperty::new(1.0),
-            color_tint_b: KeyframedProperty::new(1.0),
-            chroma_key_threshold: KeyframedProperty::new(0.0),
-            chroma_key_fuzziness: KeyframedProperty::new(0.1),
-            chroma_key_r: KeyframedProperty::new(0.0),
-            chroma_key_g: KeyframedProperty::new(1.0),
-            chroma_key_b: KeyframedProperty::new(0.0),
-            lut_enabled: KeyframedProperty::new(0.0),
-            lut_path: None,
-            lut_size: 0,
-            reverse: false,
-            freeze_frame_ms: None,
-            audio_enabled: true,
-            video_enabled: true,
-            stabilization_enabled: false,
-            motion_tracking_enabled: false,
-            stabilization_strength: KeyframedProperty::new(0.5),
-            object_detection_enabled: false,
-            tracking_data: Vec::new(),
-            detections: Vec::new(),
-            effects: Vec::new(),
-        }
+        Clip::new(id, id, track_id, start, end, 0, end - start)
     }
-
     #[test]
     fn scripted_session_round_trip_preserves_transition_state() {
         let mut session = EditorSession::with_default_project("Harness", 1920, 1080, 60.0, 3);

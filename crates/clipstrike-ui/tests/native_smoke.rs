@@ -1,4 +1,28 @@
 #[cfg(windows)]
+fn unique_smoke_appdata_dir(test_name: &str) -> std::path::PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let unique_suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "clipstrike-{test_name}-appdata-{}-{unique_suffix}",
+        std::process::id()
+    ))
+}
+
+#[cfg(windows)]
+#[test]
+fn unique_smoke_appdata_dir_returns_a_fresh_path() {
+    let first = unique_smoke_appdata_dir("native-smoke");
+    let second = unique_smoke_appdata_dir("native-smoke");
+
+    assert_ne!(first, second);
+    assert!(first.to_string_lossy().contains("clipstrike-native-smoke-appdata"));
+}
+
+#[cfg(windows)]
 #[ignore]
 #[test]
 fn windows_launch_smoke_stays_alive() {
@@ -23,7 +47,7 @@ fn windows_launch_smoke_stays_alive() {
 fn windows_import_smoke_inserts_clip() {
     use std::{fs, process::Command};
 
-    let appdata_dir = std::env::temp_dir().join("clipstrike-native-appdata");
+    let appdata_dir = unique_smoke_appdata_dir("native-import");
     fs::create_dir_all(&appdata_dir).expect("create appdata dir");
     unsafe {
         std::env::set_var("APPDATA", &appdata_dir);
@@ -147,9 +171,140 @@ fn windows_launch_smoke_stays_alive() {
     assert!(true);
 }
 
+#[cfg(windows)]
+#[ignore]
+#[test]
+fn windows_playback_boundary_smoke_stops_at_clip_end() {
+    use std::{fs, path::PathBuf, process::Command};
+
+    let appdata_dir = unique_smoke_appdata_dir("native-playback");
+    fs::create_dir_all(&appdata_dir).expect("create playback appdata dir");
+    unsafe {
+        std::env::set_var("APPDATA", &appdata_dir);
+    }
+
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .expect("repo root should resolve");
+    let fixture_path = repo_root.join("PythonDatatempclipstrike-gst-launch-smoke.mp4");
+    assert!(
+        fixture_path.exists(),
+        "expected playback fixture at {}",
+        fixture_path.display()
+    );
+    unsafe {
+        std::env::set_var("CLIPSTRIKE_TEST_MEDIA_PATHS", &fixture_path);
+    }
+
+    let mut child = clipstrike_ui::native_smoke::launch_clipstrike_desktop()
+        .expect("desktop app should launch for smoke testing");
+
+    let pid = child.id();
+    let asset_name = fixture_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("fixture should have a UTF-8 file name");
+    let script = r#"
+param([int]$TargetPid)
+Add-Type -AssemblyName UIAutomationClient
+$root = [System.Windows.Automation.AutomationElement]::RootElement
+$pidCond = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::ProcessIdProperty,
+    $TargetPid
+)
+$winCond = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+    [System.Windows.Automation.ControlType]::Window
+)
+$topCond = New-Object System.Windows.Automation.AndCondition($pidCond, $winCond)
+
+function Find-ElementByName($scopeRoot, [string]$name, [int]$attempts = 80, [int]$delayMs = 250) {
+    $cond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::NameProperty,
+        $name
+    )
+    $found = $null
+    for ($i = 0; $i -lt $attempts -and -not $found; $i++) {
+        $found = $scopeRoot.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+        if (-not $found) { Start-Sleep -Milliseconds $delayMs }
+    }
+    return $found
+}
+
+$window = $null
+for ($i = 0; $i -lt 60 -and -not $window; $i++) {
+    $window = $root.FindFirst([System.Windows.Automation.TreeScope]::Children, $topCond)
+    if (-not $window) { Start-Sleep -Milliseconds 250 }
+}
+if (-not $window) { throw "ClipStrike window not found for PID $TargetPid" }
+
+$importButton = Find-ElementByName $window "Import" 60 250
+if (-not $importButton) { throw "Import button not found" }
+$importInvoke = $importButton.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+$importInvoke.Invoke()
+
+$asset = Find-ElementByName $window "{ASSET_NAME}" 80 250
+if (-not $asset) { throw "Imported asset row not found" }
+
+$row = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($asset)
+if (-not $row) { throw "Could not resolve imported asset row parent" }
+$rowPlus = Find-ElementByName $row "+" 30 250
+if (-not $rowPlus) { throw "Imported asset + button not found" }
+$plusInvoke = $rowPlus.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+$plusInvoke.Invoke()
+
+$playButton = Find-ElementByName $window "Play" 80 250
+if (-not $playButton) { throw "Play button not found" }
+$playInvoke = $playButton.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+$playInvoke.Invoke()
+
+$complete = Find-ElementByName $window "__clipstrike_test_playback_complete__: true" 160 250
+if (-not $complete) { throw "Playback completion marker not found" }
+"#
+        .replace("{ASSET_NAME}", asset_name);
+
+    let script_path = std::env::temp_dir().join(format!("clipstrike_uia_playback_{}.ps1", pid));
+    fs::write(&script_path, script).expect("should write UIA script");
+
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            script_path
+                .to_str()
+                .expect("temp path should be valid UTF-8"),
+            "-TargetPid",
+            &pid.to_string(),
+        ])
+        .output()
+        .expect("should run UIAutomation script");
+
+    let _ = child.kill();
+    unsafe {
+        std::env::remove_var("CLIPSTRIKE_TEST_MEDIA_PATHS");
+    }
+
+    assert!(
+        output.status.success(),
+        "uia smoke test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[cfg(not(windows))]
 #[test]
 fn windows_import_smoke_inserts_clip() {
+    assert!(true);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn windows_playback_boundary_smoke_stops_at_clip_end() {
     assert!(true);
 }
 
@@ -159,7 +314,7 @@ fn windows_import_smoke_inserts_clip() {
 fn windows_recovery_smoke_shows_banner() {
     use std::{fs, process::Command};
 
-    let appdata_dir = std::env::temp_dir().join("clipstrike-native-recovery-appdata");
+    let appdata_dir = unique_smoke_appdata_dir("native-recovery");
     fs::create_dir_all(&appdata_dir).expect("create recovery appdata dir");
     unsafe {
         std::env::set_var("APPDATA", &appdata_dir);
@@ -470,3 +625,5 @@ stderr:
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+

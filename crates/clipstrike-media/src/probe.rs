@@ -50,6 +50,94 @@ fn copy_readback_pixels(
     pixels
 }
 
+#[cfg_attr(not(feature = "gstreamer-backend"), allow(dead_code))]
+fn select_authoritative_duration(
+    discovered_duration: Option<Duration>,
+    decoded_duration: Option<Duration>,
+) -> Option<Duration> {
+    decoded_duration.or(discovered_duration)
+}
+
+#[cfg(feature = "gstreamer-backend")]
+fn decode_duration_sync(uri: &str) -> Result<Option<Duration>, String> {
+    use gstreamer as gst;
+    use gstreamer::prelude::*;
+
+    if let Err(err) = gst::init() {
+        return Err(format!("Failed to initialize GStreamer: {}", err));
+    }
+
+    let pipeline = gst::ElementFactory::make("playbin3")
+        .build()
+        .map_err(|err| format!("Failed to create duration probe pipeline: {}", err))?
+        .dynamic_cast::<gst::Pipeline>()
+        .map_err(|_| "Failed to cast playbin3 to Pipeline".to_string())?;
+    pipeline.set_property("uri", uri);
+
+    let video_sink = gst::ElementFactory::make("fakesink")
+        .build()
+        .map_err(|err| format!("Failed to create duration probe video sink: {}", err))?;
+    video_sink.set_property("sync", false);
+    video_sink.set_property("async", false);
+    pipeline.set_property("video-sink", &video_sink);
+
+    let audio_sink = gst::ElementFactory::make("fakesink")
+        .build()
+        .map_err(|err| format!("Failed to create duration probe audio sink: {}", err))?;
+    audio_sink.set_property("sync", false);
+    audio_sink.set_property("async", false);
+    pipeline.set_property("audio-sink", &audio_sink);
+
+    pipeline
+        .set_state(gst::State::Playing)
+        .map_err(|err| format!("Failed to start duration probe pipeline: {}", err))?;
+
+    let bus = pipeline
+        .bus()
+        .ok_or_else(|| "Duration probe pipeline has no bus".to_string())?;
+    let started_at = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(30);
+
+    loop {
+        let message = bus.timed_pop_filtered(
+            gst::ClockTime::from_mseconds(100),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        );
+
+        if let Some(message) = message {
+            match message.view() {
+                gst::MessageView::Eos(..) => {
+                    let position = pipeline
+                        .query_position::<gst::ClockTime>()
+                        .map(|clock| Duration::from_nanos(clock.nseconds()));
+                    let duration = pipeline
+                        .query_duration::<gst::ClockTime>()
+                        .map(|clock| Duration::from_nanos(clock.nseconds()));
+                    let _ = pipeline.set_state(gst::State::Null);
+                    return Ok(position.or(duration));
+                }
+                gst::MessageView::Error(err) => {
+                    let _ = pipeline.set_state(gst::State::Null);
+                    return Err(format!(
+                        "Decoded duration probe failed for {}: {}",
+                        uri,
+                        err.error()
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        if started_at.elapsed() >= timeout {
+            let _ = pipeline.set_state(gst::State::Null);
+            return Err(format!(
+                "Timed out waiting for decoded duration probe on {} after {:?}",
+                uri, timeout
+            ));
+        }
+    }
+}
+
 #[cfg(feature = "gstreamer-backend")]
 pub fn probe_metadata_sync(uri: &str) -> Result<ClipMetadata, String> {
     use gstreamer as gst;
@@ -66,9 +154,32 @@ pub fn probe_metadata_sync(uri: &str) -> Result<ClipMetadata, String> {
         .discover_uri(uri)
         .map_err(|e| format!("Failed to discover URI ({}): {}", uri, e))?;
 
-    let duration = info
+    let discovered_duration = info
         .duration()
         .map(|d: gst::ClockTime| Duration::from_nanos(d.nseconds()));
+    let decoded_duration = match decode_duration_sync(uri) {
+        Ok(duration) => duration,
+        Err(err) => {
+            log::warn!(
+                "Falling back to discoverer duration for {} because decoded probe failed: {}",
+                uri,
+                err
+            );
+            None
+        }
+    };
+    let duration = select_authoritative_duration(discovered_duration, decoded_duration);
+
+    if let (Some(discovered), Some(decoded)) = (discovered_duration, decoded_duration) {
+        if discovered != decoded {
+            log::info!(
+                "Using decoded duration for {}: discovered_ms={} decoded_ms={}",
+                uri,
+                discovered.as_millis(),
+                decoded.as_millis()
+            );
+        }
+    }
 
     let mut width = None;
     let mut height = None;
@@ -257,10 +368,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn authoritative_duration_prefers_fully_decoded_duration() {
+        let discovered = Some(Duration::from_millis(5_500));
+        let decoded = Some(Duration::from_millis(5_000));
+
+        assert_eq!(
+            select_authoritative_duration(discovered, decoded),
+            Some(Duration::from_millis(5_000))
+        );
+    }
+
+    #[test]
+    fn authoritative_duration_falls_back_to_discovered_when_decoded_is_none() {
+        let discovered = Some(Duration::from_millis(5_500));
+
+        assert_eq!(
+            select_authoritative_duration(discovered, None),
+            Some(Duration::from_millis(5_500))
+        );
+    }
+
+    #[test]
+    fn authoritative_duration_returns_none_when_both_are_none() {
+        assert_eq!(select_authoritative_duration(None, None), None);
+    }
+
     #[tokio::test]
-    async fn test_probe_invalid_uri() {
-        let uri = "file:///non/existent/file.mp4".to_string();
-        let result = probe_metadata(uri).await;
-        assert!(result.is_err());
+    async fn test_probe_real_file_repro() {
+        use std::path::PathBuf;
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.pop();
+        path.pop();
+        path.push("PythonDatatempclipstrike-gst-repro.mp4");
+        let uri = format!("file:///{}", path.to_string_lossy().replace('\\', "/"));
+        println!("Probing URI: {}", uri);
+        let result = probe_metadata_sync(&uri).expect("probe failed");
+        println!("Metadata: {:?}", result);
+        assert!(result.duration.is_some());
+        assert!(result.duration.unwrap().as_millis() > 0);
     }
 }

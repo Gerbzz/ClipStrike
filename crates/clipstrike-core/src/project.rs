@@ -393,55 +393,9 @@ mod tests {
         assert!(!proj.is_track_audible(proj.tracks[0].id));
         assert!(!proj.is_track_audible(proj.tracks[1].id));
     }
-
-    fn make_clip(id: usize, track_id: usize, start: i64, end: i64) -> Clip {
-        Clip {
-            id,
-            asset_id: id,
-            track_id,
-            blend_mode: BlendMode::Normal,
-            start,
-            end,
-            brightness: KeyframedProperty::new(1.0),
-            contrast: KeyframedProperty::new(1.0),
-            saturation: KeyframedProperty::new(1.0),
-            grayscale: KeyframedProperty::new(0.0),
-            blur_radius: KeyframedProperty::new(0.0),
-            volume: KeyframedProperty::new(1.0),
-            pos_x: KeyframedProperty::new(0.0),
-            pos_y: KeyframedProperty::new(0.0),
-            scale_x: KeyframedProperty::new(1.0),
-            scale_y: KeyframedProperty::new(1.0),
-            rotation: KeyframedProperty::new(0.0),
-            opacity: KeyframedProperty::new(1.0),
-            speed: KeyframedProperty::new(1.0),
-            pixelate_size: KeyframedProperty::new(1.0),
-            gamma: KeyframedProperty::new(1.0),
-            hue: KeyframedProperty::new(0.0),
-            color_tint_r: KeyframedProperty::new(1.0),
-            color_tint_g: KeyframedProperty::new(1.0),
-            color_tint_b: KeyframedProperty::new(1.0),
-            chroma_key_threshold: KeyframedProperty::new(0.0),
-            chroma_key_fuzziness: KeyframedProperty::new(0.1),
-            chroma_key_r: KeyframedProperty::new(0.0),
-            chroma_key_g: KeyframedProperty::new(1.0),
-            chroma_key_b: KeyframedProperty::new(0.0),
-            lut_enabled: KeyframedProperty::new(0.0),
-            lut_path: None,
-            lut_size: 0,
-            reverse: false,
-            freeze_frame_ms: None,
-            audio_enabled: true,
-            video_enabled: true,
-            tracking_data: Vec::new(),
-            detections: Vec::new(),
-            effects: Vec::new(),
-            stabilization_enabled: false,
-            motion_tracking_enabled: false,
-            object_detection_enabled: false,
-            stabilization_strength: KeyframedProperty::new(0.0),
-        }
-    }
+fn make_clip(id: usize, track_id: usize, start: i64, end: i64) -> Clip {
+    Clip::new(id, id, track_id, start, end, 0, end - start)
+}
 
     #[test]
     fn test_project_serialization_round_trips_runtime_state() {

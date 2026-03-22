@@ -360,10 +360,31 @@ mod imp {
         purpose: &str,
     ) -> Result<(gst::Element, String), String> {
         let mut last_error = None;
+        let mut tried_hardware = false;
+
         for name in candidates {
+            let is_hw = name.contains("nv")
+                || name.contains("vaapi")
+                || name.contains("qsv")
+                || name.contains("d3d11");
+            if is_hw {
+                tried_hardware = true;
+            }
+
             match gst::ElementFactory::make(name).build() {
                 Ok(element) => {
-                    log::info!("Using {} element `{}`", purpose, name);
+                    if is_hw {
+                        log::info!("Using HARDWARE {} element `{}`", purpose, name);
+                    } else {
+                        if tried_hardware {
+                            log::warn!(
+                                "FALLBACK: Using SOFTWARE {} element `{}` because hardware acceleration failed or was unavailable",
+                                purpose, name
+                            );
+                        } else {
+                            log::info!("Using SOFTWARE {} element `{}`", purpose, name);
+                        }
+                    }
                     return Ok((element, (*name).to_string()));
                 }
                 Err(err) => {

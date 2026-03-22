@@ -6,6 +6,23 @@ pub trait Command {
     fn undo(&mut self, project: &mut Project, timeline: &mut Timeline);
 }
 
+pub struct CompoundCommand {
+    pub commands: Vec<Box<dyn Command>>,
+}
+
+impl Command for CompoundCommand {
+    fn execute(&mut self, project: &mut Project, timeline: &mut Timeline) {
+        for cmd in &mut self.commands {
+            cmd.execute(project, timeline);
+        }
+    }
+    fn undo(&mut self, project: &mut Project, timeline: &mut Timeline) {
+        for cmd in self.commands.iter_mut().rev() {
+            cmd.undo(project, timeline);
+        }
+    }
+}
+
 pub struct AddClipCommand {
     pub clip: Clip,
 }
@@ -62,11 +79,49 @@ pub struct TrimClipCommand {
 }
 
 impl Command for TrimClipCommand {
-    fn execute(&mut self, _project: &mut Project, timeline: &mut Timeline) {
-        let _ = timeline.trim(self.clip_id, self.new_start, self.new_end);
+    fn execute(&mut self, project: &mut Project, timeline: &mut Timeline) {
+        let max_duration = project
+            .assets
+            .iter()
+            .find(|a| {
+                timeline
+                    .clips
+                    .iter()
+                    .find(|c| c.id == self.clip_id)
+                    .map(|c| c.asset_id == a.id)
+                    .unwrap_or(false)
+            })
+            .map(|a| a.duration_ms as i64)
+            .unwrap_or(i64::MAX);
+
+        let _ = timeline.trim(
+            self.clip_id,
+            self.new_start,
+            self.new_end,
+            max_duration,
+        );
     }
-    fn undo(&mut self, _project: &mut Project, timeline: &mut Timeline) {
-        let _ = timeline.trim(self.clip_id, self.old_start, self.old_end);
+    fn undo(&mut self, project: &mut Project, timeline: &mut Timeline) {
+        let max_duration = project
+            .assets
+            .iter()
+            .find(|a| {
+                timeline
+                    .clips
+                    .iter()
+                    .find(|c| c.id == self.clip_id)
+                    .map(|c| c.asset_id == a.id)
+                    .unwrap_or(false)
+            })
+            .map(|a| a.duration_ms as i64)
+            .unwrap_or(i64::MAX);
+
+        let _ = timeline.trim(
+            self.clip_id,
+            self.old_start,
+            self.old_end,
+            max_duration,
+        );
     }
 }
 
@@ -76,16 +131,31 @@ pub struct SeparateAudioCommand {
 }
 
 impl Command for SeparateAudioCommand {
-    fn execute(&mut self, _project: &mut Project, timeline: &mut Timeline) {
+    fn execute(&mut self, project: &mut Project, timeline: &mut Timeline) {
         if let Some(pos) = timeline.clips.iter().position(|c| c.id == self.clip_id) {
             timeline.clips[pos].audio_enabled = false;
+            timeline.clips[pos].group_id = self.audio_clip.group_id;
             timeline.add_clip(self.audio_clip.clone());
+
+            // Sync project
+            if let Some(p_pos) = project.clips.iter().position(|c| c.id == self.clip_id) {
+                project.clips[p_pos].audio_enabled = false;
+                project.clips[p_pos].group_id = self.audio_clip.group_id;
+            }
+            project.clips.push(self.audio_clip.clone());
         }
     }
-    fn undo(&mut self, _project: &mut Project, timeline: &mut Timeline) {
+    fn undo(&mut self, project: &mut Project, timeline: &mut Timeline) {
         timeline.remove_clip(self.audio_clip.id);
         if let Some(pos) = timeline.clips.iter().position(|c| c.id == self.clip_id) {
             timeline.clips[pos].audio_enabled = true;
+            // Note: We don't necessarily reset group_id here as it doesn't hurt to keep it
+        }
+
+        // Sync project
+        project.clips.retain(|c| c.id != self.audio_clip.id);
+        if let Some(p_pos) = project.clips.iter().position(|c| c.id == self.clip_id) {
+            project.clips[p_pos].audio_enabled = true;
         }
     }
 }

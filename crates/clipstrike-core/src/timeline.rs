@@ -45,6 +45,8 @@ pub struct Clip {
     pub track_id: usize, // Represents Z-order layering
     pub start: i64,
     pub end: i64,
+    pub in_point: i64,
+    pub out_point: i64,
 
     #[serde(default)]
     pub blend_mode: BlendMode,
@@ -117,6 +119,11 @@ pub struct Clip {
     pub tracking_data: Vec<crate::effects::MotionTrack>,
     #[serde(default)]
     pub detections: Vec<crate::effects::DetectedObject>,
+
+    #[serde(default)]
+    pub group_id: Option<usize>,
+    #[serde(default)]
+    pub color_tag: [u8; 4],
 }
 
 fn default_enabled() -> bool {
@@ -124,13 +131,23 @@ fn default_enabled() -> bool {
 }
 
 impl Clip {
-    pub fn new(id: usize, asset_id: usize, track_id: usize, start: i64, end: i64) -> Self {
+    pub fn new(
+        id: usize,
+        asset_id: usize,
+        track_id: usize,
+        start: i64,
+        end: i64,
+        in_point: i64,
+        out_point: i64,
+    ) -> Self {
         Self {
             id,
             asset_id,
             track_id,
             start,
             end,
+            in_point,
+            out_point,
             blend_mode: BlendMode::Normal,
             brightness: KeyframedProperty::new(1.0),
             contrast: KeyframedProperty::new(1.0),
@@ -170,6 +187,13 @@ impl Clip {
             object_detection_enabled: false,
             tracking_data: Vec::new(),
             detections: Vec::new(),
+            group_id: None,
+            color_tag: [
+                rand::random::<u8>(),
+                rand::random::<u8>(),
+                rand::random::<u8>(),
+                255,
+            ],
         }
     }
 
@@ -185,7 +209,7 @@ impl Clip {
         if let Some(freeze_frame_ms) = self.freeze_frame_ms {
             return freeze_frame_ms.max(0);
         }
-        self.integrated_source_offset(self.end)
+        (self.out_point - self.in_point).max(0)
     }
 
     pub fn source_time_at(&self, timeline_time_ms: i64) -> i64 {
@@ -194,11 +218,10 @@ impl Clip {
         }
 
         let offset = self.integrated_source_offset(timeline_time_ms);
-        let total = self.integrated_source_offset(self.end);
         if self.reverse {
-            (total - offset).max(0)
+            (self.out_point - offset).max(self.in_point)
         } else {
-            offset.min(total)
+            (self.in_point + offset).min(self.out_point)
         }
     }
 
@@ -224,6 +247,30 @@ impl Clip {
         }
 
         area.round() as i64
+    }
+
+    /// Convert a source media position (in milliseconds) back to a timeline position.
+    /// This is the inverse of `source_time_at()` — given where GStreamer currently is
+    /// in the source file, compute where the playhead should be on the timeline.
+    pub fn timeline_time_from_source(&self, source_ms: i64) -> i64 {
+        if self.freeze_frame_ms.is_some() {
+            // Freeze-frame clips don't advance source position, so we can't
+            // derive timeline position from source position. Return clip start.
+            return self.start;
+        }
+
+        let source_offset = if self.reverse {
+            self.out_point - source_ms.clamp(self.in_point, self.out_point)
+        } else {
+            source_ms.clamp(self.in_point, self.out_point) - self.in_point
+        };
+
+        // For constant speed (the common case), this is an exact inversion:
+        // source_offset = speed * (timeline_time - clip.start)
+        // => timeline_time = clip.start + source_offset / speed
+        let speed = self.speed_multiplier_at(self.start).max(0.01);
+        let timeline_offset = (source_offset as f32 / speed).round() as i64;
+        (self.start + timeline_offset).clamp(self.start, self.end)
     }
 }
 
@@ -632,13 +679,16 @@ impl Timeline {
             self.remove_clip(id);
 
             // Add part 1
+            let split_source_at = clip.source_time_at(split_at);
             self.add_clip(Clip {
-                id: rand::random::<usize>(),
+                id, // Keep original ID
                 asset_id: clip.asset_id,
                 track_id: clip.track_id,
                 blend_mode: BlendMode::Normal,
                 start: clip.start,
                 end: split_at,
+                in_point: clip.in_point,
+                out_point: split_source_at,
                 brightness: clip.brightness.clone(),
                 contrast: clip.contrast.clone(),
                 saturation: clip.saturation.clone(),
@@ -677,6 +727,8 @@ impl Timeline {
                 tracking_data: clip.tracking_data.clone(),
                 detections: clip.detections.clone(),
                 effects: clip.effects.clone(),
+                group_id: clip.group_id,
+                color_tag: clip.color_tag,
             });
 
             // Add part 2
@@ -687,6 +739,8 @@ impl Timeline {
                 blend_mode: BlendMode::Normal,
                 start: split_at,
                 end: clip.end,
+                in_point: split_source_at,
+                out_point: clip.out_point,
                 brightness: clip.brightness.clone(),
                 contrast: clip.contrast.clone(),
                 saturation: clip.saturation.clone(),
@@ -725,6 +779,8 @@ impl Timeline {
                 tracking_data: clip.tracking_data.clone(),
                 detections: clip.detections.clone(),
                 effects: clip.effects.clone(),
+                group_id: clip.group_id,
+                color_tag: clip.color_tag,
             });
 
             Ok(())
@@ -734,8 +790,23 @@ impl Timeline {
     }
 
     /// Trims a clip's edges.
-    pub fn trim(&mut self, id: usize, new_start: i64, new_end: i64) -> Result<(), String> {
+    pub fn trim(
+        &mut self,
+        id: usize,
+        new_start: i64,
+        new_end: i64,
+        max_source_duration_ms: i64,
+    ) -> Result<(), String> {
         if let Some(pos) = self.clips.iter().position(|c| c.id == id) {
+            let mut new_in_point =
+                self.clips[pos].in_point + self.clips[pos].integrated_source_offset(new_start);
+            let mut new_out_point =
+                self.clips[pos].in_point + self.clips[pos].integrated_source_offset(new_end);
+
+            // Clamp to source bounds
+            new_in_point = new_in_point.clamp(0, max_source_duration_ms);
+            new_out_point = new_out_point.clamp(new_in_point, max_source_duration_ms);
+
             let old_clip = self.clips[pos].clone();
             self.snap_engine.remove_edge(old_clip.start);
             self.snap_engine.remove_edge(old_clip.end);
@@ -744,6 +815,8 @@ impl Timeline {
             let sanitized_end = new_end.max(sanitized_start + 1);
             self.clips[pos].start = sanitized_start;
             self.clips[pos].end = sanitized_end;
+            self.clips[pos].in_point = new_in_point;
+            self.clips[pos].out_point = new_out_point;
 
             self.snap_engine.add_edge(sanitized_start);
             self.snap_engine.add_edge(sanitized_end);
@@ -841,10 +914,10 @@ mod tests {
     #[test]
     fn test_interval_tree_point_query() {
         let mut tree = IntervalTree::new();
-        tree.insert(Clip::new(1, 0, 1, 10, 50));
-        tree.insert(Clip::new(2, 0, 1, 20, 40));
-        tree.insert(Clip::new(3, 0, 1, 45, 60));
-        tree.insert(Clip::new(4, 0, 1, 5, 15));
+        tree.insert(Clip::new(1, 0, 1, 10, 50, 0, 40));
+        tree.insert(Clip::new(2, 0, 1, 20, 40, 0, 20));
+        tree.insert(Clip::new(3, 0, 1, 45, 60, 0, 15));
+        tree.insert(Clip::new(4, 0, 1, 5, 15, 0, 10));
 
         let result = tree.query_point(30);
         assert_eq!(result.len(), 2);
@@ -1016,7 +1089,7 @@ mod tests {
 
     #[test]
     fn clip_new_initializes_ai_defaults() {
-        let clip = Clip::new(7, 42, 3, 10, 20);
+        let clip = Clip::new(7, 42, 3, 10, 20, 0, 10);
 
         assert_eq!(clip.id, 7);
         assert_eq!(clip.asset_id, 42);
@@ -1031,7 +1104,7 @@ mod tests {
     }
 
     fn make_clip(id: usize, track_id: usize, start: i64, end: i64) -> Clip {
-        Clip::new(id, 0, track_id, start, end)
+        Clip::new(id, 0, track_id, start, end, 0, end - start)
     }
 
     #[test]
@@ -1130,7 +1203,7 @@ mod tests {
         let mut timeline = Timeline::new();
         timeline.add_clip(make_clip(1, 1, 0, 100));
 
-        timeline.trim(1, 50, 150).unwrap();
+        timeline.trim(1, 50, 150, 1000).unwrap();
 
         // queries should reflect the new bounds [50, 150)
         assert_eq!(timeline.get_clips_at_time(25).len(), 0);
@@ -1157,5 +1230,34 @@ mod tests {
                 .find_closest_edge_excluding(0, 10, &[])
                 .is_none()
         );
+    }
+
+    #[test]
+    fn timeline_time_from_source_round_trips_with_source_time_at() {
+        // Clip on timeline at [1000, 6000) with in_point=500, out_point=5500
+        let clip = Clip::new(1, 10, 1, 1000, 6000, 500, 5500);
+
+        // At timeline time 1000, source_time = in_point = 500
+        assert_eq!(clip.source_time_at(1000), 500);
+        assert_eq!(clip.timeline_time_from_source(500), 1000);
+
+        // At timeline time 3500 (midpoint), source_time = 500 + 2500 = 3000
+        assert_eq!(clip.source_time_at(3500), 3000);
+        assert_eq!(clip.timeline_time_from_source(3000), 3500);
+
+        // At timeline time 6000 (end), source_time = 500 + 5000 = 5500 = out_point
+        assert_eq!(clip.source_time_at(6000), 5500);
+        assert_eq!(clip.timeline_time_from_source(5500), 6000);
+    }
+
+    #[test]
+    fn timeline_time_from_source_clamps_to_clip_bounds() {
+        let clip = Clip::new(1, 10, 1, 0, 5000, 0, 5000);
+
+        // Source position before in_point clamps to clip start
+        assert_eq!(clip.timeline_time_from_source(-100), 0);
+
+        // Source position after out_point clamps to clip end
+        assert_eq!(clip.timeline_time_from_source(6000), 5000);
     }
 }

@@ -2,9 +2,9 @@ use crate::app_config::{AppConfig, ProjectProfile, ThemePreference};
 use crate::export::{ExportProgress, export_frame_count_for_duration_ms};
 use clipstrike_audio::waveform::extract_waveform_sync;
 use clipstrike_core::bridges::inkscape::InkscapeBridge;
-use clipstrike_core::clip_defaults::timeline_clip_end_ms;
+use clipstrike_core::clip_defaults::{clamp_trim_to_asset_bounds, timeline_clip_end_ms};
 use clipstrike_core::commands::{
-    AddClipCommand, MoveClipCommand, RemoveClipCommand, SeparateAudioCommand, TrimClipCommand,
+    AddClipCommand, CompoundCommand, MoveClipCommand, RemoveClipCommand, SeparateAudioCommand, TrimClipCommand,
     UndoStack,
 };
 use clipstrike_media::engine_manager::EngineManager;
@@ -18,6 +18,7 @@ use clipstrike_render::gpu::{
 use clipstrike_core::effects::{DetectedObject, MotionTrack, TrackPoint};
 use clipstrike_core::keyframes::{DEFAULT_KEYFRAME_SNAP_MS, InterpolationMode, KeyframedProperty};
 use clipstrike_core::labels::{timeline_clip_label, timeline_clip_tooltip};
+use clipstrike_core::playback::{advance_playhead, clip_eos_step};
 use clipstrike_core::project::{
     Marker, MarkerToggleResult, MediaAsset, Project, Track, TransitionMaskAsset,
 };
@@ -43,6 +44,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const TRACK_HEADER_WIDTH: f32 = 132.0;
+const TRACK_HEIGHT: f32 = 80.0;
 const TIMELINE_CONTENT_OFFSET_X: f32 = TRACK_HEADER_WIDTH + 16.0;
 
 #[derive(PartialEq, Debug)]
@@ -99,6 +101,7 @@ pub struct ClipStrikeApp {
     drag_pointer_start_x: Option<f32>,
     drag_pointer_start_y: Option<f32>,
     drag_clip_id: Option<usize>,
+    dragged_group_clip_ids: Vec<usize>,
     drag_start_track_index: Option<usize>,
     drag_preview_times: Option<(i64, i64)>,
     drag_preview_track_index: Option<usize>,
@@ -139,6 +142,8 @@ pub struct ClipStrikeApp {
     test_media_picker_paths: Option<Vec<PathBuf>>,
     #[cfg(not(target_arch = "wasm32"))]
     title_svg_edit_sessions: HashMap<usize, TitleEditSession>,
+    was_playing_before_scrub: bool,
+    last_track_content_origin_x: Option<f32>,
 }
 
 #[derive(Clone, Copy)]
@@ -361,6 +366,12 @@ impl ClipStrikeApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let app_config = AppConfig::load_or_default();
         let wgpu_render_state = cc.wgpu_render_state.clone();
+
+        if let Some(state) = &wgpu_render_state {
+            let info = state.adapter.get_info();
+            log::info!("WGPU adapter: {} ({:?})", info.name, info.backend);
+        }
+
         let mut style = (*cc.egui_ctx.style()).clone();
         style.visuals = match app_config.theme {
             ThemePreference::Dark => egui::Visuals::dark(),
@@ -577,6 +588,7 @@ impl ClipStrikeApp {
             drag_pointer_start_x: None,
             drag_pointer_start_y: None,
             drag_clip_id: None,
+            dragged_group_clip_ids: Vec::new(),
             drag_start_track_index: None,
             drag_preview_times: None,
             drag_preview_track_index: None,
@@ -607,6 +619,8 @@ impl ClipStrikeApp {
             active_export: None,
             show_title_editor: false,
             editing_title: None,
+            was_playing_before_scrub: false,
+            last_track_content_origin_x: None,
         }
     }
 
@@ -653,6 +667,7 @@ impl ClipStrikeApp {
             drag_pointer_start_x: None,
             drag_pointer_start_y: None,
             drag_clip_id: None,
+            dragged_group_clip_ids: Vec::new(),
             drag_start_track_index: None,
             drag_preview_times: None,
             drag_preview_track_index: None,
@@ -683,6 +698,8 @@ impl ClipStrikeApp {
             test_media_picker_paths: None,
             #[cfg(not(target_arch = "wasm32"))]
             title_svg_edit_sessions: HashMap::new(),
+            was_playing_before_scrub: false,
+            last_track_content_origin_x: None,
         }
     }
 
@@ -721,7 +738,7 @@ impl ClipStrikeApp {
             .first()
             .map(|track| track.id)
             .unwrap_or(0);
-        let clip = Clip::new(rand::random::<usize>(), 1, track_id, 0, 1000);
+        let clip = Clip::new(rand::random::<usize>(), 1, track_id, 0, 1000, 0, 1000);
         self.undo_stack.push(
             Box::new(AddClipCommand { clip }),
             &mut self.project,
@@ -768,6 +785,8 @@ impl ClipStrikeApp {
             track_id,
             self.playhead_ms,
             end_ms,
+            0,
+            asset_duration_ms as i64,
         );
         clip.video_enabled = true;
         clip.audio_enabled = self
@@ -783,6 +802,183 @@ impl ClipStrikeApp {
             &mut self.timeline,
         );
         Ok(())
+    }
+
+    fn materialize_title_asset(&mut self, title_id: usize) -> Result<usize, String> {
+        let title = self
+            .project
+            .titles
+            .iter()
+            .find(|candidate| candidate.id == title_id)
+            .cloned()
+            .ok_or_else(|| format!("Title {title_id} not found"))?;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let uri = {
+            let svg_path = Self::title_svg_temp_path(title.id);
+            if let Some(parent) = svg_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|err| {
+                    format!(
+                        "Failed to create title asset directory {}: {err}",
+                        parent.display()
+                    )
+                })?;
+            }
+            std::fs::write(&svg_path, &title.svg_content).map_err(|err| {
+                format!(
+                    "Failed to write title asset SVG {}: {err}",
+                    svg_path.display()
+                )
+            })?;
+            Self::file_uri_from_path(&svg_path)?
+        };
+
+        #[cfg(target_arch = "wasm32")]
+        let uri = {
+            use base64::{Engine as _, engine::general_purpose};
+            let b64 = general_purpose::STANDARD.encode(&title.svg_content);
+            format!("data:image/svg+xml;base64,{}", b64)
+        };
+
+        if let Some(existing_asset) = self.project.assets.iter_mut().find(|asset| asset.uri == uri) {
+            existing_asset.name = title.name.clone();
+            existing_asset.duration_ms = existing_asset.duration_ms.max(10_000);
+            existing_asset.audio_levels.clear();
+            return Ok(existing_asset.id);
+        }
+
+        let asset_id = rand::random::<usize>();
+        self.project.assets.push(MediaAsset {
+            id: asset_id,
+            name: title.name,
+            uri,
+            duration_ms: 10_000,
+            audio_levels: Vec::new(),
+        });
+        Ok(asset_id)
+    }
+
+    fn create_title_clip(
+        &mut self,
+        title_id: usize,
+        track_id: usize,
+        start_ms: i64,
+        clip_duration_ms: u64,
+    ) -> Result<Clip, String> {
+        let asset_id = self.materialize_title_asset(title_id)?;
+        let end_ms = timeline_clip_end_ms(start_ms, clip_duration_ms, self.frame_duration_ms());
+        let mut clip = Clip::new(
+            rand::random::<usize>(),
+            asset_id,
+            track_id,
+            start_ms,
+            end_ms,
+            0,
+            clip_duration_ms as i64,
+        );
+        clip.video_enabled = true;
+        clip.audio_enabled = false;
+        Ok(clip)
+    }
+
+    fn add_title_to_timeline(
+        &mut self,
+        title_id: usize,
+        clip_duration_ms: u64,
+    ) -> Result<(), String> {
+        let Some(track_id) = self.default_drop_track_id() else {
+            return Err("No visible tracks available for adding titles".to_string());
+        };
+        let clip = self.create_title_clip(title_id, track_id, self.playhead_ms, clip_duration_ms)?;
+        self.undo_stack.push(
+            Box::new(AddClipCommand { clip }),
+            &mut self.project,
+            &mut self.timeline,
+        );
+        Ok(())
+    }
+
+    fn asset_library_kind(uri: &str) -> &'static str {
+        let ext = uri.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+        match ext.as_str() {
+            "mp4" | "mov" | "mkv" | "webm" | "avi" => "Video",
+            "wav" | "mp3" | "aac" | "flac" | "ogg" => "Audio",
+            "png" | "jpg" | "jpeg" | "bmp" | "gif" | "webp" => "Image",
+            _ => "Media",
+        }
+    }
+
+    fn asset_drag_preview_accent(kind: &str) -> egui::Color32 {
+        match kind {
+            "Video" => egui::Color32::from_rgb(34, 139, 230),
+            "Audio" => egui::Color32::from_rgb(242, 153, 74),
+            "Image" => egui::Color32::from_rgb(39, 174, 96),
+            "Title" => egui::Color32::from_rgb(219, 68, 55),
+            _ => egui::Color32::from_rgb(155, 166, 178),
+        }
+    }
+
+    fn draw_library_drag_preview(&self, ctx: &egui::Context) {
+        let Some(pointer_pos) = ctx.input(|input| input.pointer.interact_pos()) else {
+            return;
+        };
+
+        let preview = if let Some(asset_id) = ctx.data(|data| data.get_temp::<usize>(egui::Id::new("dragging_asset_id"))) {
+            self.project.assets.iter().find(|asset| asset.id == asset_id).map(|asset| {
+                let kind = Self::asset_library_kind(&asset.uri);
+                (kind, asset.name.clone(), Self::asset_drag_preview_accent(kind))
+            })
+        } else if let Some(title_id) = ctx.data(|data| data.get_temp::<usize>(egui::Id::new("dragging_title_id"))) {
+            self.project.titles.iter().find(|title| title.id == title_id).map(|title| {
+                ("Title", title.name.clone(), Self::asset_drag_preview_accent("Title"))
+            })
+        } else {
+            None
+        };
+
+        let Some((kind, name, accent)) = preview else {
+            return;
+        };
+
+        let card_rect = egui::Rect::from_min_size(
+            pointer_pos + egui::vec2(18.0, 18.0),
+            egui::vec2(240.0, 58.0),
+        );
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("library_drag_preview"),
+        ));
+        let fill = egui::Color32::from_rgba_premultiplied(accent.r(), accent.g(), accent.b(), 110);
+        let stroke = egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_premultiplied(accent.r(), accent.g(), accent.b(), 210),
+        );
+        let text_color = ctx.style().visuals.text_color();
+
+        painter.rect_filled(card_rect, 12.0, fill);
+        painter.rect_stroke(card_rect, 12.0, stroke);
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                card_rect.left_top(),
+                egui::pos2(card_rect.left() + 8.0, card_rect.bottom()),
+            ),
+            12.0,
+            accent,
+        );
+        painter.text(
+            card_rect.left_top() + egui::vec2(18.0, 10.0),
+            egui::Align2::LEFT_TOP,
+            kind,
+            egui::FontId::proportional(12.0),
+            accent,
+        );
+        painter.text(
+            card_rect.left_top() + egui::vec2(18.0, 28.0),
+            egui::Align2::LEFT_TOP,
+            name,
+            egui::FontId::proportional(16.0),
+            text_color,
+        );
     }
 
     fn split_audio_target_track_id(track_ids: &[usize], clip_track_id: usize) -> Option<usize> {
@@ -875,17 +1071,11 @@ impl ClipStrikeApp {
                         )
                     };
                     let (asset_id, asset_name, asset_uri, asset_duration_ms) = asset_data;
-                    let ext = asset_uri.split('.').last().unwrap_or("").to_lowercase();
                     let item_id = egui::Id::new(("asset", asset_id));
 
                     let mut add_to_timeline = false;
                     ui.horizontal(|ui| {
-                        let icon = if ["png", "jpg", "jpeg"].contains(&ext.as_str()) {
-                            "Image"
-                        } else {
-                            "Media"
-                        };
-                        ui.label(icon);
+                        ui.label(Self::asset_library_kind(&asset_uri));
                         let label_res = ui.selectable_label(false, &asset_name);
                         if ui
                             .interact(label_res.rect, item_id, egui::Sense::drag())
@@ -954,6 +1144,10 @@ impl ClipStrikeApp {
             "__clipstrike_test_detection_label_count__: {}",
             snapshot["detection_count"].as_u64().unwrap_or(0)
         ));
+        ui.label(format!(
+            "__clipstrike_test_playback_complete__: {}",
+            snapshot["playback_complete"].as_bool().unwrap_or(false)
+        ));
     }
 
     pub fn render_transport_test_ui(&mut self, ui: &mut egui::Ui) {
@@ -965,9 +1159,16 @@ impl ClipStrikeApp {
         });
     }
     pub fn test_snapshot(&self) -> serde_json::Value {
+        let timeline_end_ms = self.timeline_end_ms();
+        let playback_complete = !self.is_playing
+            && !self.timeline.clips.is_empty()
+            && self.playhead_ms == timeline_end_ms
+            && self.playhead_ms > 0;
         let mut state_json = serde_json::json!({
             "playhead_ms": self.playhead_ms,
+            "timeline_end_ms": timeline_end_ms,
             "is_playing": self.is_playing,
+            "playback_complete": playback_complete,
             "tracks_count": self.project.tracks.len(),
             "clips_count": self.timeline.clips.len(),
             "transitions_count": self.timeline.transitions.len(),
@@ -1589,6 +1790,7 @@ impl ClipStrikeApp {
             .and_then(|name| name.to_str())
             .unwrap_or("Imported Media")
             .to_string();
+        let suppress_import_warnings = std::env::var_os("CLIPSTRIKE_TEST_MEDIA_PATHS").is_some();
         let duration_ms = match probe_metadata_sync(&uri) {
             Ok(metadata) => metadata
                 .duration
@@ -1597,14 +1799,22 @@ impl ClipStrikeApp {
                 })
                 .unwrap_or(0),
             Err(err) => {
-                log::warn!("Failed to probe media metadata for {}: {}", uri, err);
+                if suppress_import_warnings {
+                    log::debug!("Failed to probe media metadata for {}: {}", uri, err);
+                } else {
+                    log::warn!("Failed to probe media metadata for {}: {}", uri, err);
+                }
                 0
             }
         };
         let audio_levels = match extract_waveform_sync(&uri, 96) {
             Ok(levels) => levels,
             Err(err) => {
-                log::warn!("Failed to extract waveform for {}: {}", uri, err);
+                if suppress_import_warnings {
+                    log::debug!("Failed to extract waveform for {}: {}", uri, err);
+                } else {
+                    log::warn!("Failed to extract waveform for {}: {}", uri, err);
+                }
                 Vec::new()
             }
         };
@@ -1700,6 +1910,42 @@ impl ClipStrikeApp {
             .unwrap_or(0)
     }
 
+    fn step_playback(&mut self, delta_ms: i64) {
+        let step = advance_playhead(self.playhead_ms, delta_ms, self.timeline_end_ms());
+        self.playhead_ms = step.playhead_ms;
+        if step.should_stop {
+            self.set_playing_state(false);
+        }
+    }
+
+    fn handle_clip_eos(&mut self, clip_id: usize) {
+        let Some(step) = clip_eos_step(&self.timeline.clips, clip_id, self.timeline_end_ms())
+        else {
+            return;
+        };
+
+        self.playhead_ms = step.playhead_ms;
+        if step.should_stop {
+            self.set_playing_state(false);
+        } else {
+            self.seek_playhead();
+        }
+    }
+
+    fn process_engine_events(&mut self) {
+        let Some(engine_manager) = &mut self.engine_manager else {
+            return;
+        };
+
+        for event in engine_manager.drain_events() {
+            match event {
+                clipstrike_media::engine_manager::EngineEvent::EndOfStream { clip_id } => {
+                    self.handle_clip_eos(clip_id);
+                }
+            }
+        }
+    }
+
     fn apply_fade_in(clip: &mut Clip) {
         for (time_ms, value) in fade_in_points(clip.start, clip.end) {
             clip.opacity
@@ -1788,13 +2034,23 @@ impl ClipStrikeApp {
     }
 
     fn timeline_time_from_ruler_position(
-        ruler_rect: egui::Rect,
+        origin_x: f32,
         pointer_pos: egui::Pos2,
         zoom_level: f32,
     ) -> i64 {
         let pixels_per_ms = (zoom_level * 0.1).max(f32::EPSILON);
-        let local_x = (pointer_pos.x - (ruler_rect.left() + TIMELINE_CONTENT_OFFSET_X)).max(0.0);
+        let local_x = (pointer_pos.x - origin_x).max(0.0);
         (local_x / pixels_per_ms) as i64
+    }
+
+    fn clip_split_time_from_pointer(
+        clip_start_ms: i64,
+        clip_rect_left: f32,
+        pointer_x: f32,
+        pixels_per_ms: f32,
+    ) -> i64 {
+        let local_x = (pointer_x - clip_rect_left).max(0.0);
+        clip_start_ms.saturating_add((local_x / pixels_per_ms.max(f32::EPSILON)) as i64)
     }
 
     fn preview_texture_should_bypass_fx(
@@ -2383,6 +2639,54 @@ impl ClipStrikeApp {
         }
     }
 
+    fn draw_clip_waveform(
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        audio_levels: &[f32],
+        clip_in_ms: i64,
+        clip_out_ms: i64,
+        asset_duration_ms: u64,
+    ) {
+        if audio_levels.is_empty() {
+            return;
+        }
+
+        let mut mesh = egui::Mesh::default();
+        let color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100);
+        let width = rect.width();
+        let height = rect.height();
+        let mid_y = rect.center().y;
+
+        let asset_duration_ms = asset_duration_ms.max(1) as f64;
+        let clip_in_f = clip_in_ms as f64;
+        let clip_out_f = clip_out_ms as f64;
+        let clip_duration_f = (clip_out_f - clip_in_f).max(1.0);
+
+        for i in 0..(width as usize) {
+            let t = i as f64 / width as f64;
+            let timeline_ms = clip_in_f + t * clip_duration_f;
+            let asset_t = timeline_ms / asset_duration_ms;
+
+            if asset_t < 0.0 || asset_t > 1.0 {
+                continue;
+            }
+
+            let bin_idx = (asset_t * (audio_levels.len() as f64)) as usize;
+            if let Some(&level) = audio_levels.get(bin_idx) {
+                let amplitude = (level * height * 0.4).max(1.0);
+                let x = rect.left() + i as f32;
+                mesh.add_colored_rect(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x, mid_y - amplitude),
+                        egui::pos2(x + 1.0, mid_y + amplitude),
+                    ),
+                    color,
+                );
+            }
+        }
+        ui.painter().add(mesh);
+    }
+
     fn marker_color(marker: &Marker) -> egui::Color32 {
         egui::Color32::from_rgba_unmultiplied(
             marker.color[0],
@@ -2826,28 +3130,37 @@ impl ClipStrikeApp {
         let mut created_engine = false;
         for clip in active_clips.iter().chain(prewarm_clips.iter()) {
             if let Some(asset) = self.project.assets.iter().find(|a| a.id == clip.asset_id) {
-                log::debug!(
-                    "sync_engines_for_playhead: clip_id={} asset_id={} uri={} video_enabled={} audio_enabled={}",
-                    clip.id,
-                    asset.id,
-                    asset.uri,
-                    clip.video_enabled,
-                    clip.audio_enabled
-                );
-                match engine_manager.sync_clip(clip, &asset.uri) {
-                    Ok(created) => {
-                        if created {
-                            created_engine = true;
-                            if prewarm_clips
-                                .iter()
-                                .any(|warm_clip| warm_clip.id == clip.id)
-                            {
-                                let _ = engine_manager
-                                    .seek_clips(std::slice::from_ref(clip), clip.start);
+                if asset.duration_ms == 0 {
+                    log::debug!(
+                        "sync_engines_for_playhead: skipping zero-duration asset for clip_id={} asset_id={} uri={}",
+                        clip.id,
+                        asset.id,
+                        asset.uri
+                    );
+                } else {
+                    log::debug!(
+                        "sync_engines_for_playhead: clip_id={} asset_id={} uri={} video_enabled={} audio_enabled={}",
+                        clip.id,
+                        asset.id,
+                        asset.uri,
+                        clip.video_enabled,
+                        clip.audio_enabled
+                    );
+                    match engine_manager.sync_clip(clip, &asset.uri) {
+                        Ok(created) => {
+                            if created {
+                                created_engine = true;
+                                if prewarm_clips
+                                    .iter()
+                                    .any(|warm_clip| warm_clip.id == clip.id)
+                                {
+                                    let _ = engine_manager
+                                        .seek_clips(std::slice::from_ref(clip), clip.start);
+                                }
                             }
                         }
+                        Err(err) => log::error!("Failed to sync clip {}: {}", clip.id, err),
                     }
-                    Err(err) => log::error!("Failed to sync clip {}: {}", clip.id, err),
                 }
             } else {
                 log::warn!(
@@ -2901,11 +3214,44 @@ impl ClipStrikeApp {
         }
     }
 
+    fn interactive_seek_playhead_active_only(&mut self) {
+        let (all_active_clips, _) = self.active_clips_for_playhead();
+        self.sync_engines_for_playhead(&all_active_clips, &[], false);
+        if let Some(engine_manager) = &self.engine_manager {
+            engine_manager.seek_clips_interactive(&all_active_clips, self.playhead_ms);
+        }
+        if let Some(audio) = &self.audio_engine {
+            audio.set_playhead(self.playhead_ms);
+        }
+    }
+
     fn seek_playhead(&mut self) {
         let (all_active_clips, prewarm_clips) = self.playback_clips_for_playhead();
         self.sync_engines_for_playhead(&all_active_clips, &prewarm_clips, true);
         if let Some(audio) = &self.audio_engine {
             audio.set_playhead(self.playhead_ms);
+        }
+    }
+
+    fn seek_playhead_active_only(&mut self) {
+        let (all_active_clips, _) = self.active_clips_for_playhead();
+        self.sync_engines_for_playhead(&all_active_clips, &[], true);
+        if let Some(audio) = &self.audio_engine {
+            audio.set_playhead(self.playhead_ms);
+        }
+    }
+
+    fn scrub_playhead(&mut self, target_ms: i64) {
+        let target_ms = target_ms.clamp(0, self.timeline_end_ms());
+        if target_ms == self.playhead_ms {
+            return;
+        }
+
+        self.playhead_ms = target_ms;
+        if self.is_playing {
+            self.interactive_seek_playhead_active_only();
+        } else {
+            self.seek_playhead();
         }
     }
 
@@ -3263,6 +3609,8 @@ impl eframe::App for ClipStrikeApp {
                                 track_id,
                                 start_ms,
                                 start_ms + 5000,
+                                0,
+                                5000,
                             );
                             clip.audio_enabled = false;
                             clip.video_enabled = true;
@@ -3320,25 +3668,22 @@ impl eframe::App for ClipStrikeApp {
                     if let Some(title) = self.project.titles.first() {
                         let title_id = title.id;
                         let track_id = self.project.tracks.first().map(|t| t.id).unwrap_or(0);
-                        let mut clip = Clip::new(
-                            rand::random::<usize>(),
-                            0,
-                            track_id,
-                            self.playhead_ms,
-                            self.playhead_ms + 5000,
-                        );
-                        clip.audio_enabled = false;
-                        clip.video_enabled = true;
-                        clip.reverse = false;
-                        clip.freeze_frame_ms = None;
-                        clip.stabilization_enabled = false;
-                        clip.motion_tracking_enabled = false;
-                        clip.object_detection_enabled = false;
-                        self.undo_stack.push(
-                            Box::new(AddClipCommand { clip }),
-                            &mut self.project,
-                            &mut self.timeline,
-                        );
+                        match self.create_title_clip(title_id, track_id, self.playhead_ms, 5_000) {
+                            Ok(clip) => {
+                                self.undo_stack.push(
+                                    Box::new(AddClipCommand { clip }),
+                                    &mut self.project,
+                                    &mut self.timeline,
+                                );
+                            }
+                            Err(err) => {
+                                log::error!(
+                                    "Failed to add title {} to timeline from test hook: {}",
+                                    title_id,
+                                    err
+                                );
+                            }
+                        }
                     }
                 } else if cmd.starts_with("SWITCH_TAB:") {
                     let tab_name = &cmd["SWITCH_TAB:".len()..];
@@ -3378,12 +3723,45 @@ impl eframe::App for ClipStrikeApp {
         // Handle playback timing
         if self.is_playing {
             let dt = ctx.input(|i| i.stable_dt);
-            self.playhead_ms += (dt * 1000.0) as i64;
+            let was_playing = self.is_playing;
+
+            // Try to derive playhead from GStreamer's actual position to avoid drift.
+            let mut engine_synced = false;
+            if let Some(engine_manager) = &self.engine_manager {
+                // Find the primary active clip at the current playhead
+                if let Some(primary_clip) = self
+                    .timeline
+                    .clips
+                    .iter()
+                    .find(|clip| clip.start <= self.playhead_ms && self.playhead_ms < clip.end)
+                {
+                    if let Some(source_pos_ms) =
+                        engine_manager.query_clip_position_ms(primary_clip.id)
+                    {
+                        let engine_timeline_ms =
+                            primary_clip.timeline_time_from_source(source_pos_ms);
+                        let timeline_end = self.timeline_end_ms();
+                        let clamped = engine_timeline_ms.clamp(0, timeline_end);
+                        if clamped >= timeline_end {
+                            self.playhead_ms = timeline_end;
+                            self.set_playing_state(false);
+                        } else {
+                            self.playhead_ms = clamped;
+                        }
+                        engine_synced = true;
+                    }
+                }
+            }
+
+            // Fallback: advance with UI delta if no engine position available
+            if !engine_synced {
+                self.step_playback((dt * 1000.0) as i64);
+            }
 
             // Task 6.7: Looped playback
-            if self.loop_enabled && self.playhead_ms >= self.loop_end_ms {
+            if was_playing && self.loop_enabled && self.playhead_ms >= self.loop_end_ms {
                 self.playhead_ms = self.loop_start_ms;
-                self.seek_playhead();
+                self.set_playing_state(true);
             }
 
             ctx.request_repaint(); // Keep the loop running
@@ -3391,6 +3769,8 @@ impl eframe::App for ClipStrikeApp {
 
         #[cfg(not(target_arch = "wasm32"))]
         self.poll_title_svg_edit_sessions(ctx);
+
+        self.process_engine_events();
 
         // Sync engines with active clips at playhead
         let (all_active_clips, prewarm_clips) = self.playback_clips_for_playhead();
@@ -3862,18 +4242,40 @@ impl eframe::App for ClipStrikeApp {
                 egui::ScrollArea::both().show(ui, |ui| {
                     let timeline_rect = ui.available_rect_before_wrap();
 
+                    if ui.rect_contains_pointer(timeline_rect) {
+                        let scroll_delta = ui.input(|i| i.raw_scroll_delta.y);
+                        if ui.input(|i| i.modifiers.ctrl) && scroll_delta != 0.0 {
+                            self.zoom_level = (self.zoom_level + scroll_delta * 0.001).clamp(0.0, 1.0);
+                        }
+                    }
+
+                    let mut current_frame_track_origin_x: Option<f32> = None;
+
                     // Time ruler interaction
                     let (ruler_rect, ruler_res) = ui.allocate_exact_size(
                         egui::vec2(2000.0, 20.0),
                         egui::Sense::click_and_drag(),
                     );
+                    let origin_x = self.last_track_content_origin_x.unwrap_or(ruler_rect.left() + TIMELINE_CONTENT_OFFSET_X);
+                    
+                    if ruler_res.drag_started() {
+                        self.was_playing_before_scrub = self.is_playing;
+                        if self.is_playing {
+                            self.is_playing = false;
+                            if let Some(engine_manager) = &mut self.engine_manager {
+                                engine_manager.pause_all();
+                            }
+                        }
+                    }
+
                     let ruler_context_time_ms = ruler_res.interact_pointer_pos().map(|pos| {
-                        Self::timeline_time_from_ruler_position(ruler_rect, pos, self.zoom_level)
+                        Self::timeline_time_from_ruler_position(origin_x, pos, self.zoom_level)
                     });
+
                     if ruler_res.clicked() || ruler_res.dragged() {
                         if let Some(pos) = ruler_res.interact_pointer_pos() {
-                            self.playhead_ms = Self::timeline_time_from_ruler_position(
-                                ruler_rect,
+                            let mut target_playhead_ms = Self::timeline_time_from_ruler_position(
+                                origin_x,
                                 pos,
                                 self.zoom_level,
                             );
@@ -3885,13 +4287,25 @@ impl eframe::App for ClipStrikeApp {
                                         + (marker.time_ms as f32 * self.zoom_level * 0.1);
                                     (marker_x - pos.x).abs() <= tolerance_px
                                 }) {
-                                    self.playhead_ms = marker.time_ms;
+                                    target_playhead_ms = marker.time_ms;
                                     self.selected_marker_id = Some(marker.id);
                                 } else {
                                     self.selected_marker_id = None;
                                 }
                             }
-                            self.seek_playhead();
+                            self.scrub_playhead(target_playhead_ms);
+                        }
+                    }
+
+                    if ruler_res.drag_released() {
+                        if self.was_playing_before_scrub {
+                            self.is_playing = true;
+                            let (active_clips, _) = self.active_clips_for_playhead();
+                            if let Some(engine_manager) = &mut self.engine_manager {
+                                let active_ids: Vec<usize> = active_clips.iter().map(|c| c.id).collect();
+                                engine_manager.play_clips(&active_ids);
+                            }
+                            self.was_playing_before_scrub = false;
                         }
                     }
 
@@ -4044,30 +4458,17 @@ impl eframe::App for ClipStrikeApp {
                     }
                     ui.add_space(4.0);
 
-                    // Draw Playhead line across all tracks
-                    let playhead_x = ruler_rect.left()
-                        + TIMELINE_CONTENT_OFFSET_X
-                        + (self.playhead_ms as f32 * self.zoom_level * 0.1);
-                    if playhead_x >= timeline_rect.left() && playhead_x <= timeline_rect.right() {
-                        ui.painter().line_segment(
-                            [
-                                egui::pos2(playhead_x, timeline_rect.top()),
-                                egui::pos2(playhead_x, timeline_rect.bottom()),
-                            ],
-                            egui::Stroke::new(2.0, egui::Color32::RED),
-                        );
-                    }
+                    // Playhead drawing moved to after the track loop so it can use the exact track content origin.
 
                     let mut razor_cmd = None;
-
-                    let mut move_cmd = None;
-                    let mut trim_cmd = None;
                     let mut add_clip_cmd = None;
                     let mut separate_audio_cmd = None;
                     let mut remove_clip_id = None;
                     let mut pending_track_reorder = None;
                     let mut pending_track_remove_id = None;
+                    let mut pending_ungroup_clip_id = None;
                     let mut pending_track_rename: Option<(usize, String)> = None;
+                    let mut pending_title_clip_request: Option<(usize, usize, i64)> = None;
                     let track_count = self.project.tracks.len();
                     let track_ids: Vec<usize> =
                         self.project.tracks.iter().map(|track| track.id).collect();
@@ -4081,7 +4482,7 @@ impl eframe::App for ClipStrikeApp {
                         ui.horizontal(|ui| {
                             // Track Header
                             let header_response = ui
-                                .allocate_ui(egui::vec2(TRACK_HEADER_WIDTH, 56.0), |ui| {
+                                .allocate_ui(egui::vec2(TRACK_HEADER_WIDTH, TRACK_HEIGHT + 6.0), |ui| {
                                     ui.vertical(|ui| {
                                         if self.track_name_edit_id == Some(track.id) {
                                             let rename_response = ui.add(
@@ -4143,7 +4544,7 @@ impl eframe::App for ClipStrikeApp {
                             }
                             if header_response.drag_stopped() {
                                 let row_offset =
-                                    (header_response.drag_delta().y / 58.0).round() as isize;
+                                    (header_response.drag_delta().y / (TRACK_HEIGHT + 8.0)).round() as isize;
                                 let target_index = (track_order_index as isize + row_offset)
                                     .clamp(0, track_count.saturating_sub(1) as isize)
                                     as usize;
@@ -4158,9 +4559,12 @@ impl eframe::App for ClipStrikeApp {
                             ui.set_enabled(!track.locked);
                             // Track Content
                             let (rect, _track_res) = ui.allocate_exact_size(
-                                egui::vec2(2000.0, 50.0),
+                                egui::vec2(2000.0, TRACK_HEIGHT),
                                 egui::Sense::hover(),
                             );
+                            if current_frame_track_origin_x.is_none() {
+                                current_frame_track_origin_x = Some(rect.left());
+                            }
 
                             #[cfg(target_arch = "wasm32")]
                             {
@@ -4182,12 +4586,13 @@ impl eframe::App for ClipStrikeApp {
                                     if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
                                         let local_x = pos.x - rect.left();
                                         let start_ms = (local_x / (self.zoom_level * 0.1)) as i64;
+                                        let asset_duration_ms = asset_duration_by_id
+                                            .get(&asset_id)
+                                            .copied()
+                                            .unwrap_or(0);
                                         let end_ms = timeline_clip_end_ms(
                                             start_ms,
-                                            asset_duration_by_id
-                                                .get(&asset_id)
-                                                .copied()
-                                                .unwrap_or(0),
+                                            asset_duration_ms,
                                             frame_duration_ms,
                                         );
 
@@ -4198,6 +4603,8 @@ impl eframe::App for ClipStrikeApp {
                                             track_idx,
                                             start_ms,
                                             end_ms,
+                                            0,
+                                            asset_duration_ms as i64,
                                         );
                                         clip.audio_enabled = self
                                             .project
@@ -4216,64 +4623,46 @@ impl eframe::App for ClipStrikeApp {
                                         });
                                     }
                                 } else if let Some(title_id) = dragging_title_id {
-                                    if let Some(title) =
-                                        self.project.titles.iter().find(|t| t.id == title_id)
-                                    {
-                                        if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
-                                            let local_x = pos.x - rect.left();
-                                            let start_ms =
-                                                (local_x / (self.zoom_level * 0.1)) as i64;
+                                    if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                                        let local_x = pos.x - rect.left();
+                                        let start_ms = (local_x / (self.zoom_level * 0.1)) as i64;
+                                        pending_title_clip_request = Some((title_id, track_idx, start_ms));
+                                        ctx.data_mut(|d| {
+                                            d.remove_temp::<usize>(egui::Id::new(
+                                                "dragging_title_id",
+                                            ))
+                                        });
+                                    }
+                                }
+                            } else if ui.rect_contains_pointer(rect)
+                                && ctx.input(|i| i.pointer.any_down())
+                            {
+                                // Ghost clip preview
+                                let dragging_id: Option<usize> =
+                                    ctx.data(|d| d.get_temp(egui::Id::new("dragging_asset_id")));
+                                let dragging_title_id: Option<usize> =
+                                    ctx.data(|d| d.get_temp(egui::Id::new("dragging_title_id")));
 
-                                            // Task 13.2: Convert title to a temporary asset
-                                            #[cfg(not(target_arch = "wasm32"))]
-                                            let uri = {
-                                                let temp_dir = std::env::temp_dir();
-                                                let svg_path = temp_dir
-                                                    .join(format!("title_{}.svg", title.id));
-                                                let _ =
-                                                    std::fs::write(&svg_path, &title.svg_content);
-                                                format!(
-                                                    "file:///{}",
-                                                    svg_path.to_string_lossy().replace("\\", "/")
-                                                )
-                                            };
-
-                                            #[cfg(target_arch = "wasm32")]
-                                            let uri = {
-                                                use base64::{
-                                                    Engine as _, engine::general_purpose,
-                                                };
-                                                let b64 = general_purpose::STANDARD
-                                                    .encode(&title.svg_content);
-                                                format!("data:image/svg+xml;base64,{}", b64)
-                                            };
-
-                                            let asset_id = rand::random::<usize>();
-
-                                            self.project.assets.push(MediaAsset {
-                                                id: asset_id,
-                                                name: title.name.clone(),
-                                                uri,
-                                                duration_ms: 10000,
-                                                audio_levels: Vec::new(),
-                                            });
-
-                                            let mut clip = Clip::new(
-                                                rand::random::<usize>(),
-                                                asset_id,
-                                                track_idx,
-                                                start_ms,
-                                                start_ms + 5000,
-                                            );
-                                            clip.video_enabled = true;
-                                            clip.audio_enabled = false;
-                                            add_clip_cmd = Some(AddClipCommand { clip });
-                                            ctx.data_mut(|d| {
-                                                d.remove_temp::<usize>(egui::Id::new(
-                                                    "dragging_title_id",
-                                                ))
-                                            });
-                                        }
+                                if let Some(asset_id) = dragging_id.or(dragging_title_id) {
+                                    if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                                        let local_x = pos.x - rect.left();
+                                        let start_ms = (local_x / (self.zoom_level * 0.1)) as i64;
+                                        let asset_duration_ms = if dragging_id.is_some() {
+                                            asset_duration_by_id.get(&asset_id).copied().unwrap_or(0)
+                                        } else {
+                                            10_000 // Default title duration
+                                        };
+                                        let pixels_per_ms = (self.zoom_level * 0.1).max(0.001);
+                                        let ghost_width = asset_duration_ms as f32 * pixels_per_ms;
+                                        let ghost_rect = egui::Rect::from_min_size(
+                                            egui::pos2(rect.left() + (start_ms as f32 * pixels_per_ms), rect.top() + 5.0),
+                                            egui::vec2(ghost_width, TRACK_HEIGHT - 10.0),
+                                        );
+                                        ui.painter().rect_filled(
+                                            ghost_rect,
+                                            4.0,
+                                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
+                                        );
                                     }
                                 }
                             }
@@ -4357,16 +4746,24 @@ impl eframe::App for ClipStrikeApp {
                                         {
                                             let paint_rect = clip_rect.intersect(rect);
                                             let clip_id = egui::Id::new(clip.id);
-                                            let (asset_name, audio_levels) = self
+                                            let (asset_name, audio_levels, asset_uri) = self
                                                 .project
                                                 .assets
                                                 .iter()
                                                 .find(|asset| asset.id == clip.asset_id)
                                                 .map(|asset| {
-                                                    (asset.name.clone(), asset.audio_levels.clone())
+                                                    (
+                                                        asset.name.clone(),
+                                                        asset.audio_levels.clone(),
+                                                        asset.uri.clone(),
+                                                    )
                                                 })
                                                 .unwrap_or_else(|| {
-                                                    ("Unknown Media".to_string(), Vec::new())
+                                                    (
+                                                        "Unknown Media".to_string(),
+                                                        Vec::new(),
+                                                        "".to_string(),
+                                                    )
                                                 });
                                             let clip_label = timeline_clip_label(
                                                 &asset_name,
@@ -4437,6 +4834,20 @@ impl eframe::App for ClipStrikeApp {
                                                 self.drag_pointer_start_y =
                                                     pointer_start.map(|pos| pos.y);
                                                 self.drag_clip_id = Some(clip.id);
+                                                if let Some(group_id) = clip.group_id {
+                                                    self.dragged_group_clip_ids = self
+                                                        .timeline
+                                                        .clips
+                                                        .iter()
+                                                        .filter(|c| {
+                                                            c.group_id == Some(group_id)
+                                                                && c.id != clip.id
+                                                        })
+                                                        .map(|c| c.id)
+                                                        .collect();
+                                                } else {
+                                                    self.dragged_group_clip_ids.clear();
+                                                }
                                                 self.drag_start_track_index =
                                                     Some(track_order_index);
                                                 self.drag_preview_track_index =
@@ -4458,9 +4869,12 @@ impl eframe::App for ClipStrikeApp {
                                                     if let Some(pos) =
                                                         body_res.interact_pointer_pos()
                                                     {
-                                                        let local_x = pos.x - rect.left();
-                                                        let split_at =
-                                                            (local_x / pixels_per_ms) as i64;
+                                                        let split_at = Self::clip_split_time_from_pointer(
+                                                            clip.start,
+                                                            rect.left(),
+                                                            pos.x,
+                                                            pixels_per_ms,
+                                                        );
                                                         razor_cmd = Some((clip.id, split_at));
                                                     }
                                                 } else {
@@ -4479,6 +4893,10 @@ impl eframe::App for ClipStrikeApp {
                                                     audio_clip.track_id = split_audio_track_id;
                                                     audio_clip.video_enabled = false;
                                                     audio_clip.audio_enabled = true;
+
+                                                    let group_id = clip.group_id.unwrap_or_else(rand::random::<usize>);
+                                                    audio_clip.group_id = Some(group_id);
+
                                                     separate_audio_cmd =
                                                         Some(SeparateAudioCommand {
                                                             clip_id: clip.id,
@@ -4491,6 +4909,12 @@ impl eframe::App for ClipStrikeApp {
                                                     remove_clip_id = Some(clip.id);
                                                     ui.close_menu();
                                                 }
+                                                if clip.group_id.is_some() {
+                                                    if ui.button("Ungroup").clicked() {
+                                                        pending_ungroup_clip_id = Some(clip.id);
+                                                        ui.close_menu();
+                                                    }
+                                                }
                                             });
 
                                             let is_selected =
@@ -4499,36 +4923,61 @@ impl eframe::App for ClipStrikeApp {
                                                 || left_res.dragged()
                                                 || right_res.dragged()
                                                 || body_res.dragged();
+                                            let kind = Self::asset_library_kind(&asset_uri);
+                                            let base_color = Self::asset_drag_preview_accent(kind);
+
                                             let color = if is_selected {
                                                 egui::Color32::from_rgb(255, 170, 0)
                                             } else if is_dragging {
                                                 egui::Color32::from_rgb(100, 160, 255)
                                             } else {
-                                                egui::Color32::from_rgb(60, 120, 200)
+                                                base_color
                                             };
 
-                                            let clip_thumbnail_id = self
-                                                .texture_pool
-                                                .as_ref()
-                                                .and_then(|pool| pool.frame_for_clip(clip.id))
-                                                .and_then(|frame| frame.egui_id);
-                                            if let Some(texture_id) = clip_thumbnail_id {
-                                                ui.painter().image(
-                                                    texture_id,
-                                                    paint_rect,
-                                                    egui::Rect::from_min_max(
-                                                        egui::pos2(0.0, 0.0),
-                                                        egui::pos2(1.0, 1.0),
-                                                    ),
-                                                    egui::Color32::WHITE,
-                                                );
+                                            if let Some(frame) = self.texture_pool.as_ref().and_then(|pool| pool.frame_for_clip(clip.id)) {
+                                                if let Some(texture_id) = frame.egui_id {
+                                                    let thumb_height = paint_rect.height();
+                                                    let thumb_width = (thumb_height * 1.77).max(10.0);
+                                                    
+                                                    let mut x = paint_rect.left();
+                                                    while x < paint_rect.right() {
+                                                        let draw_width = thumb_width.min(paint_rect.right() - x);
+                                                        let uv_right = draw_width / thumb_width;
+                                                        
+                                                        ui.painter().image(
+                                                            texture_id,
+                                                            egui::Rect::from_min_size(egui::pos2(x, paint_rect.top()), egui::vec2(draw_width, thumb_height)),
+                                                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(uv_right, 1.0)),
+                                                            egui::Color32::from_white_alpha(180),
+                                                        );
+                                                        x += thumb_width + 4.0;
+                                                    }
+                                                }
                                             }
 
-                                            let fill_alpha = if clip_thumbnail_id.is_some() {
+                                            let has_thumbnail = self.texture_pool.as_ref()
+                                                .and_then(|pool| pool.frame_for_clip(clip.id))
+                                                .is_some();
+                                            let fill_alpha = if has_thumbnail {
                                                 120
                                             } else {
                                                 255
                                             };
+
+                                            Self::draw_clip_waveform(
+                                                ui,
+                                                paint_rect,
+                                                &audio_levels,
+                                                clip.in_point,
+                                                clip.out_point,
+                                                self.project
+                                                    .assets
+                                                    .iter()
+                                                    .find(|a| a.id == clip.asset_id)
+                                                    .map(|a| a.duration_ms)
+                                                    .unwrap_or(0),
+                                            );
+
                                             ui.painter().rect_filled(
                                                 paint_rect,
                                                 4.0,
@@ -4538,6 +4987,16 @@ impl eframe::App for ClipStrikeApp {
                                                     color.b(),
                                                     fill_alpha,
                                                 ),
+                                            );
+
+                                            ui.painter().rect_stroke(
+                                                paint_rect,
+                                                4.0,
+                                                egui::Stroke::new(2.0, egui::Color32::from_rgb(
+                                                    clip.color_tag[0],
+                                                    clip.color_tag[1],
+                                                    clip.color_tag[2],
+                                                )),
                                             );
                                             ui.painter().rect_filled(
                                                 egui::Rect::from_min_max(
@@ -4692,6 +5151,15 @@ impl eframe::App for ClipStrikeApp {
                                                             4.0,
                                                             egui::Color32::from_rgb(100, 160, 255),
                                                         );
+                                                        ui.painter().rect_stroke(
+                                                            paint_rect,
+                                                            4.0,
+                                                            egui::Stroke::new(2.0, egui::Color32::from_rgb(
+                                                                clip.color_tag[0],
+                                                                clip.color_tag[1],
+                                                                clip.color_tag[2],
+                                                            )),
+                                                        );
                                                         ui.painter().text(
                                                             egui::pos2(
                                                                 paint_rect.center().x,
@@ -4818,13 +5286,27 @@ impl eframe::App for ClipStrikeApp {
                                 let delta_x = current_pointer_pos.x - pointer_start_x;
                                 let delta_ms = (delta_x / pixels_per_ms) as i64;
                                 let (new_start, new_end) = if let Some(side) = self.trim_side {
-                                    self.timeline.preview_trim(
+                                    let (preview_start, preview_end) = self.timeline.preview_trim(
                                         old_start,
                                         old_end,
                                         side == TrimSide::Left,
                                         delta_ms,
                                         snap_radius_ms,
                                         &[old_start, old_end],
+                                    );
+                                    let asset_duration_ms = self
+                                        .timeline
+                                        .clips
+                                        .iter()
+                                        .find(|clip| clip.id == active_drag_clip_id)
+                                        .and_then(|clip| asset_duration_by_id.get(&clip.asset_id))
+                                        .copied()
+                                        .unwrap_or(0);
+                                    clamp_trim_to_asset_bounds(
+                                        preview_start,
+                                        preview_end,
+                                        side == TrimSide::Left,
+                                        asset_duration_ms,
                                     )
                                 } else {
                                     self.timeline.preview_move(
@@ -4841,7 +5323,7 @@ impl eframe::App for ClipStrikeApp {
                                         let track_count = self.project.tracks.len();
                                         if track_count > 0 {
                                             let delta_y = current_pointer_pos.y - pointer_start_y;
-                                            let row_offset = (delta_y / 58.0).round() as isize;
+                                            let row_offset = (delta_y / (TRACK_HEIGHT + 8.0)).round() as isize;
                                             let target_track_index = (start_track_index as isize
                                                 + row_offset)
                                                 .clamp(0, track_count.saturating_sub(1) as isize)
@@ -4855,48 +5337,101 @@ impl eframe::App for ClipStrikeApp {
                                 }
                             }
                         } else {
-                            if let (Some((old_start, old_end)), Some((new_start, new_end))) =
+                            if let (Some((old_start, _old_end)), Some((new_start, new_end))) =
                                 (self.drag_start_times, self.drag_preview_times)
                             {
-                                let old_track_id = self
-                                    .timeline
-                                    .clips
-                                    .iter()
-                                    .find(|clip| clip.id == active_drag_clip_id)
-                                    .map(|clip| clip.track_id)
-                                    .unwrap_or(0);
-                                let new_track_id = self
-                                    .drag_preview_track_index
-                                    .and_then(|index| track_ids.get(index).copied())
-                                    .unwrap_or(old_track_id);
-                                if self.trim_side.is_some() {
-                                    trim_cmd = Some(TrimClipCommand {
-                                        clip_id: active_drag_clip_id,
-                                        old_start,
-                                        old_end,
-                                        new_start,
-                                        new_end,
-                                    });
-                                } else {
-                                    move_cmd = Some(MoveClipCommand {
-                                        clip_id: active_drag_clip_id,
-                                        old_start,
-                                        old_end,
-                                        new_start,
-                                        new_end,
-                                        old_track_id,
-                                        new_track_id,
-                                    });
+                                let delta_ms = new_start - old_start;
+                                let track_delta = self.drag_preview_track_index.map(|idx| idx as isize).unwrap_or(0) - self.drag_start_track_index.map(|idx| idx as isize).unwrap_or(0);
+
+                                let mut affected_ids = vec![active_drag_clip_id];
+                                if self.trim_side.is_none() {
+                                    affected_ids.extend(self.dragged_group_clip_ids.iter().copied());
+                                }
+
+                                let mut commands: Vec<Box<dyn clipstrike_core::commands::Command>> = Vec::new();
+
+                                for cid in affected_ids {
+                                    if let Some(clip) = self.timeline.clips.iter().find(|c| c.id == cid) {
+                                        let c_old_start = clip.start;
+                                        let c_old_end = clip.end;
+
+                                        if self.trim_side.is_some() && cid == active_drag_clip_id {
+                                            commands.push(Box::new(TrimClipCommand {
+                                                clip_id: cid,
+                                                old_start: c_old_start,
+                                                old_end: c_old_end,
+                                                new_start,
+                                                new_end,
+                                            }));
+                                        } else {
+                                            let c_new_start = c_old_start + delta_ms;
+                                            let c_new_end = c_old_end + delta_ms;
+
+                                            let old_track_id = clip.track_id;
+                                            let current_track_idx = track_ids.iter().position(|&id| id == old_track_id).unwrap_or(0);
+                                            let new_track_idx = (current_track_idx as isize + track_delta).clamp(0, track_ids.len() as isize - 1) as usize;
+                                            let new_track_id = track_ids[new_track_idx];
+
+                                            commands.push(Box::new(MoveClipCommand {
+                                                clip_id: cid,
+                                                old_start: c_old_start,
+                                                old_end: c_old_end,
+                                                new_start: c_new_start,
+                                                new_end: c_new_end,
+                                                old_track_id,
+                                                new_track_id,
+                                            }));
+                                        }
+                                    }
+                                }
+
+                                if !commands.is_empty() {
+                                    if commands.len() == 1 {
+                                        self.undo_stack.push(commands.pop().unwrap(), &mut self.project, &mut self.timeline);
+                                    } else {
+                                        self.undo_stack.push(Box::new(CompoundCommand { commands }), &mut self.project, &mut self.timeline);
+                                    }
                                 }
                             }
                             self.drag_start_times = None;
                             self.drag_pointer_start_x = None;
                             self.drag_pointer_start_y = None;
                             self.drag_clip_id = None;
+                            self.dragged_group_clip_ids.clear();
                             self.drag_start_track_index = None;
                             self.drag_preview_times = None;
                             self.drag_preview_track_index = None;
                             self.trim_side = None;
+                        }
+                    }
+
+                    self.last_track_content_origin_x = current_frame_track_origin_x;
+
+                    // Draw Playhead line across all tracks using the exact track content origin
+                    if let Some(origin_x) = current_frame_track_origin_x {
+                        let playhead_x = origin_x + (self.playhead_ms as f32 * self.zoom_level * 0.1);
+                        if playhead_x >= timeline_rect.left() && playhead_x <= timeline_rect.right() {
+                            ui.painter().line_segment(
+                                [
+                                    egui::pos2(playhead_x, timeline_rect.top()),
+                                    egui::pos2(playhead_x, timeline_rect.bottom()),
+                                ],
+                                egui::Stroke::new(2.0, egui::Color32::RED),
+                            );
+                        }
+                    } else {
+                        // Fallback if no tracks exist
+                        let playhead_x = ruler_rect.left()
+                            + TIMELINE_CONTENT_OFFSET_X
+                            + (self.playhead_ms as f32 * self.zoom_level * 0.1);
+                        if playhead_x >= timeline_rect.left() && playhead_x <= timeline_rect.right() {
+                            ui.painter().line_segment(
+                                [
+                                    egui::pos2(playhead_x, timeline_rect.top()),
+                                    egui::pos2(playhead_x, timeline_rect.bottom()),
+                                ],
+                                egui::Stroke::new(2.0, egui::Color32::RED),
+                            );
                         }
                     }
 
@@ -4913,14 +5448,15 @@ impl eframe::App for ClipStrikeApp {
                         );
                     }
 
-                    if let Some(cmd) = move_cmd {
-                        self.undo_stack
-                            .push(Box::new(cmd), &mut self.project, &mut self.timeline);
-                    }
-
-                    if let Some(cmd) = trim_cmd {
-                        self.undo_stack
-                            .push(Box::new(cmd), &mut self.project, &mut self.timeline);
+                    if let Some((title_id, track_id, start_ms)) = pending_title_clip_request {
+                        match self.create_title_clip(title_id, track_id, start_ms, 5_000) {
+                            Ok(clip) => add_clip_cmd = Some(AddClipCommand { clip }),
+                            Err(err) => log::error!(
+                                "Failed to drag title {} onto timeline: {}",
+                                title_id,
+                                err
+                            ),
+                        }
                     }
 
                     if let Some(cmd) = add_clip_cmd {
@@ -4933,8 +5469,18 @@ impl eframe::App for ClipStrikeApp {
                             .push(Box::new(cmd), &mut self.project, &mut self.timeline);
                     }
 
-                    if let Some(clip_id) = remove_clip_id {
-                        if let Some(pos) = self.timeline.clips.iter().position(|c| c.id == clip_id)
+                    if let Some(clip_id) = pending_ungroup_clip_id {
+                        let _ = self.apply_track_mutation(|project| {
+                            if let Some(pos) = project.clips.iter().position(|c| c.id == clip_id) {
+                                project.clips[pos].group_id = None;
+                            }
+                            Ok(())
+                        });
+                        self.timeline = self.project.to_timeline();
+                    }
+
+                    if let Some(id) = remove_clip_id {
+                        if let Some(pos) = self.timeline.clips.iter().position(|c| c.id == id)
                         {
                             let clip = self.timeline.clips[pos].clone();
                             self.undo_stack.push(
@@ -4980,20 +5526,6 @@ impl eframe::App for ClipStrikeApp {
                     match self.left_panel_tab {
                         LeftPanelTab::ProjectFiles => {
                             ui.horizontal(|ui| {
-                                if ui.button("+").clicked() {
-                                    let start = self.timeline.clips.len() as i64 * 1000;
-                                    let mut clip = Clip::new(
-                                        rand::random::<usize>(),
-                                        0,
-                                        5,
-                                        start,
-                                        start + 2000,
-                                    );
-                                    clip.video_enabled = true;
-                                    clip.audio_enabled = false;
-                                    self.timeline.add_clip(clip);
-                                }
-                                let _ = ui.button("-");
                                 ui.label("Show:");
 
                                 let filter_labels = ["All", "Video", "Audio", "Image"];
@@ -5067,22 +5599,11 @@ impl eframe::App for ClipStrikeApp {
                                         let (asset_id, asset_name, asset_uri, asset_duration_ms) =
                                             asset_data;
 
-                                        let ext = asset_uri
-                                            .split('.')
-                                            .last()
-                                            .unwrap_or("")
-                                            .to_lowercase();
                                         let item_id = egui::Id::new(("asset", asset_id));
 
                                         let mut add_to_timeline = false;
                                         ui.horizontal(|ui| {
-                                            let icon =
-                                                if ["png", "jpg", "jpeg"].contains(&ext.as_str()) {
-                                                    "Image"
-                                                } else {
-                                                    "Media"
-                                                };
-                                            ui.label(icon);
+                                            ui.label(Self::asset_library_kind(&asset_uri));
                                             let label_res = ui.selectable_label(false, &asset_name);
 
                                             #[cfg(target_arch = "wasm32")]
@@ -5154,6 +5675,10 @@ impl eframe::App for ClipStrikeApp {
                                 ui.label(format!(
                                     "__clipstrike_test_detection_label_count__: {}",
                                     snapshot["detection_count"].as_u64().unwrap_or(0)
+                                ));
+                                ui.label(format!(
+                                    "__clipstrike_test_playback_complete__: {}",
+                                    snapshot["playback_complete"].as_bool().unwrap_or(false)
                                 ));
                             }
                         }
@@ -5346,8 +5871,7 @@ impl eframe::App for ClipStrikeApp {
                                         });
 
                                         if add_to_timeline {
-                                            // Create a clip directly from title
-                                            if let Err(err) = self.add_asset_to_timeline(0, 5000) {
+                                            if let Err(err) = self.add_title_to_timeline(title_id, 5_000) {
                                                 log::error!(
                                                     "Failed to add title {} to timeline: {}",
                                                     title_id,
@@ -5958,6 +6482,7 @@ impl eframe::App for ClipStrikeApp {
             });
         });
 
+        self.draw_library_drag_preview(ctx);
         self.process_active_export_capture(ctx);
         self.draw_title_editor(ctx);
     }
@@ -6032,9 +6557,9 @@ mod tests {
         app.project.tracks[1].visible = false;
         app.project.tracks[3].visible = false;
         app.project.clips = vec![
-            Clip::new(1, 1, app.project.tracks[0].id, 0, 100),
-            Clip::new(2, 1, app.project.tracks[0].id, 50, 150),
-            Clip::new(3, 1, app.project.tracks[2].id, 0, 100),
+            Clip::new(1, 1, app.project.tracks[0].id, 0, 100, 0, 100),
+            Clip::new(2, 1, app.project.tracks[0].id, 50, 150, 0, 100),
+            Clip::new(3, 1, app.project.tracks[2].id, 0, 100, 0, 100),
         ];
         app.timeline = app.project.to_timeline();
         app.playhead_ms = 50;
@@ -6100,6 +6625,74 @@ mod tests {
     }
 
     #[test]
+    fn asset_library_kind_classifies_media_extensions() {
+        assert_eq!(ClipStrikeApp::asset_library_kind("file:///clip.mp4"), "Video");
+        assert_eq!(ClipStrikeApp::asset_library_kind("file:///clip.wav"), "Audio");
+        assert_eq!(ClipStrikeApp::asset_library_kind("file:///still.png"), "Image");
+        assert_eq!(ClipStrikeApp::asset_library_kind("file:///unknown.bin"), "Media");
+    }
+
+    #[test]
+    fn add_title_to_timeline_materializes_a_real_asset() {
+        let mut app = ClipStrikeApp::test_harness(Project::new("Add Title", 1920, 1080, 60.0));
+        let title_id = rand::random::<usize>();
+        app.playhead_ms = 250;
+        app.project.titles.push(clipstrike_core::project::TitleAsset {
+            id: title_id,
+            name: "Lower Third".to_string(),
+            template: clipstrike_core::project::TitleTemplate::LowerThird,
+            text: "ClipStrike".to_string(),
+            font_family: "Arial".to_string(),
+            font_size: 48.0,
+            color: [255, 255, 255, 255],
+            x: 0.5,
+            y: 0.8,
+            svg_content: "<svg><text>ClipStrike</text></svg>".to_string(),
+        });
+
+        app.add_title_to_timeline(title_id, 5_000)
+            .expect("title should be added to the timeline");
+
+        assert_eq!(app.project.assets.len(), 1);
+        let asset = app.project.assets.first().expect("title asset should exist");
+        let clip = app.timeline.clips.first().expect("title clip should be inserted");
+        assert_ne!(asset.id, 0, "title assets must never use the missing-asset sentinel");
+        assert_eq!(clip.asset_id, asset.id);
+        assert!(!clip.audio_enabled, "title clips should stay silent");
+        assert!(clip.video_enabled, "title clips should render video");
+    }
+
+    #[test]
+    fn create_title_clip_reuses_existing_materialized_asset() {
+        let mut app = ClipStrikeApp::test_harness(Project::new("Reuse Title", 1920, 1080, 60.0));
+        let title_id = rand::random::<usize>();
+        app.project.titles.push(clipstrike_core::project::TitleAsset {
+            id: title_id,
+            name: "Bugfix Title".to_string(),
+            template: clipstrike_core::project::TitleTemplate::Centered,
+            text: "Bugfix".to_string(),
+            font_family: "Arial".to_string(),
+            font_size: 48.0,
+            color: [255, 255, 255, 255],
+            x: 0.5,
+            y: 0.5,
+            svg_content: "<svg><text>Bugfix</text></svg>".to_string(),
+        });
+
+        let track_id = app.project.tracks[0].id;
+        let first_clip = app
+            .create_title_clip(title_id, track_id, 0, 5_000)
+            .expect("first title clip should be created");
+        let second_clip = app
+            .create_title_clip(title_id, track_id, 5_000, 5_000)
+            .expect("second title clip should reuse the same materialized asset");
+
+        assert_eq!(app.project.assets.len(), 1);
+        assert_eq!(first_clip.asset_id, second_clip.asset_id);
+        assert_ne!(first_clip.asset_id, 0);
+    }
+
+    #[test]
     fn playback_audio_samples_treats_empty_buffers_as_streaming_sources() {
         let empty = std::sync::Arc::new(Vec::new());
         assert!(ClipStrikeApp::playback_audio_samples(empty).is_none());
@@ -6161,7 +6754,7 @@ mod tests {
 
         app.app_config.autosave_enabled = true;
         app.current_project_path = Some(checkpoint_source.clone());
-        app.timeline.clips.push(Clip::new(77, 1, 1, 0, 250));
+        app.timeline.clips.push(Clip::new(77, 1, 1, 0, 250, 0, 250));
 
         let checkpoint_path = app
             .write_recovery_checkpoint()
@@ -6193,7 +6786,7 @@ mod tests {
         app.current_project_path = Some(checkpoint_source.clone());
 
         app.apply_track_mutation(|project| {
-            project.clips.push(Clip::new(78, 1, 1, 0, 250));
+            project.clips.push(Clip::new(78, 1, 1, 0, 250, 0, 250));
             Ok(())
         })
         .expect("track mutation should succeed");
@@ -6276,7 +6869,7 @@ mod tests {
         });
         app.project
             .clips
-            .push(Clip::new(clip_id, 101, track_id, 0, 5000));
+            .push(Clip::new(clip_id, 101, track_id, 0, 5000, 0, 5000));
         app.timeline = app.project.to_timeline();
 
         let affected_clips = app
@@ -6399,13 +6992,92 @@ mod tests {
     }
 
     #[test]
+    fn step_playback_clamps_to_timeline_end_and_stops() {
+        let mut project = Project::new("Playback End", 1920, 1080, 30.0);
+        project.clips = vec![Clip::new(1, 1, 1, 0, 5_000, 0, 5_000)];
+
+        let mut app = ClipStrikeApp::test_harness(project);
+        app.timeline = app.project.to_timeline();
+        app.playhead_ms = 4_950;
+        app.is_playing = true;
+
+        app.step_playback(100);
+
+        assert_eq!(app.playhead_ms, 5_000);
+        assert!(!app.is_playing);
+    }
+
+    #[test]
+    fn handle_clip_eos_stops_when_clip_ends_the_timeline() {
+        let mut project = Project::new("Playback EOS Stop", 1920, 1080, 30.0);
+        project.clips = vec![Clip::new(1, 1, 1, 0, 5_000, 0, 5_000)];
+
+        let mut app = ClipStrikeApp::test_harness(project);
+        app.timeline = app.project.to_timeline();
+        app.playhead_ms = 4_980;
+        app.is_playing = true;
+
+        app.handle_clip_eos(1);
+
+        assert_eq!(app.playhead_ms, 5_000);
+        assert!(!app.is_playing);
+    }
+
+    #[test]
+    fn handle_clip_eos_keeps_playing_when_next_clip_starts_at_boundary() {
+        let mut project = Project::new("Playback EOS Continue", 1920, 1080, 30.0);
+        project.clips = vec![
+            Clip::new(1, 1, 1, 0, 5_000, 0, 5_000),
+            Clip::new(2, 2, 1, 5_000, 8_000, 0, 3_000),
+        ];
+
+        let mut app = ClipStrikeApp::test_harness(project);
+        app.timeline = app.project.to_timeline();
+        app.playhead_ms = 4_980;
+        app.is_playing = true;
+
+        app.handle_clip_eos(1);
+
+        assert_eq!(app.playhead_ms, 5_000);
+        assert!(app.is_playing);
+    }
+
+    #[test]
+    fn scrub_playhead_clamps_target_to_timeline_end() {
+        let mut project = Project::new("Scrub Clamp", 1920, 1080, 30.0);
+        project.clips = vec![Clip::new(1, 1, 1, 0, 5_000, 0, 5_000)];
+
+        let mut app = ClipStrikeApp::test_harness(project);
+        app.timeline = app.project.to_timeline();
+        app.scrub_playhead(6_000);
+
+        assert_eq!(app.playhead_ms, 5_000);
+    }
+
+    #[test]
+    fn scrub_playhead_ignores_redundant_targets() {
+        let mut project = Project::new("Scrub Stable", 1920, 1080, 30.0);
+        project.clips = vec![Clip::new(1, 1, 1, 0, 5_000, 0, 5_000)];
+
+        let mut app = ClipStrikeApp::test_harness(project);
+        app.timeline = app.project.to_timeline();
+        app.playhead_ms = 750;
+        app.is_playing = true;
+
+        app.scrub_playhead(750);
+
+        assert_eq!(app.playhead_ms, 750);
+        assert!(app.is_playing);
+    }
+
+    #[test]
     fn playback_clips_for_playhead_prewarms_the_next_clip_on_each_track() {
         let mut project = Project::new("Playback Prewarm", 1920, 1080, 30.0);
         project.tracks = Project::default_tracks(2);
         project.clips = vec![
-            Clip::new(1, 1, project.tracks[0].id, 0, 1000),
-            Clip::new(2, 1, project.tracks[0].id, 1100, 2100),
-            Clip::new(3, 1, project.tracks[1].id, 1150, 2150),
+            Clip::new(1, 1, project.tracks[0].id, 0, 1000, 0, 1000),
+            Clip::new(2, 1, project.tracks[0].id, 1100, 2100, 0, 1000),
+            Clip::new(3, 1, project.tracks[1].id, 1150, 2150, 0, 1000),
         ];
 
         let mut app = ClipStrikeApp::test_harness(project);
@@ -6426,25 +7098,33 @@ mod tests {
 
     #[test]
     fn timeline_time_from_ruler_position_clamps_left_edge_and_respects_zoom() {
-        let ruler_rect = egui::Rect::from_min_size(egui::pos2(100.0, 0.0), egui::vec2(200.0, 20.0));
+        let origin_x = 100.0 + TIMELINE_CONTENT_OFFSET_X;
 
         let at_start = ClipStrikeApp::timeline_time_from_ruler_position(
-            ruler_rect,
-            egui::pos2(100.0 + TIMELINE_CONTENT_OFFSET_X, 10.0),
+            origin_x,
+            egui::pos2(origin_x, 10.0),
             0.5,
         );
         assert_eq!(at_start, 0);
 
         let later = ClipStrikeApp::timeline_time_from_ruler_position(
-            ruler_rect,
-            egui::pos2(100.0 + TIMELINE_CONTENT_OFFSET_X + 50.0, 10.0),
+            origin_x,
+            egui::pos2(origin_x + 50.0, 10.0),
             1.0,
         );
         assert_eq!(later, 500);
     }
 
+
+    #[test]
+    fn clip_split_time_from_pointer_offsets_by_clip_start() {
+        let split_at = ClipStrikeApp::clip_split_time_from_pointer(2_000, 300.0, 350.0, 0.1);
+
+        assert_eq!(split_at, 2_500);
+    }
+
     fn make_test_clip() -> Clip {
-        Clip::new(1, 1, 1, 0, 1000)
+        Clip::new(1, 1, 1, 0, 1000, 0, 1000)
     }
 
     #[test]
@@ -6470,3 +7150,4 @@ mod tests {
         );
     }
 }
+

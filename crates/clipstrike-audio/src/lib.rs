@@ -130,6 +130,16 @@ pub fn decode_f32le_samples(bytes: &[u8]) -> Result<Vec<f32>, String> {
         .collect())
 }
 
+const SCRUB_PREVIEW_MS: usize = 500;
+
+fn scrub_preview_sample_budget(sample_rate: u32) -> usize {
+    ((sample_rate as usize) * SCRUB_PREVIEW_MS / 1000).saturating_mul(2)
+}
+
+fn should_render_audio(is_playing: bool, scrub_preview_samples_remaining: usize) -> bool {
+    is_playing || scrub_preview_samples_remaining > 0
+}
+
 pub struct PlaybackEngine {
     _stream: cpal::Stream,
     handle: AudioHandle,
@@ -142,6 +152,7 @@ struct InnerPlaybackState {
     sources: Vec<AudioSource>,
     streaming_buffers: HashMap<usize, StreamingBuffer>,
     sample_rate: u32,
+    scrub_preview_samples_remaining: usize,
 }
 
 impl PlaybackEngine {
@@ -164,6 +175,7 @@ impl PlaybackEngine {
             sources: Vec::new(),
             streaming_buffers: HashMap::new(),
             sample_rate,
+            scrub_preview_samples_remaining: 0,
         };
 
         let (sender, receiver) = mpsc::channel(256);
@@ -178,11 +190,17 @@ impl PlaybackEngine {
                             AudioCommand::SetPlaying(p) => {
                                 inner.is_playing = p;
                                 if !p {
+                                    inner.scrub_preview_samples_remaining = 0;
                                     peak_levels_ref.store([0.0, 0.0]);
                                 }
                             }
                             AudioCommand::SetPlayhead(ms) => {
                                 inner.current_ms = ms;
+                                inner.scrub_preview_samples_remaining = if inner.is_playing {
+                                    0
+                                } else {
+                                    scrub_preview_sample_budget(inner.sample_rate)
+                                };
                                 for buf in inner.streaming_buffers.values_mut() {
                                     buf.clear();
                                 }
@@ -199,7 +217,7 @@ impl PlaybackEngine {
                         }
                     }
 
-                    if !inner.is_playing {
+                    if !should_render_audio(inner.is_playing, inner.scrub_preview_samples_remaining) {
                         for sample in data.iter_mut() {
                             *sample = 0.0;
                         }
@@ -249,6 +267,12 @@ impl PlaybackEngine {
                     }
 
                     peak_levels_ref.store(current_peaks);
+
+                    if !inner.is_playing {
+                        inner.scrub_preview_samples_remaining = inner
+                            .scrub_preview_samples_remaining
+                            .saturating_sub(data.len());
+                    }
 
                     let ms_processed = (data.len() as f32 / (sr / 1000.0 * 2.0)) as i64;
                     inner.current_ms += ms_processed;
@@ -357,5 +381,18 @@ mod tests {
 
         assert_eq!(buffer.pop_sample(), None);
         assert!(buffer.samples.is_empty());
+    }
+
+
+    #[test]
+    fn scrub_preview_budget_covers_a_short_audio_burst() {
+        assert_eq!(scrub_preview_sample_budget(48_000), 48_000);
+    }
+
+    #[test]
+    fn paused_scrub_preview_still_allows_audio_output() {
+        assert!(should_render_audio(true, 0));
+        assert!(should_render_audio(false, 128));
+        assert!(!should_render_audio(false, 0));
     }
 }

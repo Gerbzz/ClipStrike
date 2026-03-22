@@ -64,6 +64,12 @@ fn configure_gstreamer_env(cmd: &mut Command, gst_root: &Path) {
     cmd.env("RUST_BACKTRACE", "1");
 }
 
+fn build_failed_only_because_desktop_binary_is_locked(stderr: &str) -> bool {
+    stderr.contains("failed to remove file")
+        && stderr.contains("clipstrike-app.exe")
+        && stderr.contains("Access is denied")
+}
+
 fn build_clipstrike_desktop() -> io::Result<()> {
     let gst_root = gstreamer_root();
     if !gst_root.join("bin").join("glib-2.0-0.dll").exists() {
@@ -87,12 +93,18 @@ fn build_clipstrike_desktop() -> io::Result<()> {
 
     let output = cmd.output()?;
     if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if build_failed_only_because_desktop_binary_is_locked(&stderr) && clipstrike_exe().exists() {
+            return Ok(());
+        }
+
         return Err(io::Error::new(
             io::ErrorKind::Other,
             format!(
                 "cargo build failed:\nstdout:\n{}\nstderr:\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+                stdout,
+                stderr
             ),
         ));
     }

@@ -5,6 +5,7 @@ pub mod editor;
 pub mod effects;
 pub mod keyframes;
 pub mod labels;
+pub mod playback;
 pub mod project;
 pub mod timeline;
 pub mod transitions;
