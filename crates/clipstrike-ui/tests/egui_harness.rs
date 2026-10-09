@@ -19,6 +19,7 @@ fn add_test_clip_button_does_not_crash_and_inserts_a_clip() {
 }
 
 #[test]
+#[ignore = "native import UI harness can wait indefinitely without a desktop media backend"]
 fn import_button_loads_fixture_and_row_add_button_adds_clip() {
     let project = Project::new("Import Harness", 1920, 1080, 30.0);
     let mut app = ClipStrikeApp::test_harness(project);

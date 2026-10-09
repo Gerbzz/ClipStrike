@@ -34,3 +34,17 @@ server.out
 ui-debug-screenshot.png
 New Project.mp4
 PythonDatatempclipstrike-*
+
+# Local media, demo data, and machine state
+*.dem
+*.raw.json
+*.sqlite
+*.sqlite-*
+*.db
+*.mp4
+*.mov
+*.wav
+*.exe
+app_test_logs.txt
+git_status.txt
+git_cmd_status.txt

@@ -39,3 +39,4 @@ gstreamer-app = { workspace = true, optional = true }
 
 [dev-dependencies]
 egui_kittest = "0.30.0"
+tempfile = "3"

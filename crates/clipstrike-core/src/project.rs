@@ -1,8 +1,10 @@
+use crate::capture_package::{CapturePackage, CapturedAsset, PackageError};
 use crate::timeline::{Clip, Timeline};
 use crate::transitions::Transition;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::io::{self, Write};
+use std::path::{Component, Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::sync::mpsc;
 
@@ -92,6 +94,8 @@ pub struct Project {
     pub master_volume: f32,
     pub tracks: Vec<Track>,
     pub assets: Vec<MediaAsset>,
+    #[serde(default)]
+    pub capture_sources: Vec<CapturedAsset>,
     pub titles: Vec<TitleAsset>,
     pub generators: Vec<GeneratorAsset>,
     pub transition_masks: Vec<TransitionMaskAsset>,
@@ -152,6 +156,7 @@ impl Project {
             master_volume: 1.0,
             tracks: Vec::new(),
             assets: Vec::new(),
+            capture_sources: Vec::new(),
             titles: Vec::new(),
             generators: Vec::new(),
             transition_masks: Vec::new(),
@@ -171,6 +176,154 @@ impl Project {
             .rev()
             .map(|i| Track::new(i, &format!("Track {}", i)))
             .collect()
+    }
+
+    pub fn import_capture_package(
+        &mut self,
+        package: &CapturePackage,
+    ) -> Result<Vec<usize>, PackageError> {
+        // Recheck the on-disk evidence immediately before linking it into a project.
+        let verified = CapturePackage::load_and_validate(&package.root)?;
+        if verified.manifest.clips.iter().any(|clip| clip.fps_num % clip.fps_den != 0) {
+            return Err(PackageError::Invalid(
+                "fractional source FPS is preserved in the package but not yet supported by the millisecond timeline".into(),
+            ));
+        }
+        let mut ordered = verified.manifest.clips.clone();
+        ordered.sort_by_key(|clip| clip.group_order);
+
+        let mut next_asset_id = self.assets.iter().map(|asset| asset.id).max().unwrap_or(0);
+        let mut next_clip_id = self.clips.iter().map(|clip| clip.id).max().unwrap_or(0);
+        let mut start = self.clips.iter().map(|clip| clip.end).max().unwrap_or(0);
+        let track_id = self.tracks.first().map(|track| track.id).unwrap_or(1);
+        let mut assets = Vec::with_capacity(ordered.len());
+        let mut clips = Vec::with_capacity(ordered.len());
+        let mut sources = Vec::with_capacity(ordered.len());
+        let mut imported_ids = Vec::with_capacity(ordered.len());
+
+        for source in ordered {
+            if self.capture_sources.iter().any(|existing| {
+                existing.package_id == verified.manifest.package_id
+                    && existing.clip.clip_id == source.clip_id
+            }) {
+                return Err(PackageError::Invalid(format!(
+                    "capture clip already imported: {}", source.clip_id
+                )));
+            }
+            let duration = i64::try_from(source.duration_ms)
+                .map_err(|_| PackageError::Invalid("clip duration exceeds timeline range".into()))?;
+            let end = start.checked_add(duration)
+                .ok_or_else(|| PackageError::Invalid("timeline duration overflow".into()))?;
+            next_asset_id = next_asset_id.checked_add(1)
+                .ok_or_else(|| PackageError::Invalid("asset ID overflow".into()))?;
+            next_clip_id = next_clip_id.checked_add(1)
+                .ok_or_else(|| PackageError::Invalid("clip ID overflow".into()))?;
+            let uri = url::Url::from_file_path(verified.media_path(&source))
+                .map_err(|_| PackageError::Invalid(format!("cannot encode media path: {}", source.relative_path)))?
+                .to_string();
+            assets.push(MediaAsset {
+                id: next_asset_id,
+                name: source.clip_id.clone(),
+                uri,
+                duration_ms: source.duration_ms,
+                audio_levels: Vec::new(),
+            });
+            clips.push(Clip::new(next_clip_id, next_asset_id, track_id, start, end, 0, duration));
+            sources.push(CapturedAsset {
+                asset_id: next_asset_id,
+                package_id: verified.manifest.package_id.clone(),
+                package_path: Some(verified.root.to_string_lossy().into_owned()),
+                media_validation: verified.manifest.media_validation,
+                clip: source,
+            });
+            imported_ids.push(next_clip_id);
+            start = end;
+        }
+
+        if self.tracks.is_empty() {
+            self.add_track();
+        }
+        self.assets.extend(assets);
+        self.clips.extend(clips);
+        self.capture_sources.extend(sources);
+        Ok(imported_ids)
+    }
+
+    /// Store a package location relative to the project when the paths share a volume.
+    /// The complete package is revalidated before any media URI is changed.
+    pub fn relink_capture_package(
+        &mut self,
+        project_file: &Path,
+        package_id: &str,
+        package_root: &Path,
+    ) -> Result<(), PackageError> {
+        let package = CapturePackage::load_and_validate(package_root)?;
+        if package.manifest.package_id != package_id {
+            return Err(PackageError::Invalid("capture package ID does not match".into()));
+        }
+        let parent = project_file.parent().unwrap_or_else(|| Path::new("."))
+            .canonicalize().map_err(|error| PackageError::Io(error.to_string()))?;
+        let path_hint = relative_path(&parent, &package.root)
+            .unwrap_or_else(|| package.root.clone()).to_string_lossy().into_owned();
+        for source in self.capture_sources.iter().filter(|source| source.package_id == package_id) {
+            let matching = package.manifest.clips.iter().any(|clip| {
+                clip == &source.clip
+            });
+            if !matching {
+                return Err(PackageError::Invalid(format!("capture source missing or changed: {}", source.clip.clip_id)));
+            }
+        }
+        for source in self.capture_sources.iter_mut().filter(|source| source.package_id == package_id) {
+            source.package_path = Some(path_hint.clone());
+            if let Some(asset) = self.assets.iter_mut().find(|asset| asset.id == source.asset_id) {
+                asset.uri = url::Url::from_file_path(package.media_path(&source.clip))
+                    .map_err(|_| PackageError::Invalid("cannot encode capture media path".into()))?
+                    .to_string();
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve capture media from the stored package location. Missing or changed packages
+    /// become explicit offline URIs rather than silently using a stale absolute source.
+    pub fn relink_capture_media(&mut self, project_file: &Path) -> Vec<String> {
+        let parent = project_file.parent().unwrap_or_else(|| Path::new("."));
+        let mut packages: HashMap<PathBuf, Result<CapturePackage, PackageError>> = HashMap::new();
+        let mut errors = Vec::new();
+        for source in &self.capture_sources {
+            let Some(hint) = &source.package_path else {
+                if let Some(asset) = self.assets.iter_mut().find(|asset| asset.id == source.asset_id) {
+                    asset.uri = format!("capture-offline://{}/{}", source.package_id, source.clip.clip_id);
+                }
+                errors.push(format!("capture media unavailable: {} / {}: package location is missing", source.package_id, source.clip.clip_id));
+                continue;
+            };
+            let stored = Path::new(hint);
+            let root = if stored.is_absolute() { stored.to_path_buf() } else { parent.join(stored) };
+            let package = packages.entry(root.clone())
+                .or_insert_with(|| CapturePackage::load_manifest_structure(&root));
+            let resolved = package.as_ref().map_err(|error| error.to_string()).and_then(|package| {
+                if package.manifest.package_id != source.package_id
+                    || !package.manifest.clips.iter().any(|clip| clip == &source.clip) {
+                    return Err("stored capture metadata differs from package".into());
+                }
+                package.validate_media_clip_with_cancel(&source.clip, || false)
+                    .map_err(|error| error.to_string())
+            }).and_then(|path| {
+                url::Url::from_file_path(path)
+                    .map_err(|_| "cannot encode capture media path".to_string())
+            });
+            if let Some(asset) = self.assets.iter_mut().find(|asset| asset.id == source.asset_id) {
+                match resolved {
+                    Ok(uri) => { asset.uri = uri.to_string(); continue; }
+                    Err(reason) => {
+                        asset.uri = format!("capture-offline://{}/{}", source.package_id, source.clip.clip_id);
+                        errors.push(format!("capture media unavailable: {} / {}: {reason}", source.package_id, source.clip.clip_id));
+                    }
+                }
+            }
+        }
+        errors
     }
 
     pub fn capture_timeline(&mut self, timeline: &Timeline) {
@@ -322,13 +475,51 @@ impl Project {
     }
 
     pub fn save<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
-        std::fs::write(path, self.to_json_bytes()?)?;
+        self.save_with_before_replace(path.as_ref(), || Ok(()))
+    }
+
+    fn save_with_before_replace(
+        &self,
+        path: &Path,
+        before_replace: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut pending = tempfile::NamedTempFile::new_in(parent)?;
+        pending.write_all(&self.to_json_bytes()?)?;
+        pending.as_file().sync_all()?;
+        if path.is_file() {
+            let mut backup = tempfile::NamedTempFile::new_in(parent)?;
+            io::copy(&mut std::fs::File::open(path)?, &mut backup)?;
+            backup.as_file().sync_all()?;
+            backup.persist(Self::backup_path(path)).map_err(|error| error.error)?;
+        }
+        before_replace()?;
+        pending.persist(path).map_err(|error| error.error)?;
         Ok(())
     }
 
+    pub fn backup_path(path: &Path) -> PathBuf {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(".bak");
+        PathBuf::from(value)
+    }
+
+    pub fn load_backup(path: &Path) -> io::Result<Self> {
+        Self::load(Self::backup_path(path))
+    }
+
     pub fn load<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
-        let content = std::fs::read(path)?;
-        Ok(Self::from_json_bytes(&content)?)
+        Self::load_with_capture_warnings(path).map(|(project, _)| project)
+    }
+
+    /// Open editorial state even when linked source media is unavailable, while
+    /// returning the reason each capture asset was marked offline.
+    pub fn load_with_capture_warnings<P: AsRef<Path>>(path: P) -> std::io::Result<(Self, Vec<String>)> {
+        let content = std::fs::read(&path)?;
+        let mut project = Self::from_json_bytes(&content)?;
+        let warnings = project.relink_capture_media(path.as_ref());
+        Ok((project, warnings))
     }
 
     pub fn to_json_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
@@ -338,6 +529,21 @@ impl Project {
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(bytes)
     }
+}
+
+fn relative_path(from: &Path, to: &Path) -> Option<PathBuf> {
+    let from_parts: Vec<_> = from.components().collect();
+    let to_parts: Vec<_> = to.components().collect();
+    if from_parts.first() != to_parts.first() { return None; }
+    let common = from_parts.iter().zip(&to_parts).take_while(|(a, b)| a == b).count();
+    let mut relative = PathBuf::new();
+    for part in &from_parts[common..] {
+        if !matches!(part, Component::Normal(_)) { return None; }
+        relative.push("..");
+    }
+    for part in &to_parts[common..] { relative.push(part.as_os_str()); }
+    if relative.as_os_str().is_empty() { relative.push("."); }
+    Some(relative)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -368,8 +574,6 @@ impl EngineChannels {
 mod tests {
     use super::*;
     use crate::keyframes::InterpolationMode;
-    use crate::keyframes::KeyframedProperty;
-    use crate::timeline::BlendMode;
     use crate::transitions::TransitionType;
 
     #[test]
@@ -714,5 +918,75 @@ fn make_clip(id: usize, track_id: usize, start: i64, end: i64) -> Clip {
         let loaded = Project::from_json_bytes(&bytes).expect("project should deserialize");
 
         assert_eq!(proj, loaded);
+    }
+
+    #[test]
+    fn interrupted_save_keeps_last_good_project_and_backup() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("edit.cstrike");
+        let original = Project::new("Original", 1920, 1080, 60.0);
+        original.save(&path).unwrap();
+        let changed = Project::new("Changed", 1920, 1080, 60.0);
+        let failure = changed.save_with_before_replace(&path, || {
+            Err(io::Error::other("simulated interruption before replacement"))
+        });
+        assert!(failure.is_err());
+        assert_eq!(Project::load(&path).unwrap().name, "Original");
+        changed.save(&path).unwrap();
+        assert_eq!(Project::load(&path).unwrap().name, "Changed");
+        assert_eq!(Project::load_backup(&path).unwrap().name, "Original");
+        std::fs::write(&path, b"invalid JSON").unwrap();
+        assert!(Project::load(&path).is_err());
+        assert_eq!(Project::load_backup(&path).unwrap().name, "Original");
+    }
+
+    #[test]
+    fn capture_package_import_keeps_three_editable_sources_after_reopen() {
+        use crate::capture_package::CapturePackage;
+        use serde_json::json;
+        use std::fs;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let clips: Vec<_> = (1..=3)
+            .map(|order| {
+                fs::write(dir.path().join(format!("clip-{order}.mp4")), b"abc").unwrap();
+                json!({
+                    "clip_id": format!("clip-{order}"),
+                    "relative_path": format!("clip-{order}.mp4"),
+                    "sha256": hash, "demo_sha256": hash,
+                    "event_id": format!("event-{order}"),
+                    "player_steamid64": "76561198000000001",
+                    "map": "de_mirage", "round": 4, "utility_type": "smoke",
+                    "start_tick": 1000 + order * 100, "end_tick": 1100 + order * 100,
+                    "camera_role": "projectile", "duration_ms": 1000,
+                    "width": 1920, "height": 1080, "fps_num": 60, "fps_den": 1,
+                    "audio": {"source": "hlae_wav", "channels": 2, "sample_rate": 48000, "verified": true},
+                    "qc_status": "accepted", "group_order": order
+                })
+            })
+            .collect();
+        fs::write(dir.path().join("manifest.json"),
+            serde_json::to_vec(&json!({"schema_version": 1, "package_id": "pilot-001", "clips": clips})).unwrap()).unwrap();
+        let package = CapturePackage::load_and_validate(dir.path()).unwrap();
+
+        let mut project = Project::new("Pilot", 1920, 1080, 60.0);
+        let imported_ids = project.import_capture_package(&package).unwrap();
+        assert_eq!(imported_ids.len(), 3);
+        assert_eq!(project.assets.len(), 3);
+        assert_eq!(project.clips.len(), 3);
+        assert_eq!(project.capture_sources.len(), 3);
+        assert_ne!(project.clips[0].asset_id, project.clips[1].asset_id);
+
+        project.clips[1].start = 4_000;
+        project.clips[1].end = 5_000;
+        let project_path = dir.path().join("pilot.cstrike");
+        project.save(&project_path).unwrap();
+        let reopened = Project::load(&project_path).unwrap();
+        assert_eq!(reopened.clips[1].start, 4_000);
+        assert_eq!(reopened.capture_sources[1].clip.clip_id, "clip-2");
+        assert_eq!(reopened.capture_sources[1].clip.sha256, hash);
+        assert_eq!(reopened.assets.len(), 3);
+        assert!(reopened.assets.iter().all(|asset| asset.uri.starts_with("file:///")));
     }
 }

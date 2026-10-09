@@ -394,18 +394,4 @@ mod tests {
         assert_eq!(select_authoritative_duration(None, None), None);
     }
 
-    #[tokio::test]
-    async fn test_probe_real_file_repro() {
-        use std::path::PathBuf;
-        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.pop();
-        path.pop();
-        path.push("PythonDatatempclipstrike-gst-repro.mp4");
-        let uri = format!("file:///{}", path.to_string_lossy().replace('\\', "/"));
-        println!("Probing URI: {}", uri);
-        let result = probe_metadata_sync(&uri).expect("probe failed");
-        println!("Metadata: {:?}", result);
-        assert!(result.duration.is_some());
-        assert!(result.duration.unwrap().as_millis() > 0);
-    }
 }

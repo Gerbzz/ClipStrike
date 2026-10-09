@@ -674,7 +674,9 @@ mod tests {
     fn speed_multiplier_maps_timeline_time_to_source_time() {
         let mut session = EditorSession::with_default_project("Retime", 1920, 1080, 60.0, 1);
         let asset_id = session.add_asset("Clip", "file:///clip.mp4", 5_000);
-        let clip_id = session.add_clip(session.build_clip(asset_id, 1, 0, 1_000));
+        let mut clip = session.build_clip(asset_id, 1, 0, 1_000);
+        clip.out_point = 2_000;
+        let clip_id = session.add_clip(clip);
         session
             .set_clip_speed_keyframe(clip_id, 0, 2.0, InterpolationMode::Linear)
             .expect("speed keyframe should apply");
@@ -688,7 +690,9 @@ mod tests {
     fn reverse_playback_counts_back_from_total_source_span() {
         let mut session = EditorSession::with_default_project("Reverse", 1920, 1080, 60.0, 1);
         let asset_id = session.add_asset("Clip", "file:///clip.mp4", 5_000);
-        let clip_id = session.add_clip(session.build_clip(asset_id, 1, 0, 1_000));
+        let mut clip = session.build_clip(asset_id, 1, 0, 1_000);
+        clip.out_point = 2_000;
+        let clip_id = session.add_clip(clip);
         session
             .set_clip_speed_keyframe(clip_id, 0, 2.0, InterpolationMode::Linear)
             .expect("speed keyframe should apply");

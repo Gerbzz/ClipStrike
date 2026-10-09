@@ -1,9 +1,8 @@
 ﻿# ClipStrike Local Setup
 
-This repo is developed on Windows with two known GStreamer/MSVC SDK locations:
+This repo is developed on Windows with a GStreamer/MSVC SDK location:
 
 - Installed SDK: `C:\Program Files\gstreamer\1.0\msvc_x86_64`
-- Repo-local fallback: `W:\Youtube\clipstrike\gst_extracted\PFiles64\gstreamer\1.0\msvc_x86_64`
 
 Use the launcher script when you want the repo to configure the runtime automatically:
 

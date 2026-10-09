@@ -955,6 +955,8 @@ mod tests {
             blend_mode: BlendMode::Normal,
             start: 150,
             end: 850,
+            in_point: 0,
+            out_point: 700,
             brightness: KeyframedProperty::new(1.0),
             contrast: KeyframedProperty::new(1.0),
             saturation: KeyframedProperty::new(1.0),
@@ -993,6 +995,8 @@ mod tests {
             tracking_data: Vec::new(),
             detections: Vec::new(),
             effects: Vec::new(),
+            group_id: None,
+            color_tag: [80, 120, 160, 255],
         };
         engine.add_clip(&clip);
 

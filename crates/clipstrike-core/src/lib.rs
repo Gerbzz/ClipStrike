@@ -1,4 +1,6 @@
 pub mod bridges;
+pub mod capture_package;
+pub mod capture_import;
 pub mod clip_defaults;
 pub mod commands;
 pub mod editor;

@@ -67,7 +67,6 @@ ClipStrike is currently developed and verified primarily on Windows.
 The repo currently documents two known GStreamer SDK roots:
 
 - `C:\Program Files\gstreamer\1.0\msvc_x86_64`
-- `W:\Youtube\clipstrike\gst_extracted\PFiles64\gstreamer\1.0\msvc_x86_64`
 
 ### Quick Commands
 

@@ -261,6 +261,8 @@ mod tests {
             track_id,
             start,
             end,
+            in_point: 0,
+            out_point: end - start,
             blend_mode: crate::timeline::BlendMode::Normal,
             brightness: KeyframedProperty::new(1.0),
             contrast: KeyframedProperty::new(1.0),
@@ -300,6 +302,8 @@ mod tests {
             motion_tracking_enabled: false,
             stabilization_strength: KeyframedProperty::new(0.5),
             object_detection_enabled: false,
+            group_id: None,
+            color_tag: [80, 120, 160, 255],
         }
     }
 

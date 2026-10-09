@@ -64,6 +64,8 @@ pub struct ClipStrikeApp {
     app_config: AppConfig,
     project: Project,
     current_project_path: Option<PathBuf>,
+    saved_snapshot: Project,
+    pending_project_replace: Option<PendingProjectReplace>,
     undo_stack: UndoStack,
 
     // Engine & GPU Integration
@@ -131,6 +133,7 @@ pub struct ClipStrikeApp {
     export_preset_index: usize,
     export_output_path: Option<PathBuf>,
     export_notification: Option<String>,
+    capture_warning: Option<String>,
     active_export: Option<ActiveExportJob>,
 
     // Test Hooks Bounding Boxes
@@ -179,6 +182,13 @@ struct ActiveExportJob {
     started_at: Instant,
     restore_playhead_ms: i64,
     restore_is_playing: bool,
+}
+
+#[derive(Clone)]
+enum PendingProjectReplace {
+    New,
+    Open(PathBuf),
+    Recovery(PathBuf),
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -555,8 +565,10 @@ impl ClipStrikeApp {
             zoom_level: 0.5,
             timeline: Timeline::new(),
             app_config,
-            project,
+            project: project.clone(),
             current_project_path: None,
+            saved_snapshot: project,
+            pending_project_replace: None,
             undo_stack: UndoStack::new(),
             device,
             queue,
@@ -616,6 +628,7 @@ impl ClipStrikeApp {
             export_preset_index: 0,
             export_output_path: None,
             export_notification: None,
+            capture_warning: None,
             active_export: None,
             show_title_editor: false,
             editing_title: None,
@@ -634,8 +647,10 @@ impl ClipStrikeApp {
             zoom_level: 0.5,
             timeline,
             app_config: AppConfig::default(),
-            project,
+            project: project.clone(),
             current_project_path: None,
+            saved_snapshot: project,
+            pending_project_replace: None,
             undo_stack: UndoStack::new(),
             device: None,
             queue: None,
@@ -689,6 +704,7 @@ impl ClipStrikeApp {
             export_preset_index: 0,
             export_output_path: None,
             export_notification: None,
+            capture_warning: None,
             active_export: None,
             test_first_track_rect: None,
             test_first_asset_rect: None,
@@ -1249,10 +1265,17 @@ impl ClipStrikeApp {
         project
     }
 
+    fn has_unsaved_changes(&self) -> bool {
+        self.snapshot_project() != self.saved_snapshot
+    }
+
     fn reset_runtime_state(&mut self, project: Project, path: Option<PathBuf>) {
         self.timeline = project.to_timeline();
         self.project = project;
         self.current_project_path = path;
+        self.saved_snapshot = self.project.clone();
+        self.pending_project_replace = None;
+        self.capture_warning = None;
         self.undo_stack = UndoStack::new();
         self.is_playing = false;
         self.current_time_ms = 0;
@@ -1277,14 +1300,63 @@ impl ClipStrikeApp {
     }
 
     fn new_project(&mut self) {
-        self.reset_runtime_state(self.default_project(), None);
+        if self.has_unsaved_changes() {
+            self.pending_project_replace = Some(PendingProjectReplace::New);
+        } else {
+            self.reset_runtime_state(self.default_project(), None);
+        }
     }
 
     fn open_project_at_path(&mut self, path: PathBuf) -> Result<(), String> {
-        let project = Project::load(&path).map_err(|err| err.to_string())?;
+        if self.has_unsaved_changes() {
+            self.pending_project_replace = Some(PendingProjectReplace::Open(path));
+            return Ok(());
+        }
+        self.open_project_unchecked(path)
+    }
+
+    fn open_project_unchecked(&mut self, path: PathBuf) -> Result<(), String> {
+        let (project, warnings) = Project::load_with_capture_warnings(&path)
+            .map_err(|err| err.to_string())?;
         self.reset_runtime_state(project, Some(path.clone()));
+        if let Some(first) = warnings.first() {
+            self.capture_warning = Some(if warnings.len() == 1 { first.clone() }
+                else { format!("{} capture sources offline. First: {first}", warnings.len()) });
+        }
         self.remember_recent_project(path);
         Ok(())
+    }
+
+    fn discard_and_apply_pending_project(&mut self) -> Result<(), String> {
+        match self.pending_project_replace.take() {
+            Some(PendingProjectReplace::New) => {
+                self.reset_runtime_state(self.default_project(), None);
+                Ok(())
+            }
+            Some(PendingProjectReplace::Open(path)) => self.open_project_unchecked(path),
+            Some(PendingProjectReplace::Recovery(path)) => self.restore_recovery_unchecked(&path),
+            None => Ok(()),
+        }
+    }
+
+    fn draw_pending_project_replace(&mut self, ctx: &egui::Context) {
+        if self.pending_project_replace.is_none() { return; }
+        let mut discard = false;
+        let mut cancel = false;
+        egui::Window::new("Unsaved project changes")
+            .collapsible(false).resizable(false).show(ctx, |ui| {
+                ui.label("Save the current project before replacing it, or discard these edits.");
+                ui.horizontal(|ui| {
+                    discard = ui.button("Discard edits and continue").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if cancel { self.pending_project_replace = None; }
+        if discard {
+            if let Err(error) = self.discard_and_apply_pending_project() {
+                self.export_notification = Some(format!("Could not open project: {error}"));
+            }
+        }
     }
 
     fn open_project_dialog(&mut self) -> Result<(), String> {
@@ -1297,6 +1369,7 @@ impl ClipStrikeApp {
     fn save_project_to_path(&mut self, path: PathBuf) -> Result<(), String> {
         let project = self.snapshot_project();
         project.save(&path).map_err(|err| err.to_string())?;
+        self.saved_snapshot = project.clone();
         self.project = project;
         self.current_project_path = Some(path.clone());
         self.remember_recent_project(path);
@@ -1349,8 +1422,23 @@ impl ClipStrikeApp {
 
     fn restore_recovery_checkpoint(&mut self) -> Result<(), String> {
         let path = self.recovery_checkpoint_path();
-        let project = Project::load(&path).map_err(|err| err.to_string())?;
+        if self.has_unsaved_changes() {
+            self.pending_project_replace = Some(PendingProjectReplace::Recovery(path));
+            return Ok(());
+        }
+        self.restore_recovery_unchecked(&path)
+    }
+
+    fn restore_recovery_unchecked(&mut self, path: &Path) -> Result<(), String> {
+        let (project, warnings) = Project::load_with_capture_warnings(&path)
+            .map_err(|err| err.to_string())?;
+        let saved_snapshot = self.saved_snapshot.clone();
         self.reset_runtime_state(project, self.current_project_path.clone());
+        self.saved_snapshot = saved_snapshot;
+        if let Some(first) = warnings.first() {
+            self.capture_warning = Some(if warnings.len() == 1 { first.clone() }
+                else { format!("{} capture sources offline. First: {first}", warnings.len()) });
+        }
         Ok(())
     }
     fn draw_recovery_banner(&mut self, ui: &mut egui::Ui) {
@@ -1495,6 +1583,12 @@ impl ClipStrikeApp {
                 if let Some(notification) = &self.export_notification {
                     ui.separator();
                     ui.label(notification);
+                }
+                if let Some(warning) = &self.capture_warning {
+                    ui.separator();
+                    ui.menu_button("Capture media offline", |ui| {
+                        ui.colored_label(egui::Color32::YELLOW, warning);
+                    });
                 }
             });
 
@@ -3957,6 +4051,7 @@ impl eframe::App for ClipStrikeApp {
                 log::error!("Failed to open recent project: {}", err);
             }
         }
+        self.draw_pending_project_replace(ctx);
         if request_save_project {
             if let Err(err) = self.save_project() {
                 log::error!("Failed to save project: {}", err);
@@ -6491,8 +6586,78 @@ impl eframe::App for ClipStrikeApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clipstrike_core::capture_package::CapturedAsset;
     use clipstrike_core::project::MediaAsset;
     use std::path::PathBuf;
+
+    #[test]
+    fn new_and_open_keep_unsaved_editorial_state_until_discard() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let other_path = dir.path().join("other.cstrike");
+        Project::new("Other", 1920, 1080, 60.0).save(&other_path).unwrap();
+        let mut app = ClipStrikeApp::test_harness(Project::new("Current", 1920, 1080, 60.0));
+        app.project.name = "Unsaved edit".into();
+        assert!(app.has_unsaved_changes());
+
+        app.new_project();
+        assert_eq!(app.project.name, "Unsaved edit");
+        assert!(matches!(app.pending_project_replace, Some(PendingProjectReplace::New)));
+        app.pending_project_replace = None; // user cancels the confirmation
+        app.open_project_at_path(other_path).unwrap();
+        assert_eq!(app.project.name, "Unsaved edit");
+        assert!(matches!(app.pending_project_replace, Some(PendingProjectReplace::Open(_))));
+        app.discard_and_apply_pending_project().unwrap();
+        assert_eq!(app.project.name, "Other");
+        assert!(!app.has_unsaved_changes());
+    }
+
+    #[test]
+    fn recovery_checkpoint_keeps_current_unsaved_edits_until_discard() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("current.cstrike");
+        let mut app = ClipStrikeApp::test_harness(Project::new("Current", 1920, 1080, 60.0));
+        app.save_project_to_path(path).unwrap();
+        Project::new("Recovered", 1920, 1080, 60.0)
+            .save(app.recovery_checkpoint_path()).unwrap();
+        app.project.name = "Unsaved".into();
+        app.restore_recovery_checkpoint().unwrap();
+        assert_eq!(app.project.name, "Unsaved");
+        assert!(matches!(app.pending_project_replace, Some(PendingProjectReplace::Recovery(_))));
+        app.discard_and_apply_pending_project().unwrap();
+        assert_eq!(app.project.name, "Recovered");
+        assert!(app.has_unsaved_changes());
+    }
+
+    #[test]
+    fn opening_project_surfaces_offline_capture_reason_without_losing_editorial_state() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("offline.cstrike");
+        let mut project = Project::new("Edited", 1920, 1080, 60.0);
+        project.assets.push(MediaAsset {
+            id: 1, name: "take-1".into(), uri: "file:///old/take-1.mp4".into(),
+            duration_ms: 1000, audio_levels: Vec::new(),
+        });
+        let source: CapturedAsset = serde_json::from_value(serde_json::json!({
+            "asset_id":1,"package_id":"pilot","package_path":"missing-package",
+            "clip":{"clip_id":"take-1","relative_path":"clips/take-1.mp4",
+                "sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                "demo_sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                "event_id":"event-1","player_steamid64":"76561198000000001",
+                "map":"de_train","round":1,"utility_type":"smoke",
+                "start_tick":100,"end_tick":200,"camera_role":"projectile",
+                "duration_ms":1000,"width":1920,"height":1080,
+                "fps_num":60,"fps_den":1,
+                "audio":{"source":"hlae_wav","channels":2,"sample_rate":48000,"verified":true},
+                "qc_status":"accepted","group_order":1}
+        })).unwrap();
+        project.capture_sources.push(source);
+        project.save(&path).unwrap();
+        let mut app = ClipStrikeApp::test_harness(Project::new("Before", 1920, 1080, 60.0));
+        app.open_project_at_path(path).unwrap();
+        assert_eq!(app.project.name, "Edited");
+        assert!(app.project.assets[0].uri.starts_with("capture-offline://"));
+        assert!(app.capture_warning.as_ref().unwrap().contains("capture media unavailable"));
+    }
 
     #[test]
     fn animated_property_labels_are_correct() {

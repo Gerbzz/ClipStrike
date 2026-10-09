@@ -195,12 +195,10 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("clipstrike-proxy-test-{unique_suffix}"));
         fs::create_dir_all(&temp_dir).expect("create temp dir");
 
-        let source_fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("ui-debug-screenshot.png");
         let source_path = temp_dir.join("source.png");
-        fs::copy(&source_fixture, &source_path).expect("copy source image");
+        image::RgbaImage::from_pixel(16, 16, image::Rgba([32, 96, 160, 255]))
+            .save(&source_path)
+            .expect("write synthetic source image");
 
         let (sender, mut receiver) = tokio::sync::mpsc::channel(10);
         let generator = ProxyGenerator::new(sender);
