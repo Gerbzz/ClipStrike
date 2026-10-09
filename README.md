@@ -1,169 +1,84 @@
 # ClipStrike
 
-ClipStrike is a Rust-based desktop video editor focused on native performance, clear subsystem boundaries, and contributor-friendly architecture. The project is organized as a multi-crate Cargo workspace with a hardware-accelerated UI stack built on `egui` and `wgpu`, plus a GStreamer-backed media pipeline for playback, probing, and export.
+**A native Rust editing workbench for assembling CS2 footage.** ClipStrike brings media organization, a multitrack timeline, clip properties, and capture-package handoff into one desktop project. It is an active prototype for creators who want to turn recorded takes into an editable cut, with the project and media pipeline kept in separate crates.
 
-The goal is straightforward: build a serious non-linear editor with a clean Rust architecture, practical test coverage, and a development workflow that makes it easier for contributors to improve real editing features without fighting a monolith.
+> **Development status:** The editor model, desktop UI, project save/recovery, and capture-package import have automated coverage. The GStreamer media backend is optional and disabled in the default build. Real playback, audible audio, and encoded export have not passed production acceptance.
 
-## Why ClipStrike
+## The editing workflow
 
-- Native desktop editor architecture in Rust
-- Clear crate boundaries between core logic, media, render, audio, UI, and app wiring
-- Hardware-accelerated rendering path with `wgpu`
-- GStreamer-backed media pipeline for playback and export workflows
-- Contributor-oriented codebase with tests around timeline behavior, editor actions, and desktop smoke flows
+1. Create a project and organize source clips in the media browser.
+2. Arrange clips on video and audio tracks; use trim, slice, snapping, markers, and undo/redo while building a cut.
+3. Adjust clip properties through the timeline and keyframe model. The repository contains transitions, effects, titles, waveform helpers, and export controls, but their presence does not establish end-to-end output quality.
+4. Save a native project and keep its source media available. If a source moves or its hash changes, the capture-package path reports it as offline instead of silently dropping timeline edits.
 
-## Current Status
+A capture-package importer is also included for externally prepared takes. It creates separate editable assets and timeline clips from a versioned package; it does not record gameplay itself.
 
-ClipStrike is in active development and already contains a substantial editor foundation. The current workspace includes timeline editing, playback controls, export plumbing, transitions, effects, title editing, markers, autosave and recovery, thumbnail flows, and early AI/vision tooling.
+## What is in this repository
 
-The project is usable as a development build, but it is still being hardened. The biggest currently documented rendering boundary is native zero-copy preview interop: the media pipeline can preserve external texture metadata, but the present `wgpu` stack still requires a renderer-owned texture for visible desktop preview frames, so some paths still fall back to CPU readback.
+| Area | Implemented surface | Current boundary |
+| --- | --- | --- |
+| Timeline and project | Multitrack clip model, editing commands, snapping, markers, keyframes, transitions, save/reopen, and recovery paths | Frame-exact editing at fractional frame rates is not established |
+| Desktop UI | First-party Rust application built with egui/eframe and wgpu-backed rendering components | Visible native-window review is still pending |
+| Media | GStreamer-based probing, playback, and export code behind a Cargo feature | Default builds disable the backend; real playback and encoded export with sound are unverified |
+| Capture handoff | Package validation, import into a new project, provenance, offline detection, and relinking | Package metadata and stream probes do not prove audible sound or capture origin |
+| Development tests | Core, UI harness, and synthetic package tests | Native media smoke tests need a configured desktop/media environment; one import UI harness is ignored by default |
 
-If you want to contribute, this is the right stage to get involved: the architecture is established, major editor systems exist, and there is still meaningful room to improve media handling, performance, UX polish, testing, and feature depth.
+The code is organized as six Cargo crates: <code>clipstrike-core</code> owns project and timeline rules; <code>clipstrike-ui</code> owns the editor interface; <code>clipstrike-media</code> owns media operations; <code>clipstrike-render</code> owns GPU composition helpers; <code>clipstrike-audio</code> owns audio helpers; and <code>clipstrike-app</code> launches the desktop window. See [architecture](docs/ARCHITECTURE.md) for the deeper module layout.
 
-## Highlights
+## Editor concepts in this prototype
 
-- Multi-track timeline editing with drag, trim, slice, copy/paste, snapping, and undo/redo
-- Playback controls with seek, stepping, and timeline interaction coverage
-- Keyframe-driven clip properties with linear, bezier, and constant interpolation
-- Transition support with overlap-driven crossfades and transition configuration
-- GPU-backed effects pipeline with blur, opacity, transform, brightness, and blend modes
-- Media browser with import, filtering, and thumbnail-oriented workflows
-- SVG title tooling and built-in title editing support
-- Marker editing directly on the timeline ruler
-- Export models, export settings, progress reporting, cancel flow, and preset-driven pipeline work
-- Autosave and recovery checkpoint support
-- Native smoke tests and in-process harnesses for desktop editor flows
-- Early AI/vision features including detection labels and face-blur-oriented groundwork
+**The timeline is the source of truth.** A project stores tracks, clips, assets, edits, properties, and capture provenance. Core commands cover selecting, placing, trimming, slicing, copying, pasting, and undoing edits. Snapping and markers support alignment. The UI also has media-browser and thumbnail-oriented flows for locating material before it reaches the timeline.
 
-## Workspace Layout
+**Properties can change over time.** The code includes clip transforms, keyframes with multiple interpolation modes, transition configuration, effect parameters, title editing, and waveform helpers. These are editor and rendering foundations. Their existence in the source is not a claim that every combination has been visually reviewed or exported correctly.
 
-The repository is split into focused crates so behavior can live in the right layer:
+**Recovery keeps the edit intact.** Project writes use a temporary file and a previous-version backup; autosave and recovery checkpoints are represented in the app. Capture imports retain media hashes and path hints. If linked media is missing, moved, or changed, the editor can mark it offline and leave the project structure available for relinking.
 
-- `crates/clipstrike-core`
-  Timeline model, project model, snapping, keyframes, transitions, undoable commands, and core editor behavior.
-- `crates/clipstrike-audio`
-  Waveform extraction and audio-focused helpers.
-- `crates/clipstrike-media`
-  GStreamer probing, playback engines, export, frame provisioning, and proxy-related media tasks.
-- `crates/clipstrike-render`
-  `wgpu` texture management, frame readback, shader-driven effects, and render pipeline helpers.
-- `crates/clipstrike-ui`
-  `egui` editor frontend, app state, layout, and interaction controllers.
-- `crates/clipstrike-app`
-  Thin desktop binary layer that wires the workspace together.
+**Media is a separate integration layer.** The wgpu renderer and GStreamer integration live outside the timeline model. That separation lets core editing behavior be tested with synthetic assets, while actual playback, audio, and encoded output can be validated against real footage later. The optional GStreamer SDK is a native dependency, not bundled project code.
 
-More detail is available in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+## Build and run
 
-## Getting Started
+The published checkout is developed and verified on Windows with a Rust toolchain that supports edition 2024. Cargo resolves the pinned versions in <code>Cargo.lock</code>.
 
-ClipStrike is currently developed and verified primarily on Windows.
+~~~powershell
+cargo test --locked --workspace
+cargo build --locked --workspace --bins
+cargo run --locked -p clipstrike-app
+~~~
 
-### Prerequisites
+This default launch is useful for inspecting the application and editor state. It does **not** enable real GStreamer playback or export.
 
-- Rust toolchain with Cargo
-- Windows development environment
-- GStreamer MSVC SDK for the native media backend
+To work on the native media path, install a compatible GStreamer MSVC SDK yourself and use the repository launcher:
 
-The repo currently documents two known GStreamer SDK roots:
-
-- `C:\Program Files\gstreamer\1.0\msvc_x86_64`
-
-### Quick Commands
-
-```powershell
-cargo check --all-targets
-cargo test -p clipstrike-core
-cargo test -p clipstrike-ui --lib
-cargo check -p clipstrike-app
-cargo check -p clipstrike-app --features gstreamer-backend
-```
-
-To launch with the repo's Windows GStreamer setup:
-
-```powershell
+~~~powershell
 .\run_clipstrike_gstreamer.cmd
-```
+~~~
 
-### GStreamer Environment
+The script looks for a repository-local SDK folder and then the standard Windows Program Files SDK location. The SDK is not included here, and running this command is not an acceptance test for finished playback or export. [Local setup](docs/LOCAL_SETUP.md) lists the environment variables for manual backend checks. Native libraries are an intentional part of this Rust application; it is not described as a pure-Rust codec implementation.
 
-When running GStreamer-backed commands in a fresh shell, set the SDK root and related environment variables:
+## Capture packages and project files
 
-```powershell
-$env:GST_ROOT = 'C:\Program Files\gstreamer\1.0\msvc_x86_64'
-$env:PATH = "$env:GST_ROOT\bin;$env:PATH"
-$env:GST_PLUGIN_SYSTEM_PATH = "$env:GST_ROOT\lib\gstreamer-1.0"
-$env:GST_PLUGIN_PATH = "$env:GST_ROOT\lib\gstreamer-1.0"
-$env:PKG_CONFIG = "$env:GST_ROOT\bin\pkg-config.exe"
-$env:PKG_CONFIG_PATH = "$env:GST_ROOT\lib\pkgconfig;$env:GST_ROOT\lib\gstreamer-1.0\pkgconfig"
-$env:GSTREAMER_1_0_ROOT_MSVC_X86_64 = $env:GST_ROOT
-```
+A compatible capture package contains a versioned <code>manifest.json</code> and individual media files under <code>clips/</code>. The importer validates package structure and hashes, then writes a new <code>.cstrike</code> project:
 
-Sanity checks:
+~~~powershell
+cargo run --locked -p clipstrike-core --bin clipstrike-import -- <package-folder> <new-project.cstrike>
+~~~
 
-```powershell
-& "$env:PKG_CONFIG" --modversion glib-2.0
-& "$env:PKG_CONFIG" --modversion gstreamer-1.0
-& "$env:GST_ROOT\bin\gst-inspect-1.0.exe" --version
-```
+The project links to the package media rather than embedding it. Keep the package beside the project when moving work between folders. The project loader can report missing or changed sources and preserve edits for relinking. An interrupted project save retains a backup for recovery. Integer FPS is a temporary import gate; the millisecond timeline does not yet guarantee every frame boundary, even at 60 fps.
 
-More setup detail lives in [docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md).
+Importing a package is a handoff, not a quality verdict. A package marked “stream probed” has reported stream headers; ClipStrike has not independently established audible sound, footage origin, or final editorial quality.
 
-## Development Workflow
+## Current limits and direction
 
-ClipStrike is intentionally structured so contributors can work on editor behavior without crossing too many layers:
+ClipStrike is a source build and local prototype. There is no published installer or release in this repository. Clean-machine setup, visible desktop review, real media playback, export with audio, power-loss recovery, and broader format coverage still need acceptance work.
 
-- Put timeline rules and editing behavior in `clipstrike-core`
-- Keep GStreamer and media backend work in `clipstrike-media`
-- Keep GPU/rendering concerns in `clipstrike-render`
-- Use `clipstrike-ui` for presentation and interaction wiring, not core timeline ownership
-- Keep `clipstrike-app` thin
+Planned work includes validating the full media path on actual captures, tightening frame timing and relinking behavior, improving editor interaction, and testing packaging on clean Windows machines. These are goals, not shipped features.
 
-If you are adding or changing behavior, prefer adding tests in the crate that owns that behavior before wiring the UI around it. The codebase already includes unit tests, harness-driven UI tests, and native smoke coverage, so new work should extend that pattern rather than bypass it.
+## Development and contribution
 
-## Contributing
+Start changes in the crate that owns the behavior: timeline and project rules in <code>clipstrike-core</code>, widgets and interaction in <code>clipstrike-ui</code>, decoding/probing/export in <code>clipstrike-media</code>, GPU composition in <code>clipstrike-render</code>, and audio helpers in <code>clipstrike-audio</code>. Keep the application crate thin. Add focused tests for core rules and use the UI harness for interactions that can run without external media.
 
-Contributions are welcome, especially in these areas:
+The [current state](docs/CLIPSTRIKE_STATE.md), [architecture](docs/ARCHITECTURE.md), and [local setup](docs/LOCAL_SETUP.md) documents contain implementation context. Media-related changes need separate real-file checks in a configured environment; synthetic fixture tests alone cannot establish playback or audible sound.
 
-- media pipeline stability and playback correctness
-- performance and allocation cleanup
-- editor UX polish and workflow refinement
-- export reliability and preset coverage
-- testing depth for native desktop interactions
-- roadmap feature work in focused, reviewable slices
+## License
 
-Before opening a larger change:
-
-- Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- Review [docs/CLIPSTRIKE_STATE.md](docs/CLIPSTRIKE_STATE.md) for the current implemented surface
-- Check [TODO.md](TODO.md) and [BLOCKER.md](BLOCKER.md) for active priorities and known boundaries
-
-Good contribution guidelines for this repo:
-
-- keep changes focused
-- preserve crate boundaries
-- add or update tests with behavior changes
-- avoid unrelated refactors in feature branches
-- document new setup requirements and verification steps
-
-## Near-Term Focus
-
-Current high-value areas for contribution include:
-
-- improving preview and playback performance on native desktop builds
-- reducing remaining CPU readback paths in preview-related flows
-- extending export presets and backend robustness
-- deepening AI/vision tooling where the current groundwork already exists
-- continuing UI polish, recovery flow refinement, and editing ergonomics
-- expanding contributor documentation and reproducible verification paths
-
-## Additional Docs
-
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- [docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md)
-- [docs/CLIPSTRIKE_STATE.md](docs/CLIPSTRIKE_STATE.md)
-- [TODO.md](TODO.md)
-- [BLOCKER.md](BLOCKER.md)
-
-## Roadmap Note
-
-Screenshots and polished visual assets are intentionally not included yet. The README is currently optimized to give contributors a clear, professional entry point into the project while the editor UI continues to mature.
+ClipStrike source is licensed under [MIT](LICENSE). Third-party native libraries and Rust crates retain their own licenses.
