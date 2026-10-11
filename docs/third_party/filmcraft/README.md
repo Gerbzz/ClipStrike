@@ -1,0 +1,9 @@
+# FilmCraft timeline code attribution
+
+Source: `storytold/filmcraft` commit `2ff3f5e266838700c292a35aaf762e3d4dcef980`, [`crates/ui-egui/src/panels/timeline.rs`](https://github.com/storytold/filmcraft/blob/2ff3f5e266838700c292a35aaf762e3d4dcef980/crates/ui-egui/src/panels/timeline.rs). The adapted portions are `Layout::x_of`, `Layout::tick_at`, `timeline_extent`, `max_scroll`, and `zoom_about` (upstream lines around 2516–2527 and 2578–2610). Copyright (c) 2026 ArtCraft Team and the FilmCraft contributors.
+
+ClipStrike implementation: [`src/timeline_viewport.rs`](../../../crates/clipstrike-ui/src/timeline_viewport.rs), used by [`src/ui.rs`](../../../crates/clipstrike-ui/src/ui.rs). Changes: FilmCraft ticks/seconds became ClipStrike integer milliseconds; bounds are 1-2,000 points per second; a fixed-width egui drawing window uses a logical `f64` scroll position so late clips do not require enormous `f32` canvas coordinates; sequence-end clamping, dynamic ruler intervals, and pointer/toolbar navigation were added. The adapter changes only transient UI state. It does not replace `.cstrike` serialization, edit commands, GStreamer media, WGPU composition, or software export.
+
+FilmCraft offers MIT or Apache-2.0. ClipStrike uses the MIT option for this adapted code. The exact pinned upstream [LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE), and [NOTICE](NOTICE) files are preserved here without edits. Their SHA-256 values are respectively `D2D8416F0883694C23B473E26372506E9E11F5F41B55A92B7388DAB921D9A207`, `0D542E0C8804E39AA7F37EB00DA5A762149DC682D7829451287E11B938E94594`, and `5761787313B9D6C13DD5F03DA2E04209AD7BD08EFF8920EDFD184141D791195C`.
+
+No FilmCraft fonts, images, icons, brands, media codecs, or app binaries were copied or run. The preserved upstream NOTICE describes material not included in this pilot; its brand and font lines do not grant ClipStrike use of those assets.

@@ -6,6 +6,7 @@ pub use embedded_workspace::{EditorHostResources, EmbeddedEditorWorkspace};
 use crate::app_config::{AppConfig, ProjectProfile, ThemePreference};
 use crate::export::{ExportProgress, export_frame_count_for_duration_ms, export_frame_time_ms};
 use crate::frame_renderer::{FrameRenderer, RenderLayer};
+use crate::timeline_viewport::TimelineViewport;
 use clipstrike_audio::offline::OfflineMix;
 
 fn escape_svg_text(value: &str) -> String {
@@ -79,6 +80,8 @@ pub enum LeftPanelTab {
 pub struct ClipStrikeApp {
     left_panel_tab: LeftPanelTab,
     zoom_level: f32,
+    timeline_scroll_seconds: f64,
+    timeline_view_width: f32,
     timeline: Timeline,
     app_config: AppConfig,
     project: Project,
@@ -162,7 +165,6 @@ pub struct ClipStrikeApp {
     title_svg_edit_sessions: HashMap<usize, TitleEditSession>,
     title_edit_nonce: u64,
     was_playing_before_scrub: bool,
-    last_track_content_origin_x: Option<f32>,
 }
 
 #[derive(Clone, Copy)]
@@ -457,6 +459,12 @@ impl ClipStrikeApp {
         app.begin_export(&context)?;
         after_start(&mut app);
         let started = Instant::now();
+        let mut last_status_at = started;
+        let max_export_seconds = export_frame_count_for_duration_ms(
+            app.timeline_end_ms(),
+            app.app_config.export_presets[0].settings.fps_num,
+            app.app_config.export_presets[0].settings.fps_den,
+        ).saturating_mul(3).clamp(120, 900);
         loop {
             app.process_export_preparation(&context);
             app.process_active_export_seek(&context);
@@ -472,11 +480,30 @@ impl ClipStrikeApp {
                     Err(app.export_notification.take().unwrap_or_else(|| "Export finished without an output file".into()))
                 };
             }
-            if started.elapsed() >= std::time::Duration::from_secs(120) {
+            let status = || {
+                if app.pending_export_preparation.is_some() {
+                    "preparing media".to_string()
+                } else if let Some(job) = &app.active_export {
+                    format!(
+                        "captured {}/{} frames; next timeline time {} ms",
+                        job.progress.completed_frames(),
+                        job.progress.total_frames(),
+                        job.next_frame_ms,
+                    )
+                } else {
+                    "finalizing output".to_string()
+                }
+            };
+            if last_status_at.elapsed() >= std::time::Duration::from_secs(10) {
+                eprintln!("Offscreen export: {}", status());
+                last_status_at = Instant::now();
+            }
+            if started.elapsed() >= std::time::Duration::from_secs(max_export_seconds) {
+                let phase = status();
                 app.request_active_export_cancel();
                 app.process_active_export_seek(&context);
                 app.process_export_finalization(&context);
-                return Err("Offscreen export timed out and was canceled".into());
+                return Err(format!("Offscreen export timed out after {max_export_seconds} seconds ({phase}) and was canceled"));
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -581,6 +608,8 @@ impl ClipStrikeApp {
         Self {
             left_panel_tab: LeftPanelTab::ProjectFiles,
             zoom_level: 0.5,
+            timeline_scroll_seconds: 0.0,
+            timeline_view_width: 800.0,
             timeline: Timeline::new(),
             app_config,
             project: project.clone(),
@@ -650,7 +679,6 @@ impl ClipStrikeApp {
             show_title_editor: false,
             editing_title: None,
             was_playing_before_scrub: false,
-            last_track_content_origin_x: None,
         }
     }
 
@@ -662,6 +690,8 @@ impl ClipStrikeApp {
         Self {
             left_panel_tab: LeftPanelTab::ProjectFiles,
             zoom_level: 0.5,
+            timeline_scroll_seconds: 0.0,
+            timeline_view_width: 800.0,
             timeline,
             app_config: AppConfig::default(),
             project: project.clone(),
@@ -731,7 +761,6 @@ impl ClipStrikeApp {
             title_svg_edit_sessions: HashMap::new(),
             title_edit_nonce: rand::random::<u64>(),
             was_playing_before_scrub: false,
-            last_track_content_origin_x: None,
         }
     }
 
@@ -1324,6 +1353,7 @@ impl ClipStrikeApp {
         self.is_playing = false;
         self.current_time_ms = 0;
         self.playhead_ms = 0;
+        self.timeline_scroll_seconds = 0.0;
         self.selected_clip_id = None;
         self.selected_marker_id = None;
         self.selected_keyframe = None;
@@ -2329,19 +2359,123 @@ impl ClipStrikeApp {
         pointer_pos: egui::Pos2,
         zoom_level: f32,
     ) -> i64 {
-        let pixels_per_ms = (zoom_level * 0.1).max(f32::EPSILON);
-        let local_x = (pointer_pos.x - origin_x).max(0.0);
-        (local_x / pixels_per_ms) as i64
+        TimelineViewport::new((zoom_level as f64 * 100.0).max(1.0), 0.0)
+            .ms_at_x(origin_x, pointer_pos.x)
+    }
+
+    fn timeline_viewport(&self) -> TimelineViewport {
+        let pps = (self.zoom_level as f64 * 100.0)
+            .clamp(TimelineViewport::MIN_PPS, TimelineViewport::MAX_PPS);
+        TimelineViewport::new(pps, self.timeline_scroll_seconds)
+    }
+
+    fn set_timeline_viewport(&mut self, view: TimelineViewport) {
+        self.zoom_level = (view.pixels_per_second() / 100.0) as f32;
+        self.timeline_scroll_seconds = view.scroll_seconds();
+    }
+
+    fn navigate_timeline_wheel(
+        &mut self,
+        wheel: f32,
+        ctrl: bool,
+        shift: bool,
+        pointer_x: f32,
+        content_left: f32,
+    ) {
+        if wheel == 0.0 || !wheel.is_finite() { return; }
+        let mut view = self.timeline_viewport();
+        if ctrl {
+            let anchor_ms = view.ms_at_x(content_left, pointer_x);
+            view.zoom_about(
+                (wheel as f64 * 0.004).exp(),
+                anchor_ms,
+                self.timeline_view_width,
+                self.timeline_end_ms(),
+            );
+        } else if shift {
+            view.pan_pixels(-wheel, self.timeline_view_width, self.timeline_end_ms());
+        } else {
+            return;
+        }
+        self.set_timeline_viewport(view);
     }
 
     fn clip_split_time_from_pointer(
-        clip_start_ms: i64,
-        clip_rect_left: f32,
+        view: TimelineViewport,
+        track_origin_x: f32,
         pointer_x: f32,
-        pixels_per_ms: f32,
     ) -> i64 {
-        let local_x = (pointer_x - clip_rect_left).max(0.0);
-        clip_start_ms.saturating_add((local_x / pixels_per_ms.max(f32::EPSILON)) as i64)
+        view.ms_at_x(track_origin_x, pointer_x)
+    }
+
+    fn visible_trim_handles(
+        clip_rect: egui::Rect,
+        viewport_rect: egui::Rect,
+    ) -> (Option<egui::Rect>, Option<egui::Rect>) {
+        let paint_rect = clip_rect.intersect(viewport_rect);
+        if paint_rect.width() <= 0.0 || paint_rect.height() <= 0.0 {
+            return (None, None);
+        }
+        let handle_width = (clip_rect.width() / 2.0).min(10.0);
+        let left = (clip_rect.left() >= viewport_rect.left()
+            && clip_rect.left() < viewport_rect.right())
+            .then(|| {
+                egui::Rect::from_min_max(
+                    egui::pos2(clip_rect.left(), paint_rect.top()),
+                    egui::pos2(clip_rect.left() + handle_width, paint_rect.bottom()),
+                )
+                .intersect(paint_rect)
+            })
+            .filter(|handle| handle.width() > 0.0);
+        let right = (clip_rect.right() > viewport_rect.left()
+            && clip_rect.right() <= viewport_rect.right())
+            .then(|| {
+                egui::Rect::from_min_max(
+                    egui::pos2(clip_rect.right() - handle_width, paint_rect.top()),
+                    egui::pos2(clip_rect.right(), paint_rect.bottom()),
+                )
+                .intersect(paint_rect)
+            })
+            .filter(|handle| handle.width() > 0.0);
+        (left, right)
+    }
+
+    fn waveform_bin_at_x(
+        view: TimelineViewport,
+        track_origin_x: f32,
+        x: f32,
+        clip: &Clip,
+        asset_duration_ms: u64,
+        bin_count: usize,
+    ) -> Option<usize> {
+        if asset_duration_ms == 0 || bin_count == 0 || !clip.speed.keyframes.is_empty() {
+            return None;
+        }
+        let timeline_ms = view.ms_at_x(track_origin_x, x);
+        if timeline_ms < clip.start || timeline_ms > clip.end {
+            return None;
+        }
+        let source_ms = clip.source_time_at(timeline_ms);
+        if source_ms < 0 || source_ms as u64 > asset_duration_ms {
+            return None;
+        }
+        Some(((source_ms as f64 / asset_duration_ms as f64 * bin_count as f64) as usize)
+            .min(bin_count - 1))
+    }
+
+    fn waveform_clip_for_display(
+        clip: &Clip,
+        display_start: i64,
+        display_end: i64,
+        moving: bool,
+    ) -> Clip {
+        let mut display_clip = clip.clone();
+        if moving {
+            // A move changes timeline placement, not the source in/out points.
+            display_clip.start = display_start;
+            display_clip.end = display_end;
+        }
+        display_clip
     }
 
     fn preview_texture_should_bypass_fx(
@@ -2670,12 +2804,13 @@ impl ClipStrikeApp {
     fn draw_clip_waveform(
         ui: &mut egui::Ui,
         rect: egui::Rect,
+        view: TimelineViewport,
+        track_origin_x: f32,
         audio_levels: &[f32],
-        clip_in_ms: i64,
-        clip_out_ms: i64,
+        clip: &Clip,
         asset_duration_ms: u64,
     ) {
-        if audio_levels.is_empty() {
+        if audio_levels.is_empty() || !clip.speed.keyframes.is_empty() {
             return;
         }
 
@@ -2685,24 +2820,13 @@ impl ClipStrikeApp {
         let height = rect.height();
         let mid_y = rect.center().y;
 
-        let asset_duration_ms = asset_duration_ms.max(1) as f64;
-        let clip_in_f = clip_in_ms as f64;
-        let clip_out_f = clip_out_ms as f64;
-        let clip_duration_f = (clip_out_f - clip_in_f).max(1.0);
-
         for i in 0..(width as usize) {
-            let t = i as f64 / width as f64;
-            let timeline_ms = clip_in_f + t * clip_duration_f;
-            let asset_t = timeline_ms / asset_duration_ms;
-
-            if asset_t < 0.0 || asset_t > 1.0 {
-                continue;
-            }
-
-            let bin_idx = (asset_t * (audio_levels.len() as f64)) as usize;
-            if let Some(&level) = audio_levels.get(bin_idx) {
+            let x = rect.left() + i as f32;
+            if let Some(bin_idx) = Self::waveform_bin_at_x(
+                view, track_origin_x, x, clip, asset_duration_ms, audio_levels.len(),
+            ) {
+                let level = audio_levels[bin_idx].clamp(0.0, 1.0);
                 let amplitude = (level * height * 0.4).max(1.0);
-                let x = rect.left() + i as f32;
                 mesh.add_colored_rect(
                     egui::Rect::from_min_max(
                         egui::pos2(x, mid_y - amplitude),
@@ -4345,36 +4469,70 @@ impl ClipStrikeApp {
                         .button("\u{1F3AF}")
                         .on_hover_text("Center Timeline on Playhead")
                         .clicked()
-                    {}
+                    {
+                        let mut view = self.timeline_viewport();
+                        view.center_on(self.playhead_ms, self.timeline_view_width, self.timeline_end_ms());
+                        self.set_timeline_viewport(view);
+                    }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add(
-                            egui::Slider::new(&mut self.zoom_level, 0.0..=1.0).show_value(false),
-                        );
+                        let mut view = self.timeline_viewport();
+                        let changed = ui.add(
+                            egui::Slider::new(&mut self.zoom_level, 0.01..=20.0)
+                                .logarithmic(true)
+                                .show_value(false),
+                        ).changed();
+                        if changed {
+                            let factor = (self.zoom_level as f64 * 100.0) / view.pixels_per_second();
+                            view.zoom_about(factor, self.playhead_ms, self.timeline_view_width, self.timeline_end_ms());
+                            self.set_timeline_viewport(view);
+                        }
+                        ui.label(format!("{:.0} px/s", self.timeline_viewport().pixels_per_second()));
                         ui.label("\u{1F50D}");
+                        let max_scroll = TimelineViewport::max_scroll(
+                            self.timeline_end_ms(),
+                            self.timeline_view_width,
+                            self.timeline_viewport().pixels_per_second(),
+                        );
+                        ui.add_sized(
+                            [180.0, 18.0],
+                            egui::Slider::new(&mut self.timeline_scroll_seconds, 0.0..=max_scroll)
+                                .text("Position")
+                                .show_value(false),
+                        )
+                        .on_hover_text("Move through the full timeline");
                     });
                 });
                 ui.separator();
 
                 // Timeline Tracks Area
-                egui::ScrollArea::both().show(ui, |ui| {
-                    let timeline_rect = ui.available_rect_before_wrap();
-
-                    if ui.rect_contains_pointer(timeline_rect) {
-                        let scroll_delta = ui.input(|i| i.raw_scroll_delta.y);
-                        if ui.input(|i| i.modifiers.ctrl) && scroll_delta != 0.0 {
-                            self.zoom_level = (self.zoom_level + scroll_delta * 0.001).clamp(0.0, 1.0);
-                        }
+                let timeline_screen = ui.available_rect_before_wrap();
+                let content_screen_left = timeline_screen.left() + TIMELINE_CONTENT_OFFSET_X;
+                self.timeline_view_width = (timeline_screen.right() - content_screen_left).max(1.0);
+                if ui.rect_contains_pointer(timeline_screen) {
+                    let wheel = ui.input(|input| input.raw_scroll_delta.y);
+                    let modifiers = ui.input(|input| input.modifiers);
+                    if let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) {
+                        self.navigate_timeline_wheel(
+                            wheel, modifiers.ctrl, modifiers.shift,
+                            pointer.x, content_screen_left,
+                        );
                     }
+                }
+                let navigation = self.timeline_viewport();
+                let timeline_content_width = navigation.content_width(self.timeline_end_ms(), self.timeline_view_width);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    let timeline_rect = ui.available_rect_before_wrap();
+                    let geometry = navigation;
 
                     let mut current_frame_track_origin_x: Option<f32> = None;
 
                     // Time ruler interaction
                     let (ruler_rect, ruler_res) = ui.allocate_exact_size(
-                        egui::vec2(2000.0, 20.0),
+                        egui::vec2(timeline_content_width + TIMELINE_CONTENT_OFFSET_X, 20.0),
                         egui::Sense::click_and_drag(),
                     );
-                    let origin_x = self.last_track_content_origin_x.unwrap_or(ruler_rect.left() + TIMELINE_CONTENT_OFFSET_X);
+                    let origin_x = ruler_rect.left() + TIMELINE_CONTENT_OFFSET_X;
                     
                     if ruler_res.drag_started() {
                         self.was_playing_before_scrub = self.is_playing;
@@ -4387,22 +4545,17 @@ impl ClipStrikeApp {
                     }
 
                     let ruler_context_time_ms = ruler_res.interact_pointer_pos().map(|pos| {
-                        Self::timeline_time_from_ruler_position(origin_x, pos, self.zoom_level)
+                        geometry.ms_at_x(origin_x, pos.x)
                     });
 
                     if ruler_res.clicked() || ruler_res.dragged() {
                         if let Some(pos) = ruler_res.interact_pointer_pos() {
-                            let mut target_playhead_ms = Self::timeline_time_from_ruler_position(
-                                origin_x,
-                                pos,
-                                self.zoom_level,
-                            );
+                            let mut target_playhead_ms = geometry.ms_at_x(origin_x, pos.x);
 
                             if ruler_res.clicked() {
                                 let tolerance_px = 6.0;
                                 if let Some(marker) = self.project.markers.iter().find(|marker| {
-                                    let marker_x = ruler_rect.left()
-                                        + (marker.time_ms as f32 * self.zoom_level * 0.1);
+                                    let marker_x = geometry.x_of_ms(origin_x, marker.time_ms);
                                     (marker_x - pos.x).abs() <= tolerance_px
                                 }) {
                                     target_playhead_ms = marker.time_ms;
@@ -4446,23 +4599,35 @@ impl ClipStrikeApp {
                         0.0,
                         ctx.style().visuals.widgets.noninteractive.bg_fill,
                     );
-                    ui.painter().text(
-                        egui::pos2(
-                            ruler_rect.left() + TIMELINE_CONTENT_OFFSET_X + 8.0,
-                            ruler_rect.center().y,
-                        ),
-                        egui::Align2::LEFT_CENTER,
-                        "00:00:00:00                   00:00:05:00                   00:00:10:00",
-                        egui::FontId::proportional(12.0),
-                        ctx.style().visuals.text_color(),
+                    let (ruler_start_ms, ruler_end_ms) = geometry.visible_ms(
+                        origin_x,
+                        ui.clip_rect().left().max(origin_x),
+                        ui.clip_rect().right().min(ruler_rect.right()),
                     );
+                    let tick_step_ms = geometry.ruler_step_ms(90.0);
+                    let mut tick_ms = ruler_start_ms.div_euclid(tick_step_ms) * tick_step_ms;
+                    for _ in 0..256 {
+                        if tick_ms > ruler_end_ms { break; }
+                        let tick_x = geometry.x_of_ms(origin_x, tick_ms);
+                        ui.painter().line_segment(
+                            [egui::pos2(tick_x, ruler_rect.bottom() - 6.0),
+                             egui::pos2(tick_x, ruler_rect.bottom())],
+                            egui::Stroke::new(1.0_f32, ctx.style().visuals.text_color()),
+                        );
+                        ui.painter().text(
+                            egui::pos2(tick_x + 4.0, ruler_rect.center().y - 1.0),
+                            egui::Align2::LEFT_CENTER,
+                            self.format_timecode(tick_ms),
+                            egui::FontId::proportional(11.0),
+                            ctx.style().visuals.text_color(),
+                        );
+                        tick_ms = tick_ms.saturating_add(tick_step_ms);
+                    }
                     let mut dragging_marker_id: Option<usize> = None;
                     let mut remove_ruler_marker_id: Option<usize> = None;
                     let mut should_seek = false;
                     for marker in &mut self.project.markers {
-                        let marker_x = ruler_rect.left()
-                            + TIMELINE_CONTENT_OFFSET_X
-                            + (marker.time_ms as f32 * self.zoom_level * 0.1);
+                        let marker_x = geometry.x_of_ms(origin_x, marker.time_ms);
                         let color = Self::marker_color(marker);
                         let stroke_width = if self.selected_marker_id == Some(marker.id) {
                             2.5_f32
@@ -4483,10 +4648,7 @@ impl ClipStrikeApp {
 
                         if marker_res.dragged() {
                             if let Some(pos) = marker_res.interact_pointer_pos() {
-                                let local_x = (pos.x
-                                    - (ruler_rect.left() + TIMELINE_CONTENT_OFFSET_X))
-                                    .max(0.0);
-                                marker.time_ms = (local_x / (self.zoom_level * 0.1)) as i64;
+                                marker.time_ms = geometry.ms_at_x(origin_x, pos.x);
                                 self.playhead_ms = marker.time_ms;
                                 should_seek = true;
                                 dragging_marker_id = Some(marker.id);
@@ -4677,7 +4839,7 @@ impl ClipStrikeApp {
                             ui.set_enabled(!track.locked);
                             // Track Content
                             let (rect, _track_res) = ui.allocate_exact_size(
-                                egui::vec2(2000.0, TRACK_HEIGHT),
+                                egui::vec2(timeline_content_width, TRACK_HEIGHT),
                                 egui::Sense::hover(),
                             );
                             if current_frame_track_origin_x.is_none() {
@@ -4702,8 +4864,7 @@ impl ClipStrikeApp {
 
                                 if let Some(asset_id) = dragging_id {
                                     if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
-                                        let local_x = pos.x - rect.left();
-                                        let start_ms = (local_x / (self.zoom_level * 0.1)) as i64;
+                                        let start_ms = geometry.ms_at_x(rect.left(), pos.x);
                                         let asset_duration_ms = asset_duration_by_id
                                             .get(&asset_id)
                                             .copied()
@@ -4742,8 +4903,7 @@ impl ClipStrikeApp {
                                     }
                                 } else if let Some(title_id) = dragging_title_id {
                                     if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
-                                        let local_x = pos.x - rect.left();
-                                        let start_ms = (local_x / (self.zoom_level * 0.1)) as i64;
+                                        let start_ms = geometry.ms_at_x(rect.left(), pos.x);
                                         pending_title_clip_request = Some((title_id, track_idx, start_ms));
                                         ctx.data_mut(|d| {
                                             d.remove_temp::<usize>(egui::Id::new(
@@ -4763,17 +4923,16 @@ impl ClipStrikeApp {
 
                                 if let Some(asset_id) = dragging_id.or(dragging_title_id) {
                                     if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
-                                        let local_x = pos.x - rect.left();
-                                        let start_ms = (local_x / (self.zoom_level * 0.1)) as i64;
+                                        let start_ms = geometry.ms_at_x(rect.left(), pos.x);
                                         let asset_duration_ms = if dragging_id.is_some() {
                                             asset_duration_by_id.get(&asset_id).copied().unwrap_or(0)
                                         } else {
                                             10_000 // Default title duration
                                         };
-                                        let pixels_per_ms = (self.zoom_level * 0.1).max(0.001);
+                                        let pixels_per_ms = geometry.pixels_per_ms();
                                         let ghost_width = asset_duration_ms as f32 * pixels_per_ms;
                                         let ghost_rect = egui::Rect::from_min_size(
-                                            egui::pos2(rect.left() + (start_ms as f32 * pixels_per_ms), rect.top() + 5.0),
+                                            egui::pos2(geometry.x_of_ms(rect.left(), start_ms), rect.top() + 5.0),
                                             egui::vec2(ghost_width, TRACK_HEIGHT - 10.0),
                                         );
                                         ui.painter().rect_filled(
@@ -4799,14 +4958,13 @@ impl ClipStrikeApp {
 
                             // Task 3.2: Timeline Virtualization
                             // Calculate visible time range based on scroll position and viewport width
-                            let view_start_ms = (ui.clip_rect().left() - rect.left()).max(0.0)
-                                / (self.zoom_level * 0.1);
-                            let view_end_ms =
-                                (ui.clip_rect().right() - rect.left()) / (self.zoom_level * 0.1);
+                            let (view_start_ms, view_end_ms) = geometry.visible_ms(
+                                rect.left(), ui.clip_rect().left(), ui.clip_rect().right()
+                            );
 
                             let visible_clips = self
                                 .timeline
-                                .get_visible_clips(view_start_ms as i64, view_end_ms as i64);
+                                .get_visible_clips(view_start_ms, view_end_ms);
 
                             // Draw only visible clips for this track
                             let mut drew_transitions_for_track = false;
@@ -4834,7 +4992,6 @@ impl ClipStrikeApp {
                                         {
                                             continue;
                                         }
-                                        let pixels_per_ms = (self.zoom_level * 0.1).max(0.001);
                                         let is_active_drag = self.drag_clip_id == Some(clip.id);
                                         let (display_start, display_end) = if is_active_drag {
                                             self.drag_preview_times
@@ -4842,10 +4999,8 @@ impl ClipStrikeApp {
                                         } else {
                                             (clip.start, clip.end)
                                         };
-                                        let x_start =
-                                            rect.left() + (display_start as f32 * pixels_per_ms);
-                                        let x_end =
-                                            rect.left() + (display_end as f32 * pixels_per_ms);
+                                        let x_start = geometry.x_of_ms(rect.left(), display_start);
+                                        let x_end = geometry.x_of_ms(rect.left(), display_end);
 
                                         let clip_rect = egui::Rect::from_min_max(
                                             egui::pos2(x_start, rect.top() + 5.0),
@@ -4892,42 +5047,38 @@ impl ClipStrikeApp {
                                             let clip_tooltip =
                                                 timeline_clip_tooltip(&asset_name, clip.id);
 
-                                            let left_handle_rect = egui::Rect::from_min_max(
-                                                egui::pos2(paint_rect.left(), paint_rect.top()),
-                                                egui::pos2(
-                                                    paint_rect.left() + 10.0,
-                                                    paint_rect.bottom(),
-                                                ),
-                                            );
-                                            let right_handle_rect = egui::Rect::from_min_max(
-                                                egui::pos2(
-                                                    paint_rect.right() - 10.0,
-                                                    paint_rect.top(),
-                                                ),
-                                                egui::pos2(paint_rect.right(), paint_rect.bottom()),
-                                            );
-
-                                            let left_res = ui.interact(
-                                                left_handle_rect,
-                                                clip_id.with("left"),
-                                                egui::Sense::drag(),
-                                            );
-                                            let right_res = ui.interact(
-                                                right_handle_rect,
-                                                clip_id.with("right"),
-                                                egui::Sense::drag(),
-                                            );
+                                            let (left_handle_rect, right_handle_rect) =
+                                                Self::visible_trim_handles(
+                                                    clip_rect,
+                                                    rect.intersect(ui.clip_rect()),
+                                                );
+                                            let left_res = left_handle_rect.map(|handle| {
+                                                ui.interact(
+                                                    handle,
+                                                    clip_id.with("left"),
+                                                    egui::Sense::drag(),
+                                                )
+                                            });
+                                            let right_res = right_handle_rect.map(|handle| {
+                                                ui.interact(
+                                                    handle,
+                                                    clip_id.with("right"),
+                                                    egui::Sense::drag(),
+                                                )
+                                            });
                                             let body_res = ui
                                                 .interact(paint_rect, clip_id, egui::Sense::drag())
                                                 .on_hover_text(clip_tooltip.clone());
-                                            if left_res.hovered() || right_res.hovered() {
+                                            if left_res.as_ref().is_some_and(|res| res.hovered())
+                                                || right_res.as_ref().is_some_and(|res| res.hovered())
+                                            {
                                                 ctx.set_cursor_icon(
                                                     egui::CursorIcon::ResizeHorizontal,
                                                 );
                                             }
 
-                                            let started_drag = left_res.drag_started()
-                                                || right_res.drag_started()
+                                            let started_drag = left_res.as_ref().is_some_and(|res| res.drag_started())
+                                                || right_res.as_ref().is_some_and(|res| res.drag_started())
                                                 || body_res.drag_started();
                                             if started_drag
                                                 && (self.drag_clip_id.is_none()
@@ -4937,9 +5088,10 @@ impl ClipStrikeApp {
                                                     .input(|input| input.pointer.interact_pos())
                                                     .or_else(|| {
                                                         left_res
-                                                            .interact_pointer_pos()
+                                                            .as_ref()
+                                                            .and_then(|res| res.interact_pointer_pos())
                                                             .or_else(|| {
-                                                                right_res.interact_pointer_pos()
+                                                                right_res.as_ref().and_then(|res| res.interact_pointer_pos())
                                                             })
                                                             .or_else(|| {
                                                                 body_res.interact_pointer_pos()
@@ -4972,9 +5124,9 @@ impl ClipStrikeApp {
                                                     Some(track_order_index);
                                                 self.drag_preview_times =
                                                     Some((clip.start, clip.end));
-                                                if left_res.drag_started() {
+                                                if left_res.as_ref().is_some_and(|res| res.drag_started()) {
                                                     self.trim_side = Some(TrimSide::Left);
-                                                } else if right_res.drag_started() {
+                                                } else if right_res.as_ref().is_some_and(|res| res.drag_started()) {
                                                     self.trim_side = Some(TrimSide::Right);
                                                 } else {
                                                     self.trim_side = None;
@@ -4988,10 +5140,7 @@ impl ClipStrikeApp {
                                                         body_res.interact_pointer_pos()
                                                     {
                                                         let split_at = Self::clip_split_time_from_pointer(
-                                                            clip.start,
-                                                            rect.left(),
-                                                            pos.x,
-                                                            pixels_per_ms,
+                                                            geometry, rect.left(), pos.x,
                                                         );
                                                         razor_cmd = Some((clip.id, split_at));
                                                     }
@@ -5039,8 +5188,8 @@ impl ClipStrikeApp {
                                             let is_selected =
                                                 self.selected_clip_id == Some(clip.id);
                                             let is_dragging = is_active_drag
-                                                || left_res.dragged()
-                                                || right_res.dragged()
+                                                || left_res.as_ref().is_some_and(|res| res.dragged())
+                                                || right_res.as_ref().is_some_and(|res| res.dragged())
                                                 || body_res.dragged();
                                             let kind = Self::asset_library_kind(&asset_uri);
                                             let base_color = Self::asset_drag_preview_accent(kind);
@@ -5083,20 +5232,6 @@ impl ClipStrikeApp {
                                                 255
                                             };
 
-                                            Self::draw_clip_waveform(
-                                                ui,
-                                                paint_rect,
-                                                &audio_levels,
-                                                clip.in_point,
-                                                clip.out_point,
-                                                self.project
-                                                    .assets
-                                                    .iter()
-                                                    .find(|a| a.id == clip.asset_id)
-                                                    .map(|a| a.duration_ms)
-                                                    .unwrap_or(0),
-                                            );
-
                                             ui.painter().rect_filled(
                                                 paint_rect,
                                                 4.0,
@@ -5117,6 +5252,23 @@ impl ClipStrikeApp {
                                                     clip.color_tag[2],
                                                 )),
                                             );
+                                            Self::draw_clip_waveform(
+                                                ui,
+                                                paint_rect,
+                                                geometry,
+                                                rect.left(),
+                                                &audio_levels,
+                                                &Self::waveform_clip_for_display(
+                                                    &clip,
+                                                    display_start,
+                                                    display_end,
+                                                    is_active_drag && self.trim_side.is_none(),
+                                                ),
+                                                asset_duration_by_id
+                                                    .get(&clip.asset_id)
+                                                    .copied()
+                                                    .unwrap_or(0),
+                                            );
                                             ui.painter().rect_filled(
                                                 egui::Rect::from_min_max(
                                                     paint_rect.min,
@@ -5129,58 +5281,6 @@ impl ClipStrikeApp {
                                                 4.0,
                                                 egui::Color32::from_black_alpha(110),
                                             );
-                                            if !audio_levels.is_empty() && paint_rect.width() > 24.0
-                                            {
-                                                let waveform_rect = egui::Rect::from_min_max(
-                                                    egui::pos2(
-                                                        paint_rect.left() + 8.0,
-                                                        paint_rect.center().y,
-                                                    ),
-                                                    egui::pos2(
-                                                        paint_rect.right() - 8.0,
-                                                        paint_rect.bottom() - 6.0,
-                                                    ),
-                                                );
-                                                let sample_count = ((waveform_rect.width() / 3.0)
-                                                    .floor()
-                                                    as usize)
-                                                    .clamp(8, audio_levels.len().max(8));
-                                                let denominator =
-                                                    sample_count.saturating_sub(1).max(1);
-                                                let mid_y = waveform_rect.center().y;
-                                                for sample in 0..sample_count {
-                                                    let src_index = if audio_levels.len() <= 1 {
-                                                        0
-                                                    } else {
-                                                        sample
-                                                            .saturating_mul(audio_levels.len() - 1)
-                                                            / denominator
-                                                    };
-                                                    let amplitude = audio_levels
-                                                        .get(src_index)
-                                                        .copied()
-                                                        .unwrap_or(0.0)
-                                                        .clamp(0.0, 1.0);
-                                                    let x = egui::lerp(
-                                                        waveform_rect.left()
-                                                            ..=waveform_rect.right(),
-                                                        sample as f32 / denominator as f32,
-                                                    );
-                                                    let half_height =
-                                                        (amplitude * waveform_rect.height() * 0.45)
-                                                            .max(1.0);
-                                                    ui.painter().line_segment(
-                                                        [
-                                                            egui::pos2(x, mid_y - half_height),
-                                                            egui::pos2(x, mid_y + half_height),
-                                                        ],
-                                                        egui::Stroke::new(
-                                                            1.0_f32,
-                                                            egui::Color32::from_white_alpha(150),
-                                                        ),
-                                                    );
-                                                }
-                                            }
                                             ui.painter().text(
                                                 egui::pos2(
                                                     paint_rect.center().x,
@@ -5215,15 +5315,11 @@ impl ClipStrikeApp {
                                                 {
                                                     let clip =
                                                         self.timeline.clips[clip_index].clone();
-                                                    let pixels_per_ms =
-                                                        (self.zoom_level * 0.1).max(0.001);
                                                     let (display_start, display_end) = self
                                                         .drag_preview_times
                                                         .unwrap_or((clip.start, clip.end));
-                                                    let x_start = rect.left()
-                                                        + (display_start as f32 * pixels_per_ms);
-                                                    let x_end = rect.left()
-                                                        + (display_end as f32 * pixels_per_ms);
+                                                    let x_start = geometry.x_of_ms(rect.left(), display_start);
+                                                    let x_end = geometry.x_of_ms(rect.left(), display_end);
                                                     let clip_rect = egui::Rect::from_min_max(
                                                         egui::pos2(x_start, rect.top() + 5.0),
                                                         egui::pos2(x_end, rect.bottom() - 5.0),
@@ -5306,10 +5402,8 @@ impl ClipStrikeApp {
                                         if trans.track_id != track_idx {
                                             continue;
                                         }
-                                        let x_start = rect.left()
-                                            + (trans.start_ms as f32 * self.zoom_level * 0.1);
-                                        let x_end = rect.left()
-                                            + (trans.end_ms as f32 * self.zoom_level * 0.1);
+                                        let x_start = geometry.x_of_ms(rect.left(), trans.start_ms);
+                                        let x_end = geometry.x_of_ms(rect.left(), trans.end_ms);
                                         let trans_rect = egui::Rect::from_min_max(
                                             egui::pos2(x_start, rect.top() + 2.0),
                                             egui::pos2(x_end, rect.bottom() - 2.0),
@@ -5400,7 +5494,7 @@ impl ClipStrikeApp {
                                 self.drag_pointer_start_y,
                                 ctx.input(|input| input.pointer.latest_pos()),
                             ) {
-                                let pixels_per_ms = (self.zoom_level * 0.1).max(0.001);
+                                let pixels_per_ms = geometry.pixels_per_ms();
                                 let snap_radius_ms = ((12.0 / pixels_per_ms).round() as i64).max(1);
                                 let delta_x = current_pointer_pos.x - pointer_start_x;
                                 let delta_ms = (delta_x / pixels_per_ms) as i64;
@@ -5526,11 +5620,9 @@ impl ClipStrikeApp {
                         }
                     }
 
-                    self.last_track_content_origin_x = current_frame_track_origin_x;
-
                     // Draw Playhead line across all tracks using the exact track content origin
                     if let Some(origin_x) = current_frame_track_origin_x {
-                        let playhead_x = origin_x + (self.playhead_ms as f32 * self.zoom_level * 0.1);
+                        let playhead_x = geometry.x_of_ms(origin_x, self.playhead_ms);
                         if playhead_x >= timeline_rect.left() && playhead_x <= timeline_rect.right() {
                             ui.painter().line_segment(
                                 [
@@ -5542,9 +5634,7 @@ impl ClipStrikeApp {
                         }
                     } else {
                         // Fallback if no tracks exist
-                        let playhead_x = ruler_rect.left()
-                            + TIMELINE_CONTENT_OFFSET_X
-                            + (self.playhead_ms as f32 * self.zoom_level * 0.1);
+                        let playhead_x = geometry.x_of_ms(origin_x, self.playhead_ms);
                         if playhead_x >= timeline_rect.left() && playhead_x <= timeline_rect.right() {
                             ui.painter().line_segment(
                                 [
@@ -7623,12 +7713,127 @@ mod tests {
         assert_eq!(later, 500);
     }
 
+    #[test]
+    fn timeline_wheel_zoom_keeps_pointer_time_and_does_not_edit_clips() {
+        let mut project = Project::new("Timeline", 320, 180, 10.0);
+        project.clips.push(Clip::new(1, 1, 1, 0, 500, 100, 600));
+        project.clips.push(Clip::new(2, 1, 1, 500, 1_000, 1_100, 1_600));
+        let mut app = ClipStrikeApp::test_harness(project);
+        app.timeline_scroll_seconds = 2.0;
+        app.timeline_view_width = 800.0;
+        let before_project = app.snapshot_project();
+        let before = app.timeline_viewport();
+        let content_left = 300.0;
+        let pointer_x = 450.0;
+        let anchor_ms = before.ms_at_x(content_left, pointer_x);
+
+        app.navigate_timeline_wheel(120.0, true, false, pointer_x, content_left);
+
+        let after = app.timeline_viewport();
+        assert!(after.pixels_per_second() > before.pixels_per_second());
+        assert!((after.x_of_ms(content_left, anchor_ms) - pointer_x).abs() <= 0.1);
+        assert_eq!(app.snapshot_project(), before_project);
+    }
 
     #[test]
-    fn clip_split_time_from_pointer_offsets_by_clip_start() {
-        let split_at = ClipStrikeApp::clip_split_time_from_pointer(2_000, 300.0, 350.0, 0.1);
+    fn timeline_shift_wheel_pans_without_changing_zoom() {
+        let mut app = ClipStrikeApp::test_harness(Project::new("Timeline", 320, 180, 10.0));
+        app.timeline_view_width = 800.0;
+        let before_pps = app.timeline_viewport().pixels_per_second();
+        app.navigate_timeline_wheel(-120.0, false, true, 400.0, 200.0);
+        assert!(app.timeline_scroll_seconds > 0.0);
+        assert_eq!(app.timeline_viewport().pixels_per_second(), before_pps);
+    }
 
-        assert_eq!(split_at, 2_500);
+    #[test]
+    fn editor_can_center_on_a_three_hour_clip_at_maximum_zoom() {
+        let late_ms = 3 * 60 * 60 * 1_000;
+        let mut project = Project::new("Long timeline", 320, 180, 10.0);
+        project.clips.push(Clip::new(1, 1, 1, late_ms, late_ms + 1_000, 0, 1_000));
+        let mut app = ClipStrikeApp::test_harness(project);
+        app.zoom_level = 20.0;
+        app.timeline_view_width = 800.0;
+        let mut view = app.timeline_viewport();
+        view.center_on(late_ms, app.timeline_view_width, app.timeline_end_ms());
+        app.set_timeline_viewport(view);
+
+        let drawing_view = app.timeline_viewport();
+        let clip_x = drawing_view.x_of_ms(200.0, late_ms);
+        assert!((clip_x - 600.0).abs() <= 0.01);
+        assert_eq!(drawing_view.ms_at_x(200.0, clip_x), late_ms);
+        assert_eq!(drawing_view.content_width(app.timeline_end_ms(), 800.0), 800.0);
+    }
+
+
+    #[test]
+    fn long_clip_only_exposes_real_trim_edges() {
+        let end_ms = 100 * 60 * 60 * 1_000;
+        let track = egui::Rect::from_min_max(egui::pos2(200.0, 0.0), egui::pos2(1_000.0, 70.0));
+        let clip_rect = |view: TimelineViewport| egui::Rect::from_min_max(
+            egui::pos2(view.x_of_ms(track.left(), 0), 5.0),
+            egui::pos2(view.x_of_ms(track.left(), end_ms), 65.0),
+        );
+        let at_start = TimelineViewport::new(2_000.0, 0.0);
+        let (left, right) = ClipStrikeApp::visible_trim_handles(clip_rect(at_start), track);
+        assert!(left.is_some());
+        assert!(right.is_none());
+
+        let mut middle = at_start;
+        middle.center_on(end_ms / 2, 800.0, end_ms);
+        let (left, right) = ClipStrikeApp::visible_trim_handles(clip_rect(middle), track);
+        assert!(left.is_none());
+        assert!(right.is_none());
+
+        let mut at_end = at_start;
+        at_end.center_on(end_ms, 800.0, end_ms);
+        let (left, right) = ClipStrikeApp::visible_trim_handles(clip_rect(at_end), track);
+        assert!(left.is_none());
+        assert!(right.is_some());
+    }
+
+    #[test]
+    fn razor_uses_local_f64_viewport_at_one_hundred_hours() {
+        let at_ms = 100 * 60 * 60 * 1_000;
+        let mut view = TimelineViewport::new(2_000.0, 0.0);
+        view.center_on(at_ms, 800.0, at_ms + 1_000);
+        let origin = 200.0;
+        let pointer = view.x_of_ms(origin, at_ms) + 30.0;
+        assert_eq!(ClipStrikeApp::clip_split_time_from_pointer(view, origin, pointer), at_ms + 15);
+    }
+
+    #[test]
+    fn waveform_samples_the_visible_source_window_in_both_directions() {
+        let view = TimelineViewport::new(100.0, 50.0);
+        let origin = 200.0;
+        let mut clip = Clip::new(1, 1, 1, 0, 100_000, 0, 100_000);
+        assert_eq!(ClipStrikeApp::waveform_bin_at_x(view, origin, 200.0, &clip, 100_000, 100), Some(50));
+        assert_eq!(ClipStrikeApp::waveform_bin_at_x(view, origin, 300.0, &clip, 100_000, 100), Some(51));
+        clip.reverse = true;
+        assert_eq!(ClipStrikeApp::waveform_bin_at_x(view, origin, 300.0, &clip, 100_000, 100), Some(49));
+
+        let mut trimmed = Clip::new(2, 1, 1, 10_000, 110_000, 50_000, 150_000);
+        let trim_view = TimelineViewport::new(100.0, 60.0);
+        assert_eq!(ClipStrikeApp::waveform_bin_at_x(trim_view, origin, 200.0, &trimmed, 200_000, 200), Some(100));
+        assert_eq!(ClipStrikeApp::waveform_bin_at_x(trim_view, origin, 300.0, &trimmed, 200_000, 200), Some(101));
+        trimmed.reverse = true;
+        assert_eq!(ClipStrikeApp::waveform_bin_at_x(trim_view, origin, 300.0, &trimmed, 200_000, 200), Some(99));
+
+        let hundred_hours = 100 * 60 * 60 * 1_000;
+        let long = Clip::new(3, 1, 1, 0, hundred_hours, 0, hundred_hours);
+        let long_view = TimelineViewport::new(2_000.0, 50.0 * 60.0 * 60.0);
+        assert_eq!(ClipStrikeApp::waveform_bin_at_x(long_view, origin, 200.0, &long, hundred_hours as u64, 100), Some(50));
+    }
+
+    #[test]
+    fn moving_clip_preview_keeps_its_source_waveform_visible() {
+        let clip = Clip::new(1, 1, 1, 0, 1_000, 200, 1_200);
+        let moved = ClipStrikeApp::waveform_clip_for_display(&clip, 2_000, 3_000, true);
+        let view = TimelineViewport::new(100.0, 2.0);
+        let origin = 200.0;
+        assert_eq!(ClipStrikeApp::waveform_bin_at_x(view, origin, 200.0, &clip, 2_000, 10), None);
+        assert_eq!(ClipStrikeApp::waveform_bin_at_x(view, origin, 200.0, &moved, 2_000, 10), Some(1));
+        assert_eq!(ClipStrikeApp::waveform_bin_at_x(view, origin, 250.0, &moved, 2_000, 10), Some(3));
+        assert_eq!((moved.in_point, moved.out_point), (clip.in_point, clip.out_point));
     }
 
     fn make_test_clip() -> Clip {

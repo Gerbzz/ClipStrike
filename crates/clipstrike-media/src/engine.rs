@@ -652,7 +652,35 @@ mod imp {
         seek_generation: u64,
     ) -> Result<clipstrike_render::gpu::FrameUploadRequest, gst::FlowError> {
         let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
-        let timestamp = buffer.pts().map(|t| t.mseconds() as i64).unwrap_or(0);
+        // qtdemux can shift a stream with negative initial DTS forward. The
+        // accepted HLAE H.264 capture starts at buffer PTS 33.333 ms while its
+        // TIME segment starts there and assigns that frame stream time zero.
+        // Export and clip source positions use stream time, so keep the segment
+        // conversion with each sample rather than treating raw buffer PTS as
+        // the media's source timestamp.
+        let pts = buffer.pts().ok_or_else(|| {
+            log::warn!("Decoded frame for clip {clip_id} has no presentation timestamp");
+            gst::FlowError::NotNegotiated
+        })?;
+        let time_segment = sample.segment()
+            .and_then(|segment| segment.downcast_ref::<gst::ClockTime>())
+            .ok_or_else(|| {
+                log::warn!("Decoded frame for clip {clip_id} has no TIME segment");
+                gst::FlowError::NotNegotiated
+            })?;
+        // Duration is still expressed in buffer time. Other rates require a
+        // matching duration transform before source-interval coverage is safe.
+        if time_segment.rate() != 1.0 || time_segment.applied_rate() != 1.0 {
+            log::warn!("Decoded frame for clip {clip_id} has unsupported segment rate");
+            return Err(gst::FlowError::NotNegotiated);
+        }
+        // Stream time is the authored source timeline. Segment base is running
+        // time for scheduling and must not be substituted here.
+        let stream_pts = time_segment.to_stream_time(pts).ok_or_else(|| {
+            log::warn!("Decoded frame for clip {clip_id} falls outside its TIME segment");
+            gst::FlowError::NotNegotiated
+        })?;
+        let timestamp = stream_pts.mseconds() as i64;
         let external_texture_id = sample_external_texture_id(sample);
         #[cfg(target_os = "windows")]
         let native_d3d12_shared_handle = sample_native_d3d12_shared_handle(sample);
@@ -667,6 +695,7 @@ mod imp {
             timestamp,
             seek_generation,
         )?;
+        request.pts_ns = Some(stream_pts.nseconds());
         if request.duration_ns.is_none() {
             request.duration_ns = sample.caps()
                 .and_then(|caps| caps.structure(0))
@@ -738,8 +767,10 @@ mod imp {
                 state.seeking = false;
             });
             let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
-            let buffer = gst::Buffer::from_mut_slice(vec![1_u8, 2, 3, 4]);
-            let sample = gst::Sample::builder().buffer(&buffer).build();
+            let mut buffer = gst::Buffer::from_mut_slice(vec![1_u8, 2, 3, 4]);
+            buffer.get_mut().unwrap().set_pts(gst::ClockTime::from_mseconds(0));
+            let segment = gst::FormattedSegment::<gst::ClockTime>::new();
+            let sample = gst::Sample::builder().buffer(&buffer).segment(&segment).build();
             upload_sample(
                 || {
                     barrier.wait();
@@ -753,12 +784,12 @@ mod imp {
             assert!(receiver.try_recv().is_err(), "the pre-seek sample must be dropped");
 
             epoch.lock().unwrap().seeking = true;
-            let during_seek = gst::Sample::builder().buffer(&buffer).build();
+            let during_seek = gst::Sample::builder().buffer(&buffer).segment(&segment).build();
             upload_sample(|| Ok(during_seek), 7, &epoch, Some(sender.clone())).unwrap();
             assert!(receiver.try_recv().is_err(), "a callback begun during flush must be dropped");
 
             epoch.lock().unwrap().seeking = false;
-            let after_seek = gst::Sample::builder().buffer(&buffer).build();
+            let after_seek = gst::Sample::builder().buffer(&buffer).segment(&segment).build();
             upload_sample(|| Ok(after_seek), 7, &epoch, Some(sender)).unwrap();
             assert_eq!(receiver.try_recv().unwrap().seek_generation, 102);
         }
@@ -944,8 +975,10 @@ mod imp {
         #[test]
         fn frame_upload_request_from_sample_extracts_pixels() {
             gst::init().expect("gstreamer init");
-            let buffer = gst::Buffer::from_mut_slice(vec![1u8, 2, 3, 4]);
-            let sample = gst::Sample::builder().buffer(&buffer).build();
+            let mut buffer = gst::Buffer::from_mut_slice(vec![1u8, 2, 3, 4]);
+            buffer.get_mut().unwrap().set_pts(gst::ClockTime::from_mseconds(0));
+            let segment = gst::FormattedSegment::<gst::ClockTime>::new();
+            let sample = gst::Sample::builder().buffer(&buffer).segment(&segment).build();
 
             let request = frame_upload_request_from_sample(&sample, 9, 4).expect("frame request");
             assert_eq!(request.clip_id, 9);
@@ -963,11 +996,82 @@ mod imp {
             buffer.get_mut().unwrap().set_pts(gst::ClockTime::from_mseconds(100));
             let caps = gst::Caps::builder("video/x-raw")
                 .field("framerate", gst::Fraction::new(30, 1)).build();
-            let sample = gst::Sample::builder().buffer(&buffer).caps(&caps).build();
+            let segment = gst::FormattedSegment::<gst::ClockTime>::new();
+            let sample = gst::Sample::builder().buffer(&buffer).caps(&caps).segment(&segment).build();
 
             let request = frame_upload_request_from_sample(&sample, 9, 4).unwrap();
             assert_eq!(request.pts_ns, Some(100_000_000));
             assert_eq!(request.duration_ns, Some(33_333_333));
+        }
+
+        #[test]
+        fn sample_segment_restores_source_time_after_negative_dts_shift() {
+            gst::init().expect("gstreamer init");
+            let mut segment = gst::FormattedSegment::<gst::ClockTime>::new();
+            segment.set_start(gst::ClockTime::from_nseconds(33_333_333));
+            segment.set_time(gst::ClockTime::from_nseconds(0));
+            let mut buffer = gst::Buffer::from_mut_slice(vec![1u8, 2, 3, 4]);
+            buffer.get_mut().unwrap().set_pts(gst::ClockTime::from_nseconds(33_333_333));
+            buffer.get_mut().unwrap().set_duration(gst::ClockTime::from_nseconds(16_666_666));
+            let sample = gst::Sample::builder().buffer(&buffer).segment(&segment).build();
+
+            let request = frame_upload_request_from_sample(&sample, 1, 7).unwrap();
+            assert_eq!(request.pts_ns, Some(0));
+            assert_eq!(request.duration_ns, Some(16_666_666));
+            assert_eq!(request.timestamp_ms, 0);
+            assert_eq!(request.seek_generation, 7);
+
+            let mut seek_segment = gst::FormattedSegment::<gst::ClockTime>::new();
+            seek_segment.set_start(gst::ClockTime::from_nseconds(133_333_333));
+            seek_segment.set_time(gst::ClockTime::from_nseconds(100_000_000));
+            let mut seek_buffer = gst::Buffer::from_mut_slice(vec![1u8, 2, 3, 4]);
+            seek_buffer.get_mut().unwrap().set_pts(gst::ClockTime::from_nseconds(133_333_333));
+            let seek_sample = gst::Sample::builder().buffer(&seek_buffer).segment(&seek_segment).build();
+            let request = frame_upload_request_from_sample(&seek_sample, 1, 8).unwrap();
+            assert_eq!(request.pts_ns, Some(100_000_000));
+            assert_eq!(request.timestamp_ms, 100);
+            assert_eq!(request.seek_generation, 8);
+        }
+
+        #[test]
+        fn sample_without_pts_or_time_segment_cannot_be_marked_fresh() {
+            gst::init().expect("gstreamer init");
+            let buffer = gst::Buffer::from_mut_slice(vec![1u8, 2, 3, 4]);
+            let segment = gst::FormattedSegment::<gst::ClockTime>::new();
+            let no_pts = gst::Sample::builder().buffer(&buffer).segment(&segment).build();
+            assert!(matches!(
+                frame_upload_request_from_sample(&no_pts, 1, 7),
+                Err(gst::FlowError::NotNegotiated)
+            ));
+
+            let mut timestamped_buffer = gst::Buffer::from_mut_slice(vec![1u8, 2, 3, 4]);
+            timestamped_buffer.get_mut().unwrap().set_pts(gst::ClockTime::from_mseconds(0));
+            // GstSample supplies a default identity TIME segment when none is
+            // provided. An explicit non-TIME segment must still be rejected.
+            let bytes_segment = gst::FormattedSegment::<gst::format::Bytes>::new();
+            let no_segment = gst::Sample::builder()
+                .buffer(&timestamped_buffer)
+                .segment(&bytes_segment)
+                .build();
+            assert!(matches!(
+                frame_upload_request_from_sample(&no_segment, 1, 7),
+                Err(gst::FlowError::NotNegotiated)
+            ));
+        }
+
+        #[test]
+        fn non_unit_segment_rate_cannot_reuse_unscaled_frame_duration() {
+            gst::init().expect("gstreamer init");
+            let mut buffer = gst::Buffer::from_mut_slice(vec![1u8, 2, 3, 4]);
+            buffer.get_mut().unwrap().set_pts(gst::ClockTime::from_mseconds(100));
+            buffer.get_mut().unwrap().set_duration(gst::ClockTime::from_mseconds(40));
+            let mut segment = gst::FormattedSegment::<gst::ClockTime>::new();
+            segment.set_rate(2.0);
+            let sample = gst::Sample::builder().buffer(&buffer).segment(&segment).build();
+            assert!(matches!(
+                frame_upload_request_from_sample(&sample, 1, 7),
+                Err(gst::FlowError::NotNegotiated)
+            ));
         }
 
         #[test]

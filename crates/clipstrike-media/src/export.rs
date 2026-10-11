@@ -161,6 +161,9 @@ fn configure_encoder_properties(
                 encoder.set_property_from_str("tune", "zerolatency");
                 encoder.set_property("bitrate", settings.bitrate_kbps);
                 encoder.set_property("key-int-max", 30u32);
+            } else if encoder_name == "openh264enc" {
+                // OpenH264 uses bits/second; x264enc uses kilobits/second.
+                encoder.set_property("bitrate", settings.bitrate_kbps.saturating_mul(1_000));
             } else {
                 let _ = encoder.set_property("bitrate", settings.bitrate_kbps);
             }
@@ -462,6 +465,8 @@ mod unavailable_tests {
 #[cfg(all(test, feature = "gstreamer-backend"))]
 mod tests {
     use super::Exporter;
+    use gstreamer as gst;
+    use gst::prelude::*;
     use std::path::PathBuf;
 
     fn temp_output_path() -> PathBuf {
@@ -538,5 +543,27 @@ mod tests {
         let candidates = super::encoder_candidates_for_settings(&settings);
         assert_eq!(candidates.first().copied(), Some("nvh264enc"));
         assert!(candidates.contains(&"x264enc"));
+    }
+
+    #[test]
+    fn openh264_bitrate_setting_uses_bits_per_second() {
+        gst::init().expect("failed to initialize GStreamer");
+        if gst::ElementFactory::find("openh264enc").is_none() {
+            eprintln!("OpenH264 plugin is unavailable; skipping its property readback");
+            return;
+        }
+        let encoder = gst::ElementFactory::make("openh264enc")
+            .build()
+            .expect("available OpenH264 encoder should build");
+        let settings = super::ExportSettings {
+            codec: super::VideoCodec::H264,
+            bitrate_kbps: 5_000,
+            use_hardware_acceleration: false,
+            ..Default::default()
+        };
+
+        super::configure_encoder_properties("openh264enc", &encoder, &settings);
+
+        assert_eq!(encoder.property::<u32>("bitrate"), 5_000_000);
     }
 }

@@ -2,7 +2,7 @@
 
 **A native Rust editing workbench for assembling CS2 footage.** ClipStrike brings media organization, a multitrack timeline, clip properties, and capture-package handoff into one desktop project. It is an active prototype for creators who want to turn recorded takes into an editable cut, with the project and media pipeline kept in separate crates.
 
-> **Development status:** The editor model, desktop UI, project save/recovery, capture-package import, and shared GUI/offscreen renderer have automated coverage. A saved-project software H.264/AAC export passed an offscreen test using synthetic media and independent decode checks. The GStreamer backend is optional and disabled in the default build. Native-window interaction, speaker playback, broader real-media output, and clean-machine packaging have not passed acceptance.
+> **Development status:** The editor model, desktop UI, project save/recovery, capture-package import, and shared GUI/offscreen renderer have automated coverage. Synthetic export and one bounded real-media saved-project export from a corrected project copy passed independent H.264/AAC decode checks. The GStreamer backend is optional and disabled in the default build. Native-window interaction, speaker playback, broader real-media output, and clean-machine packaging have not passed acceptance.
 
 ## The editing workflow
 
@@ -17,9 +17,9 @@ A capture-package importer is also included for externally prepared takes. It cr
 
 | Area | Implemented surface | Current boundary |
 | --- | --- | --- |
-| Timeline and project | Multitrack clip model, editing commands, snapping, markers, keyframes, transitions, save/reopen, and recovery paths | Frame-exact editing at fractional frame rates is not established |
+| Timeline and project | Multitrack clip model, editing commands, snapping, markers, keyframes, transitions, save/reopen, recovery, and an attributed long-timeline viewport | Native pointer interaction and frame-exact editing at fractional frame rates are not established |
 | Desktop UI | First-party Rust application built with egui/eframe and wgpu-backed rendering components | Visible native-window review is still pending |
-| Media | GStreamer-based probing, playback, and export behind a Cargo feature; a shared renderer also drives saved-project offscreen export | Default builds disable the backend; the verified software export uses synthetic media, while native-window playback, speaker output, and broader real-media acceptance remain open |
+| Media | GStreamer-based probing, playback, and export behind a Cargo feature; a shared renderer also drives saved-project offscreen export | Default builds disable the backend; one corrected real-media project exported and decoded, while native-window playback, speaker output, and broader real-media acceptance remain open |
 | Capture handoff | Package validation, import into a new project, provenance, offline detection, and relinking | Package metadata and stream probes do not prove audible sound or capture origin |
 | Development tests | Core, UI harness, synthetic package, software export, and embedded workspace lifecycle tests | Native media tests need the configured SDK and FFmpeg tools; visible UI and audible playback review remain open; one import UI harness is ignored by default |
 
@@ -29,17 +29,19 @@ The code is organized as six Cargo crates: <code>clipstrike-core</code> owns pro
 
 **The timeline is the source of truth.** A project stores tracks, clips, assets, edits, properties, and capture provenance. Core commands cover selecting, placing, trimming, slicing, copying, pasting, and undoing edits. Snapping and markers support alignment. The UI also has media-browser and thumbnail-oriented flows for locating material before it reaches the timeline.
 
+**Long timelines use a bounded viewport.** The timeline adapts coordinate, extent, and anchored-zoom math from FilmCraft with [pinned attribution and licenses](docs/third_party/filmcraft/README.md). Tests cover late clips, true start/end trim grips, and trimmed or reversed waveform placement. Live native pointer behavior remains unreviewed; animated-speed waveforms are hidden rather than drawn with an unverified source-time map.
+
 **Properties can change over time.** The code includes clip transforms, keyframes with multiple interpolation modes, transition configuration, effect parameters, title editing, and waveform helpers. These are editor and rendering foundations. Their existence in the source is not a claim that every combination has been visually reviewed or exported correctly.
 
 **Recovery keeps the edit intact.** Project writes use a temporary file and a previous-version backup; autosave and recovery checkpoints are represented in the app. Capture imports retain media hashes and path hints. If linked media is missing, moved, or changed, the editor can mark it offline and leave the project structure available for relinking.
 
-**Media is a separate integration layer.** The wgpu renderer and GStreamer integration live outside the timeline model. The shared production frame renderer drives both GUI and offscreen paths; the saved-project offscreen path has produced an independently decoded software-encoded video with audio from synthetic inputs. If NVIDIA hardware H.264 cannot start, the export UI offers a manual software-encoding retry. Media callbacks guard seek generations before publishing frames, and remote URI diagnostics redact credentials. These checks do not establish native-window playback or quality across real footage. The optional GStreamer SDK is a native dependency, not bundled project code.
+**Media is a separate integration layer.** The wgpu renderer and GStreamer integration live outside the timeline model. The shared production frame renderer drives both GUI and offscreen paths. A bounded real-media project copy produced a 6.2-second software H.264/AAC file with 186 decoded frames and stereo audio; this validates that file-output path, not broad footage support. Media callbacks normalize GStreamer TIME-segment timestamps before frame selection while retaining seek-generation and interval checks; OpenH264 bitrate settings are converted from kbps to the encoder's bits-per-second property. If NVIDIA hardware H.264 cannot start, the export UI offers a manual software-encoding retry. Remote URI diagnostics redact credentials. The optional GStreamer SDK is a native dependency, not bundled project code.
 
 **The editor can be hosted inside another Rust app.** The WGPU-only [embedded workspace API](docs/EMBEDDED_EDITOR_API.md) opens a saved project in a host eframe window and delegates editing, preview, and export to the same editor. Lifecycle tests cover repeated open/close, texture cleanup, return requests, and export cancellation. Integration in DemoStrike and native pointer interaction remain separate verification work.
 
 ## Build and run
 
-The published checkout is developed and verified on Windows with a Rust toolchain that supports edition 2024. Cargo resolves the pinned versions in <code>Cargo.lock</code>.
+The published checkout is developed and verified on Windows with a Rust toolchain that supports edition 2024. Linux and macOS builds and workflows have not been verified. Cargo resolves the pinned versions in <code>Cargo.lock</code>.
 
 ~~~powershell
 cargo test --locked --workspace
@@ -71,7 +73,7 @@ Importing a package is a handoff, not a quality verdict. A package marked “str
 
 ## Current limits and direction
 
-ClipStrike is a source build and local prototype. There is no published installer or release in this repository. A saved synthetic project passed an offscreen software video-and-audio export and decode check. The native GStreamer test run still logged nonfatal segment-format assertions that need diagnosis. Clean-machine setup, visible desktop and audible playback review, power-loss recovery, repeated NVENC hardware encoding, and broader real-media/format coverage still need acceptance work.
+ClipStrike is a source build and local prototype. There is no published installer or release in this repository. Synthetic and one corrected real-media saved-project export passed independent full decoding. A source project that requests video past its stream endpoint still fails rather than inventing missing frames; its authoring or an explicit last-frame policy needs correction. The FX shader retains decoded source alpha in static validation, but native visual alpha output has not been reviewed. Native pointer editing, visible layout, audible speaker playback, clean-machine setup, power-loss recovery, and Linux/macOS behavior remain unverified. Repeated NVENC export can fail in the same process with a preview decoder active; the manual software retry succeeded in a bounded test. Native GStreamer tests can log nonfatal segment-format assertions, and OpenH264 emitted `cmInitParaError` at end of stream despite a fully decodable file. Those encoder diagnostics need diagnosis before production claims.
 
 Planned work includes validating the full media path on actual captures, tightening fractional-frame timing and relinking behavior, improving editor interaction, and testing packaging on clean Windows machines. These are goals, not shipped features.
 
@@ -83,4 +85,4 @@ The [current state](docs/CLIPSTRIKE_STATE.md), [architecture](docs/ARCHITECTURE.
 
 ## License
 
-ClipStrike source is licensed under [MIT](LICENSE). Third-party native libraries and Rust crates retain their own licenses.
+ClipStrike source is licensed under [MIT](LICENSE). The adapted FilmCraft viewport retains [upstream attribution and license notices](docs/third_party/filmcraft/README.md). Third-party native libraries and Rust crates retain their own licenses.

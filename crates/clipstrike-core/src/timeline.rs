@@ -219,9 +219,9 @@ impl Clip {
 
         let offset = self.integrated_source_offset(timeline_time_ms);
         if self.reverse {
-            (self.out_point - offset).max(self.in_point)
+            self.out_point.saturating_sub(offset).max(self.in_point)
         } else {
-            (self.in_point + offset).min(self.out_point)
+            self.in_point.saturating_add(offset).min(self.out_point)
         }
     }
 
@@ -232,6 +232,12 @@ impl Clip {
         }
 
         let span_ms = clamped_end - self.start;
+        // Most clips have a fixed speed. Avoid walking every 16 ms from the
+        // start of a long clip and losing precision in absolute f32 times.
+        if self.speed.keyframes.is_empty() {
+            return (span_ms as f64 * self.speed_multiplier_at(self.start) as f64)
+                .round() as i64;
+        }
         let steps = ((span_ms + 15) / 16).max(1);
         let dt = span_ms as f32 / steps as f32;
         let mut area = 0.0f32;
@@ -268,9 +274,9 @@ impl Clip {
         // For constant speed (the common case), this is an exact inversion:
         // source_offset = speed * (timeline_time - clip.start)
         // => timeline_time = clip.start + source_offset / speed
-        let speed = self.speed_multiplier_at(self.start).max(0.01);
-        let timeline_offset = (source_offset as f32 / speed).round() as i64;
-        (self.start + timeline_offset).clamp(self.start, self.end)
+        let speed = self.speed_multiplier_at(self.start) as f64;
+        let timeline_offset = (source_offset as f64 / speed).round() as i64;
+        self.start.saturating_add(timeline_offset).clamp(self.start, self.end)
     }
 }
 
@@ -1237,6 +1243,20 @@ mod tests {
         // At timeline time 6000 (end), source_time = 500 + 5000 = 5500 = out_point
         assert_eq!(clip.source_time_at(6000), 5500);
         assert_eq!(clip.timeline_time_from_source(5500), 6000);
+    }
+
+    #[test]
+    fn constant_speed_source_lookup_is_exact_at_one_hundred_hours() {
+        let start = 100 * 60 * 60 * 1_000;
+        let mut clip = Clip::new(1, 1, 1, start, start + 100_000, 50_000, 250_000);
+        clip.speed.default_value = 1.5;
+        assert_eq!(clip.source_time_at(start + 1), 50_002);
+        assert_eq!(clip.source_time_at(start + 35), 50_053);
+        assert_eq!(clip.source_time_at(start + 50_000), 125_000);
+        assert_eq!(clip.timeline_time_from_source(125_000), start + 50_000);
+        clip.reverse = true;
+        assert_eq!(clip.source_time_at(start + 50_000), 175_000);
+        assert_eq!(clip.timeline_time_from_source(175_000), start + 50_000);
     }
 
     #[test]
