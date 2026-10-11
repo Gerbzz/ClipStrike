@@ -76,10 +76,19 @@ pub struct TrimClipCommand {
     pub old_end: i64,
     pub new_start: i64,
     pub new_end: i64,
+    pub original_clip: Option<Clip>,
+    pub trimmed_clip: Option<Clip>,
 }
 
 impl Command for TrimClipCommand {
     fn execute(&mut self, project: &mut Project, timeline: &mut Timeline) {
+        if let Some(trimmed) = &self.trimmed_clip {
+            let _ = timeline.replace_clip(trimmed.clone());
+            return;
+        }
+        let Some(original) = timeline.clips.iter().find(|c| c.id == self.clip_id).cloned() else {
+            return;
+        };
         let max_duration = project
             .assets
             .iter()
@@ -94,47 +103,38 @@ impl Command for TrimClipCommand {
             .map(|a| a.duration_ms as i64)
             .unwrap_or(i64::MAX);
 
-        let _ = timeline.trim(
+        if timeline.trim(
             self.clip_id,
             self.new_start,
             self.new_end,
             max_duration,
-        );
+        ).is_ok() {
+            self.original_clip = Some(original);
+            self.trimmed_clip = timeline.clips.iter().find(|c| c.id == self.clip_id).cloned();
+        }
     }
-    fn undo(&mut self, project: &mut Project, timeline: &mut Timeline) {
-        let max_duration = project
-            .assets
-            .iter()
-            .find(|a| {
-                timeline
-                    .clips
-                    .iter()
-                    .find(|c| c.id == self.clip_id)
-                    .map(|c| c.asset_id == a.id)
-                    .unwrap_or(false)
-            })
-            .map(|a| a.duration_ms as i64)
-            .unwrap_or(i64::MAX);
-
-        let _ = timeline.trim(
-            self.clip_id,
-            self.old_start,
-            self.old_end,
-            max_duration,
-        );
+    fn undo(&mut self, _project: &mut Project, timeline: &mut Timeline) {
+        if let Some(original) = &self.original_clip {
+            let _ = timeline.replace_clip(original.clone());
+        }
     }
 }
 
 pub struct SeparateAudioCommand {
     pub clip_id: usize,
     pub audio_clip: Clip,
+    pub original_clip: Option<Clip>,
 }
 
 impl Command for SeparateAudioCommand {
     fn execute(&mut self, project: &mut Project, timeline: &mut Timeline) {
         if let Some(pos) = timeline.clips.iter().position(|c| c.id == self.clip_id) {
-            timeline.clips[pos].audio_enabled = false;
-            timeline.clips[pos].group_id = self.audio_clip.group_id;
+            let original = timeline.clips[pos].clone();
+            let mut video_only = original.clone();
+            video_only.audio_enabled = false;
+            video_only.group_id = self.audio_clip.group_id;
+            self.original_clip = Some(original);
+            let _ = timeline.replace_clip(video_only);
             timeline.add_clip(self.audio_clip.clone());
 
             // Sync project
@@ -146,16 +146,15 @@ impl Command for SeparateAudioCommand {
         }
     }
     fn undo(&mut self, project: &mut Project, timeline: &mut Timeline) {
+        let Some(original) = &self.original_clip else { return; };
         timeline.remove_clip(self.audio_clip.id);
-        if let Some(pos) = timeline.clips.iter().position(|c| c.id == self.clip_id) {
-            timeline.clips[pos].audio_enabled = true;
-            // Note: We don't necessarily reset group_id here as it doesn't hurt to keep it
-        }
+        let _ = timeline.replace_clip(original.clone());
 
         // Sync project
         project.clips.retain(|c| c.id != self.audio_clip.id);
         if let Some(p_pos) = project.clips.iter().position(|c| c.id == self.clip_id) {
-            project.clips[p_pos].audio_enabled = true;
+            project.clips[p_pos].audio_enabled = original.audio_enabled;
+            project.clips[p_pos].group_id = original.group_id;
         }
     }
 }
@@ -185,27 +184,47 @@ pub struct RazorClipCommand {
     pub split_at: i64,
     pub original_clip: Option<Clip>,
     pub new_clip_id: Option<usize>,
+    pub split_clips: Option<(Clip, Clip)>,
 }
 
 impl Command for RazorClipCommand {
     fn execute(&mut self, _project: &mut Project, timeline: &mut Timeline) {
+        if let Some((left, right)) = &self.split_clips {
+            let original_index = timeline.clips.iter().position(|c| c.id == self.clip_id);
+            timeline.remove_clip(self.clip_id);
+            timeline.add_clip(left.clone());
+            timeline.add_clip(right.clone());
+            if let Some(index) = original_index {
+                let _ = timeline.move_clip_to_index(left.id, index);
+                let _ = timeline.move_clip_to_index(right.id, index + 1);
+            }
+            return;
+        }
         if let Some(pos) = timeline.clips.iter().position(|c| c.id == self.clip_id) {
             let clip = timeline.clips[pos].clone();
-            self.original_clip = Some(clip.clone());
-            let _ = timeline.razor(self.clip_id, self.split_at);
-            // Find the newly created clip (it was added to the end of the list)
-            if let Some(new_clip) = timeline.clips.last() {
-                self.new_clip_id = Some(new_clip.id);
+            if timeline.razor(self.clip_id, self.split_at).is_ok() {
+                self.original_clip = Some(clip);
+                if let (Some(left), Some(right)) = (
+                    timeline.clips.get(pos).cloned(),
+                    timeline.clips.get(pos + 1).cloned(),
+                ) {
+                    self.new_clip_id = Some(right.id);
+                    self.split_clips = Some((left, right));
+                }
             }
         }
     }
     fn undo(&mut self, _project: &mut Project, timeline: &mut Timeline) {
         if let (Some(original), Some(new_id)) = (&self.original_clip, self.new_clip_id) {
+            let original_index = timeline.clips.iter().position(|c| c.id == self.clip_id);
             // Remove both segments
             timeline.remove_clip(self.clip_id);
             timeline.remove_clip(new_id);
             // Restore original
             timeline.add_clip(original.clone());
+            if let Some(index) = original_index {
+                let _ = timeline.move_clip_to_index(original.id, index);
+            }
         }
     }
 }
@@ -338,7 +357,9 @@ mod tests {
         let mut timeline = Timeline::new();
         let mut project = Project::new("test", 1920, 1080, 30.0);
         let mut undo_stack = UndoStack::new();
-        let clip = create_test_clip(1, 0, 100, 2000);
+        let mut clip = create_test_clip(1, 0, 100, 2000);
+        clip.in_point = 250;
+        clip.out_point = 2150;
         timeline.add_clip(clip);
 
         // Trim clip (change start and end)
@@ -349,6 +370,8 @@ mod tests {
                 old_end: 2000,
                 new_start: 500,
                 new_end: 1500,
+                original_clip: None,
+                trimmed_clip: None,
             }),
             &mut project,
             &mut timeline,
@@ -356,16 +379,67 @@ mod tests {
 
         assert_eq!(timeline.clips[0].start, 500);
         assert_eq!(timeline.clips[0].end, 1500);
+        assert_eq!((timeline.clips[0].in_point, timeline.clips[0].out_point), (650, 1650));
 
         // Undo trim
         undo_stack.undo(&mut project, &mut timeline);
         assert_eq!(timeline.clips[0].start, 100);
         assert_eq!(timeline.clips[0].end, 2000);
+        assert_eq!((timeline.clips[0].in_point, timeline.clips[0].out_point), (250, 2150));
 
         // Redo trim
         undo_stack.redo(&mut project, &mut timeline);
         assert_eq!(timeline.clips[0].start, 500);
         assert_eq!(timeline.clips[0].end, 1500);
+        assert_eq!((timeline.clips[0].in_point, timeline.clips[0].out_point), (650, 1650));
+    }
+
+    #[test]
+    fn invalid_razor_undo_preserves_unrelated_clip() {
+        let mut timeline = Timeline::new();
+        let mut project = Project::new("test", 1920, 1080, 30.0);
+        let original = create_test_clip(1, 0, 0, 1000);
+        let unrelated = create_test_clip(2, 0, 2000, 3000);
+        timeline.add_clip(original.clone());
+        timeline.add_clip(unrelated.clone());
+        let mut undo = UndoStack::new();
+        undo.push(Box::new(RazorClipCommand {
+            clip_id: 1, split_at: 1000, original_clip: None,
+            new_clip_id: None, split_clips: None,
+        }), &mut project, &mut timeline);
+        undo.undo(&mut project, &mut timeline);
+        assert_eq!(timeline.clips, vec![original, unrelated]);
+    }
+
+    #[test]
+    fn razor_redo_keeps_clip_identity_and_blend() {
+        let mut timeline = Timeline::new();
+        let mut project = Project::new("test", 1920, 1080, 30.0);
+        let before = create_test_clip(9, 0, 0, 100);
+        let after = create_test_clip(10, 0, 1100, 1200);
+        timeline.add_clip(before.clone());
+        let mut original = create_test_clip(1, 0, 100, 1100);
+        original.in_point = 200;
+        original.out_point = 1200;
+        original.blend_mode = crate::timeline::BlendMode::Multiply;
+        original.reverse = true;
+        timeline.add_clip(original.clone());
+        timeline.add_clip(after.clone());
+        let mut undo = UndoStack::new();
+        undo.push(Box::new(RazorClipCommand {
+            clip_id: 1, split_at: 600, original_clip: None,
+            new_clip_id: None, split_clips: None,
+        }), &mut project, &mut timeline);
+        let split = timeline.clips.clone();
+        assert_eq!(split.len(), 4);
+        assert_eq!(split[1].blend_mode, crate::timeline::BlendMode::Multiply);
+        assert_eq!(split[2].blend_mode, crate::timeline::BlendMode::Multiply);
+        assert_eq!((split[1].in_point, split[1].out_point), (700, 1200));
+        assert_eq!((split[2].in_point, split[2].out_point), (200, 700));
+        undo.undo(&mut project, &mut timeline);
+        assert_eq!(timeline.clips, vec![before, original, after]);
+        undo.redo(&mut project, &mut timeline);
+        assert_eq!(timeline.clips, split);
     }
 
     #[test]
@@ -376,16 +450,20 @@ mod tests {
 
         let mut original_clip = create_test_clip(1, 0, 0, 1000);
         original_clip.audio_enabled = true;
-        timeline.add_clip(original_clip);
+        original_clip.group_id = Some(42);
+        timeline.add_clip(original_clip.clone());
+        project.clips.push(original_clip);
 
         let mut audio_clip = create_test_clip(2, 1, 0, 1000);
         audio_clip.video_enabled = false;
         audio_clip.audio_enabled = true;
+        audio_clip.group_id = Some(99);
 
         undo_stack.push(
             Box::new(SeparateAudioCommand {
                 clip_id: 1,
                 audio_clip,
+                original_clip: None,
             }),
             &mut project,
             &mut timeline,
@@ -396,6 +474,7 @@ mod tests {
 
         let vid_clip = timeline.clips.iter().find(|c| c.id == 1).unwrap();
         assert!(!vid_clip.audio_enabled);
+        assert!(!timeline.get_clips_at_time(500).iter().find(|c| c.id == 1).unwrap().audio_enabled);
 
         let aud_clip = timeline.clips.iter().find(|c| c.id == 2).unwrap();
         assert!(!aud_clip.video_enabled);
@@ -407,6 +486,9 @@ mod tests {
 
         let vid_clip_undone = timeline.clips.iter().find(|c| c.id == 1).unwrap();
         assert!(vid_clip_undone.audio_enabled);
+        assert_eq!(vid_clip_undone.group_id, Some(42));
+        assert_eq!(project.clips.len(), 1);
+        assert_eq!(project.clips[0].group_id, Some(42));
     }
 
     #[test]

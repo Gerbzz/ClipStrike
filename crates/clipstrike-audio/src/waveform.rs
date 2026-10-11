@@ -16,7 +16,7 @@ pub fn extract_waveform_sync(uri: &str, bins: usize) -> Result<Vec<f32>, String>
         "uridecodebin uri={:?} ! audioconvert ! audioresample ! audio/x-raw,format=F32LE,channels=1,rate=8000 ! appsink name=sink sync=false max-buffers=32 drop=true",
         uri
     ))
-    .map_err(|err| format!("Failed to build waveform pipeline: {}", err))?
+    .map_err(|err| clipstrike_core::media_uri::media_error(uri, "Failed to build waveform pipeline", &err.to_string()))?
     .dynamic_cast::<gst::Pipeline>()
     .map_err(|_| "Waveform pipeline was not a GstPipeline".to_string())?;
     let sink = pipeline
@@ -27,7 +27,7 @@ pub fn extract_waveform_sync(uri: &str, bins: usize) -> Result<Vec<f32>, String>
 
     pipeline
         .set_state(gst::State::Playing)
-        .map_err(|err| format!("Failed to start waveform pipeline: {}", err))?;
+        .map_err(|err| clipstrike_core::media_uri::media_error(uri, "Failed to start waveform pipeline", &err.to_string()))?;
 
     let bus = pipeline
         .bus()
@@ -60,10 +60,8 @@ pub fn extract_waveform_sync(uri: &str, bins: usize) -> Result<Vec<f32>, String>
                 gst::MessageView::Eos(..) => break,
                 gst::MessageView::Error(err) => {
                     let _ = pipeline.set_state(gst::State::Null);
-                    return Err(format!(
-                        "Waveform decode failed for {}: {}",
-                        uri,
-                        err.error()
+                    return Err(clipstrike_core::media_uri::media_error(
+                        uri, "Waveform decode failed", &err.error().to_string(),
                     ));
                 }
                 _ => {}

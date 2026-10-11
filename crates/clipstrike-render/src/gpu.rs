@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
@@ -18,6 +19,10 @@ pub struct FrameTexture {
     pub index: usize,
     pub ready: bool,
     pub clip_id: Option<usize>,
+    pub timestamp_ms: Option<i64>,
+    pub pts_ns: Option<u64>,
+    pub duration_ns: Option<u64>,
+    pub seek_generation: Option<u64>,
     pub external_texture_id: Option<u32>,
     pub native_d3d12_shared_handle: Option<usize>,
     pub egui_id: Option<egui::TextureId>,
@@ -49,6 +54,7 @@ pub struct TexturePool {
     pub width: u32,
     pub height: u32,
     pool: Vec<FrameTexture>,
+    expected_seek_generations: HashMap<usize, u64>,
     warned_native_import_failed: bool,
 }
 
@@ -56,6 +62,9 @@ pub struct TexturePool {
 pub struct FrameUploadRequest {
     pub clip_id: usize,
     pub timestamp_ms: i64,
+    pub pts_ns: Option<u64>,
+    pub duration_ns: Option<u64>,
+    pub seek_generation: u64,
     pub external_texture_id: Option<u32>,
     pub native_d3d12_shared_handle: Option<usize>,
     pub pixels: Vec<u8>,
@@ -72,7 +81,40 @@ pub enum FrameSourceKind {
 struct FrameUploadState {
     ready: bool,
     clip_id: Option<usize>,
+    timestamp_ms: Option<i64>,
+    seek_generation: Option<u64>,
     external_texture_id: Option<u32>,
+}
+
+fn frame_is_current(
+    state: FrameUploadState,
+    clip_id: usize,
+    expected_generation: Option<u64>,
+    expected_source_ms: Option<i64>,
+    max_distance_ms: i64,
+) -> bool {
+    state.ready
+        && state.clip_id == Some(clip_id)
+        && expected_generation.is_none_or(|generation| state.seek_generation == Some(generation))
+        && expected_source_ms.is_none_or(|source_ms| {
+            state.timestamp_ms.is_some_and(|timestamp_ms| {
+                (timestamp_ms as i128 - source_ms as i128).abs() <= max_distance_ms.max(0) as i128
+            })
+        })
+}
+
+fn upload_is_current(
+    request: &FrameUploadRequest,
+    expected_generation: Option<u64>,
+    previous: Option<FrameUploadState>,
+) -> bool {
+    expected_generation.is_none_or(|generation| request.seek_generation == generation)
+        && !previous.is_some_and(|frame| {
+            frame.ready
+                && frame.clip_id == Some(request.clip_id)
+                && frame.seek_generation == Some(request.seek_generation)
+                && frame.timestamp_ms.is_some_and(|time| time > request.timestamp_ms)
+        })
 }
 
 pub fn frame_source_kind(
@@ -92,6 +134,8 @@ fn frame_upload_state_from_request(request: &FrameUploadRequest) -> FrameUploadS
     FrameUploadState {
         ready: true,
         clip_id: Some(request.clip_id),
+        timestamp_ms: Some(request.timestamp_ms),
+        seek_generation: Some(request.seek_generation),
         external_texture_id: request.external_texture_id,
     }
 }
@@ -333,6 +377,10 @@ impl TexturePool {
                 index: i,
                 ready: false,
                 clip_id: None,
+                timestamp_ms: None,
+                pts_ns: None,
+                duration_ns: None,
+                seek_generation: None,
                 external_texture_id: None,
                 native_d3d12_shared_handle: None,
                 egui_id: None,
@@ -345,6 +393,7 @@ impl TexturePool {
             width,
             height,
             pool,
+            expected_seek_generations: HashMap::new(),
             warned_native_import_failed: false,
         }
     }
@@ -372,15 +421,62 @@ impl TexturePool {
         let recycled = self.pool.get_mut(recycle_index)?;
         recycled.ready = false;
         recycled.clip_id = None;
+        recycled.timestamp_ms = None;
+        recycled.pts_ns = None;
+        recycled.duration_ns = None;
+        recycled.seek_generation = None;
         recycled.external_texture_id = None;
         recycled.clear_preview_metadata();
         Some(recycled)
     }
 
+    pub fn expect_seek_generation(&mut self, clip_id: usize, generation: u64) {
+        let changed = self.expected_seek_generations.insert(clip_id, generation) != Some(generation);
+        if changed {
+            self.release_clip_frames(clip_id);
+        }
+    }
+
     pub fn frame_for_clip(&self, clip_id: usize) -> Option<&FrameTexture> {
-        self.pool
-            .iter()
-            .find(|frame| frame.ready && frame.clip_id == Some(clip_id))
+        self.frame_for_clip_at(clip_id, None, 0)
+    }
+
+    pub fn frame_for_clip_at(
+        &self,
+        clip_id: usize,
+        expected_source_ms: Option<i64>,
+        max_distance_ms: i64,
+    ) -> Option<&FrameTexture> {
+        let expected_generation = self.expected_seek_generations.get(&clip_id).copied();
+        self.pool.iter().find(|frame| {
+            frame_is_current(
+                FrameUploadState {
+                    ready: frame.ready,
+                    clip_id: frame.clip_id,
+                    timestamp_ms: frame.timestamp_ms,
+                    seek_generation: frame.seek_generation,
+                    external_texture_id: frame.external_texture_id,
+                },
+                clip_id,
+                expected_generation,
+                expected_source_ms,
+                max_distance_ms,
+            )
+        })
+    }
+
+    /// Export selection requires a decoded frame whose actual source PTS
+    /// interval covers this source instant. Unknown duration never matches.
+    pub fn frame_for_clip_covering_ns(&self, clip_id: usize, source_ns: u64) -> Option<&FrameTexture> {
+        let expected_generation = self.expected_seek_generations.get(&clip_id).copied();
+        self.pool.iter().find(|frame| {
+            frame.ready && frame.clip_id == Some(clip_id)
+                && expected_generation.is_none_or(|generation| frame.seek_generation == Some(generation))
+                && frame.pts_ns.zip(frame.duration_ns).is_some_and(|(pts, duration)| {
+                    duration > 0 && pts <= source_ns
+                        && pts.checked_add(duration).is_some_and(|end| source_ns < end)
+                })
+        })
     }
 
     pub fn frame_source_kind(frame: &FrameTexture) -> FrameSourceKind {
@@ -397,9 +493,14 @@ impl TexturePool {
         clip_id: usize,
         external_id: u32,
     ) -> Result<(), String> {
+        let generation = self.expected_seek_generations.get(&clip_id).copied();
         let frame = self.acquire_for_clip(clip_id).ok_or("No frame available")?;
         frame.ready = true;
         frame.clip_id = Some(clip_id);
+        frame.timestamp_ms = None;
+        frame.pts_ns = None;
+        frame.duration_ns = None;
+        frame.seek_generation = generation;
         frame.external_texture_id = Some(external_id);
         frame.clear_preview_metadata();
         Ok(())
@@ -410,8 +511,37 @@ impl TexturePool {
         queue: &wgpu::Queue,
         request: FrameUploadRequest,
     ) -> Result<bool, String> {
+        let previous = self.pool.iter().find(|frame| frame.clip_id == Some(request.clip_id))
+            .map(|frame| FrameUploadState {
+                ready: frame.ready,
+                clip_id: frame.clip_id,
+                timestamp_ms: frame.timestamp_ms,
+                seek_generation: frame.seek_generation,
+                external_texture_id: frame.external_texture_id,
+            });
+        if !upload_is_current(
+            &request,
+            self.expected_seek_generations.get(&request.clip_id).copied(),
+            previous,
+        ) {
+            // An older seek or regressive timestamp must not erase a newer,
+            // correctly decoded frame already in the pool.
+            return Ok(false);
+        }
         let width = self.width;
         let height = self.height;
+        let expected_pixel_count = width as usize * height as usize * 4;
+        if !request.pixels.is_empty() && request.pixels.len() != expected_pixel_count {
+            // This is the current upload, so retaining the prior pixels would
+            // make a failed decode look like a fresh frame at the next capture.
+            self.release_clip_frames(request.clip_id);
+            return Err(format!(
+                "Unexpected pixel payload size for clip {}: got {}, expected {}",
+                request.clip_id,
+                request.pixels.len(),
+                expected_pixel_count,
+            ));
+        }
         let device = Arc::clone(&self.device);
         let format = self.format;
 
@@ -426,14 +556,6 @@ impl TexturePool {
 
             if !request.pixels.is_empty() {
                 let bytes_per_row = width * 4;
-                if request.pixels.len() != (width as usize * height as usize * 4) {
-                    return Err(format!(
-                        "Unexpected pixel payload size for clip {}: got {}, expected {}",
-                        request.clip_id,
-                        request.pixels.len(),
-                        width as usize * height as usize * 4,
-                    ));
-                }
                 queue.write_texture(
                     wgpu::ImageCopyTexture {
                         texture: &frame.texture,
@@ -472,8 +594,26 @@ impl TexturePool {
                 frame.clear_preview_metadata();
             }
 
+            if request.pixels.is_empty() && !imported_native_preview {
+                frame.ready = false;
+                frame.clip_id = None;
+                frame.timestamp_ms = None;
+                frame.pts_ns = None;
+                frame.duration_ns = None;
+                frame.seek_generation = None;
+                frame.external_texture_id = None;
+                return Err(format!(
+                    "Decoded frame for clip {} had no usable pixels or native texture",
+                    request.clip_id,
+                ));
+            }
+
             frame.ready = state.ready;
             frame.clip_id = state.clip_id;
+            frame.timestamp_ms = state.timestamp_ms;
+            frame.pts_ns = request.pts_ns;
+            frame.duration_ns = request.duration_ns;
+            frame.seek_generation = state.seek_generation;
             frame.external_texture_id = state.external_texture_id;
         }
 
@@ -496,6 +636,10 @@ impl TexturePool {
         if let Some(frame) = self.pool.get_mut(index) {
             frame.ready = false;
             frame.clip_id = None;
+            frame.timestamp_ms = None;
+            frame.pts_ns = None;
+            frame.duration_ns = None;
+            frame.seek_generation = None;
             frame.external_texture_id = None;
             frame.clear_preview_metadata();
         }
@@ -506,6 +650,10 @@ impl TexturePool {
             if frame.clip_id == Some(clip_id) {
                 frame.ready = false;
                 frame.clip_id = None;
+                frame.timestamp_ms = None;
+                frame.pts_ns = None;
+                frame.duration_ns = None;
+                frame.seek_generation = None;
                 frame.external_texture_id = None;
                 frame.clear_preview_metadata();
             }
@@ -533,6 +681,9 @@ mod tests {
         let request = super::FrameUploadRequest {
             clip_id: 42,
             timestamp_ms: 1337,
+            pts_ns: None,
+            duration_ns: None,
+            seek_generation: 3,
             external_texture_id: Some(7),
             native_d3d12_shared_handle: None,
             pixels: vec![1, 2, 3, 4],
@@ -540,6 +691,7 @@ mod tests {
 
         assert_eq!(request.clip_id, 42);
         assert_eq!(request.timestamp_ms, 1337);
+        assert_eq!(request.seek_generation, 3);
         assert_eq!(request.external_texture_id, Some(7));
         assert_eq!(request.pixels, vec![1, 2, 3, 4]);
     }
@@ -557,6 +709,9 @@ mod tests {
         let request = super::FrameUploadRequest {
             clip_id: 7,
             timestamp_ms: 99,
+            pts_ns: None,
+            duration_ns: None,
+            seek_generation: 4,
             external_texture_id: Some(12),
             native_d3d12_shared_handle: None,
             pixels: Vec::new(),
@@ -565,7 +720,105 @@ mod tests {
         let state = super::frame_upload_state_from_request(&request);
         assert!(state.ready);
         assert_eq!(state.clip_id, Some(7));
+        assert_eq!(state.seek_generation, Some(4));
+        assert_eq!(state.timestamp_ms, Some(99));
         assert_eq!(state.external_texture_id, Some(12));
+    }
+
+    #[test]
+    fn old_seek_frames_are_rejected_while_current_playback_frames_advance() {
+        use super::{FrameUploadRequest, frame_is_current, frame_upload_state_from_request, upload_is_current};
+        let request = |seek_generation, timestamp_ms| FrameUploadRequest {
+            clip_id: 7,
+            seek_generation,
+            timestamp_ms,
+            pts_ns: None,
+            duration_ns: None,
+            external_texture_id: None,
+            native_d3d12_shared_handle: None,
+            pixels: Vec::new(),
+        };
+
+        let old_seek = request(4, 1000);
+        assert!(!upload_is_current(&old_seek, Some(5), None));
+        let current = request(5, 100);
+        assert!(upload_is_current(&current, Some(5), None));
+        let state = frame_upload_state_from_request(&current);
+        assert!(frame_is_current(state, 7, Some(5), Some(116), 50));
+        assert!(!frame_is_current(state, 7, Some(5), Some(1000), 50));
+        assert!(!frame_is_current(state, 7, Some(6), Some(100), 50));
+
+        let next = request(5, 133);
+        assert!(upload_is_current(&next, Some(5), Some(state)));
+        let next_state = frame_upload_state_from_request(&next);
+        assert!(!upload_is_current(&request(5, 90), Some(5), Some(next_state)));
+        assert!(frame_is_current(next_state, 7, Some(5), Some(150), 50));
+        assert!(frame_is_current(next_state, 7, Some(5), None, 0), "static title/image frames do not age out by timestamp");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn texture_pool_invalidates_a_seek_and_rejects_late_uploads() {
+        use std::sync::Arc;
+
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let instance = wgpu::Instance::default();
+        let adapter = runtime.block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            compatible_surface: None,
+            ..Default::default()
+        })).expect("native WGPU adapter required for texture-pool regression");
+        let (device, queue) = runtime.block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor::default(), None,
+        )).expect("native WGPU device required for texture-pool regression");
+        let mut pool = super::TexturePool::new(Arc::new(device), wgpu::TextureFormat::Rgba8Unorm, 2, 2, 2);
+        let request = |seek_generation, timestamp_ms| super::FrameUploadRequest {
+            clip_id: 7,
+            seek_generation,
+            timestamp_ms,
+            pts_ns: None,
+            duration_ns: None,
+            external_texture_id: None,
+            native_d3d12_shared_handle: None,
+            pixels: vec![255; 16],
+        };
+
+        pool.expect_seek_generation(7, 4);
+        pool.apply_frame_upload_request(&queue, request(4, 1000)).unwrap();
+        assert!(pool.frame_for_clip_at(7, Some(1000), 50).is_some());
+
+        pool.expect_seek_generation(7, 5);
+        assert!(pool.frame_for_clip(7).is_none(), "seek must invalidate the cached frame");
+        pool.apply_frame_upload_request(&queue, request(4, 1000)).unwrap();
+        assert!(pool.frame_for_clip(7).is_none(), "late old-generation upload must be dropped");
+        pool.apply_frame_upload_request(&queue, request(5, 100)).unwrap();
+        assert!(pool.frame_for_clip_at(7, Some(116), 50).is_some());
+        assert!(pool.frame_for_clip_at(7, Some(1000), 50).is_none());
+
+        pool.apply_frame_upload_request(&queue, request(5, 133)).unwrap();
+        pool.apply_frame_upload_request(&queue, request(5, 90)).unwrap();
+        assert_eq!(pool.frame_for_clip(7).unwrap().timestamp_ms, Some(133));
+        assert!(pool.frame_for_clip_at(7, Some(150), 50).is_some());
+
+        let mut malformed = request(5, 166);
+        malformed.pixels.pop();
+        assert!(pool.apply_frame_upload_request(&queue, malformed).is_err());
+        assert!(pool.frame_for_clip_at(7, Some(133), 50).is_none(), "a rejected newer pixel payload must invalidate the previously ready texture");
+
+        pool.apply_frame_upload_request(&queue, request(5, 166)).unwrap();
+        assert_eq!(pool.frame_for_clip(7).unwrap().timestamp_ms, Some(166));
+        let mut unusable = request(5, 166);
+        unusable.pixels.clear();
+        assert!(pool.apply_frame_upload_request(&queue, unusable).is_err());
+        assert!(pool.frame_for_clip(7).is_none(), "failed upload must not show the previous pixels");
+
+        let mut timed = request(5, 200);
+        timed.pts_ns = Some(200_000_000);
+        timed.duration_ns = Some(33_000_000);
+        pool.apply_frame_upload_request(&queue, timed).unwrap();
+        assert!(pool.frame_for_clip_covering_ns(7, 232_000_000).is_some());
+        assert!(pool.frame_for_clip_covering_ns(7, 233_000_000).is_none(),
+            "the decoded frame's exclusive end must not be accepted for export");
+        assert!(pool.frame_for_clip_covering_ns(7, 199_000_000).is_none());
     }
 
     #[test]

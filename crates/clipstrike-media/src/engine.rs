@@ -1,6 +1,7 @@
 #[cfg(feature = "gstreamer-backend")]
 mod imp {
     use clipstrike_audio::{AudioHandle, decode_f32le_samples};
+    use clipstrike_core::media_uri::{media_error, safe_backend_detail, source_label};
     use gstreamer as gst;
     use gstreamer_app as gst_app;
     use gstreamer_app::prelude::*;
@@ -21,10 +22,32 @@ mod imp {
     }
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     };
     use std::thread;
+    static NEXT_SEEK_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+    struct SeekEpoch {
+        generation: u64,
+        seeking: bool,
+    }
+
+    fn startup_error(bus: &gst::Bus, uri: &str, fallback: &str) -> String {
+        let message = bus
+            .pop_filtered(&[gst::MessageType::Error])
+            .or_else(|| {
+                bus.timed_pop_filtered(
+                    Some(gst::ClockTime::from_mseconds(250)),
+                    &[gst::MessageType::Error],
+                )
+            });
+        let detail = message.and_then(|msg| match msg.view() {
+            gst::MessageView::Error(error) => Some(error.error().to_string()),
+            _ => None,
+        });
+        media_error(uri, "Open failed", &detail.unwrap_or_else(|| fallback.to_string()))
+    }
 
     fn ghost_pad_from_static_pad(
         element: &gst::Element,
@@ -40,13 +63,10 @@ mod imp {
     where
         F: FnOnce() -> Result<(), String>,
     {
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
         let result = match catch_unwind(AssertUnwindSafe(setup)) {
             Ok(result) => result,
             Err(_) => Err(format!("{context} panicked")),
         };
-        std::panic::set_hook(previous_hook);
         result
     }
 
@@ -75,6 +95,8 @@ mod imp {
         frame_sender: Option<tokio::sync::mpsc::Sender<clipstrike_render::gpu::FrameUploadRequest>>,
         bus_stop: Arc<AtomicBool>,
         bus_task: Option<thread::JoinHandle<()>>,
+        seek_epoch: Arc<Mutex<SeekEpoch>>,
+        seek_call_lock: Mutex<()>,
     }
 
     impl VideoEngine {
@@ -95,10 +117,11 @@ mod imp {
         ) -> Result<Self, String> {
             gst::init().map_err(|e| e.to_string())?;
             crate::decoder_affinity::prefer_hardware_decoders();
+            let source_context = source_label(uri);
             log::info!(
-                "Creating VideoEngine clip_id={} uri={} video_enabled={} audio_enabled={}",
+                "Creating VideoEngine clip_id={} source={} video_enabled={} audio_enabled={}",
                 clip_id,
-                uri,
+                source_context,
                 video_enabled,
                 audio_enabled
             );
@@ -138,9 +161,9 @@ mod imp {
                                 .map_err(|e| e.to_string())?;
 
                             log::debug!(
-                                "VideoEngine::new configuring sink clip_id={} uri={} prefer_d3d12_memory=true frame={}x{}",
+                                "VideoEngine::new configuring sink clip_id={} source={} prefer_d3d12_memory=true frame={}x{}",
                                 clip_id,
-                                uri,
+                                source_context,
                                 frame_width,
                                 frame_height
                             );
@@ -178,9 +201,9 @@ mod imp {
                                 .map_err(|e| e.to_string())?;
 
                             log::debug!(
-                                "VideoEngine::new configuring sink clip_id={} uri={} prefer_gl_memory=true frame={}x{}",
+                                "VideoEngine::new configuring sink clip_id={} source={} prefer_gl_memory=true frame={}x{}",
                                 clip_id,
-                                uri,
+                                source_context,
                                 frame_width,
                                 frame_height
                             );
@@ -213,9 +236,9 @@ mod imp {
 
                 if let Err(err) = hardware_sink_result {
                     log::warn!(
-                        "Falling back to direct appsink for clip_id={} uri={} because hardware preview sink setup failed: {}",
+                        "Falling back to direct appsink for clip_id={} source={} because hardware preview sink setup failed: {}",
                         clip_id,
-                        uri,
+                        source_context,
                         err
                     );
                     let cpu_caps = video_sink_caps(frame_width, frame_height);
@@ -227,9 +250,9 @@ mod imp {
                     .build()
                     .map_err(|e| e.to_string())?;
                 log::debug!(
-                    "VideoEngine::new configuring sink clip_id={} uri={} prefer_gl_memory=false frame={}x{}",
+                    "VideoEngine::new configuring sink clip_id={} source={} prefer_gl_memory=false frame={}x{}",
                     clip_id,
-                    uri,
+                    source_context,
                     frame_width,
                     frame_height
                 );
@@ -239,39 +262,13 @@ mod imp {
 
             let bus = pipeline.bus().ok_or_else(|| {
                 log::error!(
-                    "VideoEngine::new pipeline missing bus for clip_id={} uri={}",
+                    "VideoEngine::new pipeline missing bus for clip_id={} source={}",
                     clip_id,
-                    uri
+                    source_context
                 );
                 "Pipeline must have a bus".to_string()
             })?;
             let bus_stop = Arc::new(AtomicBool::new(false));
-            let bus_stop_for_thread = Arc::clone(&bus_stop);
-            let event_sender_for_thread = event_sender.clone();
-            let bus_task = thread::spawn(move || {
-                while !bus_stop_for_thread.load(Ordering::Relaxed) {
-                    let Some(msg) = bus.timed_pop(Some(gst::ClockTime::from_mseconds(250))) else {
-                        continue;
-                    };
-
-                    match msg.view() {
-                        gst::MessageView::Error(err) => {
-                            log::error!("GStreamer Error: {} ({:?})", err.error(), err.debug());
-                        }
-                        gst::MessageView::Eos(_) => {
-                            log::info!("GStreamer EOS reached for clip_id={}", clip_id);
-                            if let Some(sender) = &event_sender_for_thread {
-                                let _ =
-                                    sender.send(crate::engine_manager::EngineEvent::EndOfStream {
-                                        clip_id,
-                                    });
-                            }
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            });
 
             let mut audio_appsink = None;
 
@@ -299,7 +296,7 @@ mod imp {
                 pipeline.set_property("audio-sink", &audio_sink);
             }
 
-            let engine = Self {
+            let mut engine = Self {
                 pipeline,
                 appsink,
                 audio_appsink,
@@ -309,11 +306,61 @@ mod imp {
                 _frame_height: frame_height,
                 frame_sender,
                 bus_stop,
-                bus_task: Some(bus_task),
+                bus_task: None,
+                seek_epoch: Arc::new(Mutex::new(SeekEpoch {
+                    generation: NEXT_SEEK_GENERATION.fetch_add(1, Ordering::Relaxed),
+                    seeking: false,
+                })),
+                seek_call_lock: Mutex::new(()),
             };
 
             engine.setup_callbacks();
-            engine.pause()?;
+            engine
+                .pause()
+                .map_err(|error| startup_error(&bus, uri, &error))?;
+            // GStreamer changes to PAUSED asynchronously. The editor seeks as
+            // soon as a new engine is returned, so wait for preroll here rather
+            // than silently losing that first seek.
+            let (transition, state, pending) =
+                engine.pipeline.state(gst::ClockTime::from_seconds(5));
+            if transition.is_err() || !matches!(state, gst::State::Paused | gst::State::Playing) {
+                return Err(startup_error(
+                    &bus,
+                    uri,
+                    &format!("preview did not become ready (state={state:?}, pending={pending:?}, result={transition:?})"),
+                ));
+            }
+            let bus_stop_for_thread = Arc::clone(&engine.bus_stop);
+            let event_sender_for_thread = event_sender;
+            let bus_source_context = source_context.clone();
+            let bus_uri = uri.to_owned();
+            engine.bus_task = Some(thread::spawn(move || {
+                while !bus_stop_for_thread.load(Ordering::Relaxed) {
+                    let Some(msg) = bus.timed_pop(Some(gst::ClockTime::from_mseconds(250))) else {
+                        continue;
+                    };
+                    match msg.view() {
+                        gst::MessageView::Error(err) => {
+                            log::error!(
+                                "GStreamer error for clip {} ({}): {}",
+                                clip_id,
+                                bus_source_context,
+                                safe_backend_detail(&bus_uri, &err.error().to_string())
+                            );
+                        }
+                        gst::MessageView::Eos(_) => {
+                            log::info!("GStreamer EOS reached for clip_id={}", clip_id);
+                            if let Some(sender) = &event_sender_for_thread {
+                                let _ = sender.send(crate::engine_manager::EngineEvent::EndOfStream {
+                                    clip_id,
+                                });
+                            }
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }));
             Ok(engine)
         }
 
@@ -321,16 +368,26 @@ mod imp {
             let clip_id = self.clip_id;
             let preroll_frame_sender = self.frame_sender.clone();
             let sample_frame_sender = self.frame_sender.clone();
+            let preroll_epoch = Arc::clone(&self.seek_epoch);
+            let sample_epoch = Arc::clone(&self.seek_epoch);
 
             self.appsink.set_callbacks(
                 gst_app::AppSinkCallbacks::builder()
                     .new_preroll(move |sink| {
-                        let sample = sink.pull_preroll().map_err(|_| gst::FlowError::Eos)?;
-                        upload_sample(&sample, clip_id, preroll_frame_sender.clone())
+                        upload_sample(
+                            || sink.pull_preroll().map_err(|_| gst::FlowError::Eos),
+                            clip_id,
+                            &preroll_epoch,
+                            preroll_frame_sender.clone(),
+                        )
                     })
                     .new_sample(move |sink| {
-                        let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                        upload_sample(&sample, clip_id, sample_frame_sender.clone())
+                        upload_sample(
+                            || sink.pull_sample().map_err(|_| gst::FlowError::Eos),
+                            clip_id,
+                            &sample_epoch,
+                            sample_frame_sender.clone(),
+                        )
                     })
                     .build(),
             );
@@ -403,12 +460,26 @@ mod imp {
             position: std::time::Duration,
             mode: SeekMode,
         ) -> Result<(), String> {
-            self.pipeline
+            // Serialize callers, but never hold the callback epoch lock while
+            // GStreamer flushes: a flush seek may wait for a streaming callback.
+            let _seek_call = self.seek_call_lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.seek_epoch.lock().unwrap_or_else(|e| e.into_inner()).seeking = true;
+            let result = self.pipeline
                 .seek_simple(
                     seek_flags(mode),
                     gst::ClockTime::from_nseconds(position.as_nanos() as u64),
                 )
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string());
+            let mut epoch = self.seek_epoch.lock().unwrap_or_else(|e| e.into_inner());
+            epoch.generation = NEXT_SEEK_GENERATION.fetch_add(1, Ordering::Relaxed);
+            // A failed seek has no trustworthy post-seek segment to publish.
+            // The next successful seek can reopen callback publication.
+            epoch.seeking = result.is_err();
+            result
+        }
+
+        pub fn frame_generation(&self) -> u64 {
+            self.seek_epoch.lock().unwrap_or_else(|e| e.into_inner()).generation
         }
 
         pub fn stop(&self) -> Result<(), String> {
@@ -438,6 +509,9 @@ mod imp {
 
     impl Drop for VideoEngine {
         fn drop(&mut self) {
+            // A running pipeline can keep its streaming threads alive while the
+            // bus worker is joined. Stop it before waiting for that worker.
+            let _ = self.pipeline.set_state(gst::State::Null);
             self.bus_stop.store(true, Ordering::Relaxed);
             if let Some(bus_task) = self.bus_task.take() {
                 let _ = bus_task.join();
@@ -556,12 +630,16 @@ mod imp {
         external_texture_id: Option<u32>,
         native_d3d12_shared_handle: Option<usize>,
         timestamp_ms: i64,
+        seek_generation: u64,
     ) -> Result<clipstrike_render::gpu::FrameUploadRequest, gst::FlowError> {
         let pixels = map_buffer_pixels(buffer)?;
 
         Ok(clipstrike_render::gpu::FrameUploadRequest {
             clip_id,
             timestamp_ms,
+            pts_ns: buffer.pts().map(|pts| pts.nseconds()),
+            duration_ns: buffer.duration().map(|duration| duration.nseconds()),
+            seek_generation,
             external_texture_id,
             native_d3d12_shared_handle,
             pixels,
@@ -571,6 +649,7 @@ mod imp {
     fn frame_upload_request_from_sample(
         sample: &gst::Sample,
         clip_id: usize,
+        seek_generation: u64,
     ) -> Result<clipstrike_render::gpu::FrameUploadRequest, gst::FlowError> {
         let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
         let timestamp = buffer.pts().map(|t| t.mseconds() as i64).unwrap_or(0);
@@ -580,21 +659,51 @@ mod imp {
         #[cfg(not(target_os = "windows"))]
         let native_d3d12_shared_handle = None;
 
-        frame_upload_request_from_buffer(
+        let mut request = frame_upload_request_from_buffer(
             buffer,
             clip_id,
             external_texture_id,
             native_d3d12_shared_handle,
             timestamp,
-        )
+            seek_generation,
+        )?;
+        if request.duration_ns.is_none() {
+            request.duration_ns = sample.caps()
+                .and_then(|caps| caps.structure(0))
+                .and_then(|structure| structure.get::<gst::Fraction>("framerate").ok())
+                .and_then(|fps| {
+                    (fps.numer() > 0 && fps.denom() > 0).then(||
+                        (1_000_000_000u128 * fps.denom() as u128 / fps.numer() as u128) as u64
+                    )
+                });
+        }
+        Ok(request)
     }
 
-    fn upload_sample(
-        sample: &gst::Sample,
+    fn upload_sample<F>(
+        pull: F,
         clip_id: usize,
+        seek_epoch: &Mutex<SeekEpoch>,
         frame_sender: Option<tokio::sync::mpsc::Sender<clipstrike_render::gpu::FrameUploadRequest>>,
-    ) -> Result<gst::FlowSuccess, gst::FlowError> {
-        let request = frame_upload_request_from_sample(sample, clip_id)?;
+    ) -> Result<gst::FlowSuccess, gst::FlowError>
+    where
+        F: FnOnce() -> Result<gst::Sample, gst::FlowError>,
+    {
+        let initial = seek_epoch.lock().unwrap_or_else(|e| e.into_inner());
+        let generation = initial.generation;
+        let started_during_seek = initial.seeking;
+        drop(initial);
+        let sample = pull()?;
+        if started_during_seek {
+            return Ok(gst::FlowSuccess::Ok);
+        }
+        let request = frame_upload_request_from_sample(&sample, clip_id, generation)?;
+        // Publication and the seek-start marker use the same lock. A callback
+        // spanning a seek cannot tag its pre-seek sample with the new epoch.
+        let current = seek_epoch.lock().unwrap_or_else(|e| e.into_inner());
+        if current.seeking || current.generation != generation {
+            return Ok(gst::FlowSuccess::Ok);
+        }
         if let Some(sender) = frame_sender {
             let _ = sender.try_send(request);
         }
@@ -607,9 +716,52 @@ mod imp {
         use super::{
             frame_upload_request_from_buffer, frame_upload_request_from_sample,
             ghost_pad_from_static_pad, run_catching_panics, sample_external_texture_id,
-            seek_flags, video_sink_caps, video_sink_caps_with_gl_memory, SeekMode,
+            seek_flags, upload_sample, video_sink_caps, video_sink_caps_with_gl_memory, SeekEpoch,
+            SeekMode,
         };
         use gstreamer as gst;
+
+        #[test]
+        fn callback_crossing_seek_cannot_publish_a_pre_seek_sample_as_current() {
+            use std::sync::{Arc, Barrier, Mutex};
+
+            gst::init().expect("gstreamer init");
+            let epoch = Arc::new(Mutex::new(SeekEpoch { generation: 101, seeking: false }));
+            let barrier = Arc::new(Barrier::new(2));
+            let epoch_for_seek = Arc::clone(&epoch);
+            let barrier_for_seek = Arc::clone(&barrier);
+            let seek = std::thread::spawn(move || {
+                barrier_for_seek.wait();
+                let mut state = epoch_for_seek.lock().unwrap();
+                state.seeking = true;
+                state.generation = 102;
+                state.seeking = false;
+            });
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+            let buffer = gst::Buffer::from_mut_slice(vec![1_u8, 2, 3, 4]);
+            let sample = gst::Sample::builder().buffer(&buffer).build();
+            upload_sample(
+                || {
+                    barrier.wait();
+                    seek.join().unwrap();
+                    Ok(sample)
+                },
+                7,
+                &epoch,
+                Some(sender.clone()),
+            ).unwrap();
+            assert!(receiver.try_recv().is_err(), "the pre-seek sample must be dropped");
+
+            epoch.lock().unwrap().seeking = true;
+            let during_seek = gst::Sample::builder().buffer(&buffer).build();
+            upload_sample(|| Ok(during_seek), 7, &epoch, Some(sender.clone())).unwrap();
+            assert!(receiver.try_recv().is_err(), "a callback begun during flush must be dropped");
+
+            epoch.lock().unwrap().seeking = false;
+            let after_seek = gst::Sample::builder().buffer(&buffer).build();
+            upload_sample(|| Ok(after_seek), 7, &epoch, Some(sender)).unwrap();
+            assert_eq!(receiver.try_recv().unwrap().seek_generation, 102);
+        }
 
         #[test]
         fn video_sink_caps_uses_valid_structure_name_for_cpu_rgba_frames() {
@@ -673,19 +825,63 @@ mod imp {
         #[test]
         fn video_engine_new_can_configure_playbin3_for_preview_playback() {
             gst::init().expect("gstreamer init");
-            let media_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("..")
-                .join("PythonDatatempclipstrike-gst-launch-mkv.mkv");
-            let uri = format!(
-                "file:///{}",
-                media_path.to_string_lossy().replace('\\', "/")
-            );
+            let directory = tempfile::tempdir().expect("temporary media directory");
+            let media_path = directory.path().join("preview-with-audio.mp4");
+            std::fs::write(
+                &media_path,
+                include_bytes!("../tests/fixtures/preview-with-audio.mp4"),
+            )
+            .expect("write portable preview fixture");
+            let uri = url::Url::from_file_path(&media_path)
+                .expect("portable fixture path should have a file URI")
+                .to_string();
 
+            let (frame_sender, mut frame_receiver) = tokio::sync::mpsc::channel(16);
             let engine =
-                super::VideoEngine::new(&uri, 77, 1920, 1080, true, false, None, None, None)
+                super::VideoEngine::new(&uri, 77, 1920, 1080, true, false, Some(frame_sender), None, None)
                     .expect("VideoEngine::new should not panic or fail for preview playback");
-
+            let startup_generation = engine.frame_generation();
+            engine
+                .seek(std::time::Duration::from_millis(500))
+                .expect("first seek must work before playback starts");
+            let seek_generation = engine.frame_generation();
+            assert_ne!(startup_generation, seek_generation);
+            // A paused seek must still produce a decoded frame. Export and
+            // scrubbing cannot depend on calling play() to wake the sink.
+            let mut saw_paused_preroll = false;
+            for _ in 0..30 {
+                while let Ok(frame) = frame_receiver.try_recv() {
+                    if frame.seek_generation == seek_generation && frame.timestamp_ms >= 450 {
+                        saw_paused_preroll = true;
+                        break;
+                    }
+                }
+                if saw_paused_preroll { break; }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(saw_paused_preroll, "paused seek must publish current-generation preroll");
+            let mut reached_seek = false;
+            for _ in 0..40 {
+                if engine.query_position_ms().is_some_and(|position| (450..=600).contains(&position)) {
+                    reached_seek = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert!(reached_seek, "first seek must reach the requested source region");
+            engine.play().expect("play portable fixture");
+            let mut saw_new_generation_frame = false;
+            for _ in 0..40 {
+                while let Ok(frame) = frame_receiver.try_recv() {
+                    if frame.seek_generation == seek_generation && frame.timestamp_ms >= 450 {
+                        saw_new_generation_frame = true;
+                        break;
+                    }
+                }
+                if saw_new_generation_frame { break; }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert!(saw_new_generation_frame, "decoded playback must carry the seek generation and source timestamp");
             drop(engine);
         }
 
@@ -704,6 +900,39 @@ mod imp {
         }
 
         #[test]
+        fn caught_setup_panic_still_calls_the_installed_hook() {
+            use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+            let calls = Arc::new(AtomicUsize::new(0));
+            let calls_for_hook = Arc::clone(&calls);
+            let previous_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |_| {
+                calls_for_hook.fetch_add(1, Ordering::SeqCst);
+            }));
+            let result = run_catching_panics("concurrent setup", || -> Result<(), String> {
+                panic!("simulated setup failure");
+            });
+            std::panic::set_hook(previous_hook);
+
+            assert!(result.unwrap_err().contains("concurrent setup panicked"));
+            assert!(calls.load(Ordering::SeqCst) >= 1, "engine setup must not suppress the process panic hook");
+        }
+
+        #[test]
+        fn missing_local_media_error_names_the_file_and_reports_pipeline_failure() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("missing-preview.mp4");
+            let uri = url::Url::from_file_path(&path).unwrap().to_string();
+            let error = match super::VideoEngine::new(&uri, 91, 320, 180, true, false, None, None, None) {
+                Ok(_) => panic!("a missing media file must fail"),
+                Err(error) => error,
+            };
+            assert!(error.contains("missing-preview.mp4"), "{error}");
+            assert!(error.starts_with("Open failed for local media"), "{error}");
+            assert!(!error.ends_with("Element failed to change its state"), "{error}");
+        }
+
+        #[test]
         fn sample_external_texture_id_returns_none_for_cpu_buffer() {
             gst::init().expect("gstreamer init");
             let buffer = gst::Buffer::from_mut_slice(vec![1u8, 2, 3, 4]);
@@ -718,8 +947,9 @@ mod imp {
             let buffer = gst::Buffer::from_mut_slice(vec![1u8, 2, 3, 4]);
             let sample = gst::Sample::builder().buffer(&buffer).build();
 
-            let request = frame_upload_request_from_sample(&sample, 9).expect("frame request");
+            let request = frame_upload_request_from_sample(&sample, 9, 4).expect("frame request");
             assert_eq!(request.clip_id, 9);
+            assert_eq!(request.seek_generation, 4);
             assert_eq!(request.timestamp_ms, 0);
             assert_eq!(request.external_texture_id, None);
             assert_eq!(request.native_d3d12_shared_handle, None);
@@ -727,14 +957,29 @@ mod imp {
         }
 
         #[test]
+        fn frame_without_buffer_duration_uses_negotiated_constant_framerate() {
+            gst::init().expect("gstreamer init");
+            let mut buffer = gst::Buffer::from_mut_slice(vec![1u8, 2, 3, 4]);
+            buffer.get_mut().unwrap().set_pts(gst::ClockTime::from_mseconds(100));
+            let caps = gst::Caps::builder("video/x-raw")
+                .field("framerate", gst::Fraction::new(30, 1)).build();
+            let sample = gst::Sample::builder().buffer(&buffer).caps(&caps).build();
+
+            let request = frame_upload_request_from_sample(&sample, 9, 4).unwrap();
+            assert_eq!(request.pts_ns, Some(100_000_000));
+            assert_eq!(request.duration_ns, Some(33_333_333));
+        }
+
+        #[test]
         fn frame_upload_request_from_buffer_preserves_external_metadata_and_pixels() {
             gst::init().expect("gstreamer init");
             let buffer = gst::Buffer::from_mut_slice(vec![9u8, 8, 7, 6]);
 
-            let request = frame_upload_request_from_buffer(&buffer, 42, Some(77), None, 123)
+            let request = frame_upload_request_from_buffer(&buffer, 42, Some(77), None, 123, 5)
                 .expect("frame request");
             assert_eq!(request.clip_id, 42);
             assert_eq!(request.timestamp_ms, 123);
+            assert_eq!(request.seek_generation, 5);
             assert_eq!(request.external_texture_id, Some(77));
             assert_eq!(request.native_d3d12_shared_handle, None);
             assert_eq!(request.pixels, vec![9, 8, 7, 6]);
@@ -766,7 +1011,7 @@ mod imp {
     impl VideoEngine {
         pub fn new(
             _uri: &str,
-            clip_id: usize,
+            _clip_id: usize,
             _frame_width: i32,
             _frame_height: i32,
             _video_enabled: bool,
@@ -780,11 +1025,11 @@ mod imp {
             >,
             _audio_handle: Option<AudioHandle>,
         ) -> Result<Self, String> {
-            Ok(Self { _clip_id: clip_id })
+            Err("Media playback is unavailable: this build has no GStreamer backend".into())
         }
 
         pub fn play(&self) -> Result<(), String> {
-            Ok(())
+            Err("Media playback is unavailable: this build has no GStreamer backend".into())
         }
 
         pub fn pause(&self) -> Result<(), String> {
@@ -792,11 +1037,15 @@ mod imp {
         }
 
         pub fn seek(&self, _position: std::time::Duration) -> Result<(), String> {
-            Ok(())
+            Err("Media playback is unavailable: this build has no GStreamer backend".into())
         }
 
         pub fn seek_interactive(&self, _position: std::time::Duration) -> Result<(), String> {
-            Ok(())
+            Err("Media playback is unavailable: this build has no GStreamer backend".into())
+        }
+
+        pub fn frame_generation(&self) -> u64 {
+            0
         }
 
         pub fn stop(&self) -> Result<(), String> {
@@ -818,3 +1067,16 @@ mod imp {
 }
 
 pub use imp::VideoEngine;
+
+#[cfg(all(test, not(feature = "gstreamer-backend")))]
+mod unavailable_tests {
+    #[test]
+    fn disabled_backend_cannot_report_playback_ready() {
+        let error = super::VideoEngine::new(
+            "file:///fixture.mp4", 1, 320, 180, true, true, None, None, None,
+        )
+        .err()
+        .expect("disabled backend must fail");
+        assert!(error.contains("no GStreamer backend"));
+    }
+}

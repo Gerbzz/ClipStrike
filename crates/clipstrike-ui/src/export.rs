@@ -1,9 +1,31 @@
 use std::time::Duration;
 
-pub fn export_frame_count_for_duration_ms(duration_ms: i64, frame_duration_ms: i64) -> u64 {
-    let duration_ms = duration_ms.max(1) as u64;
-    let frame_duration_ms = frame_duration_ms.max(1) as u64;
-    duration_ms.saturating_add(frame_duration_ms - 1) / frame_duration_ms
+pub fn export_frame_count_for_duration_ms(duration_ms: i64, fps_num: i32, fps_den: i32) -> u64 {
+    let numerator = duration_ms.max(1) as u128 * fps_num.max(1) as u128;
+    let denominator = 1000u128 * fps_den.max(1) as u128;
+    numerator.div_ceil(denominator).min(u64::MAX as u128) as u64
+}
+
+pub fn export_frame_time_ms(frame_index: u64, fps_num: i32, fps_den: i32) -> i64 {
+    let numerator = frame_index as u128 * 1000u128 * fps_den.max(1) as u128;
+    (numerator / fps_num.max(1) as u128).min(i64::MAX as u128) as i64
+}
+
+#[cfg(test)]
+mod frame_timing_tests {
+    use super::*;
+
+    #[test]
+    fn thirty_fps_one_hour_has_no_millisecond_drift() {
+        assert_eq!(export_frame_count_for_duration_ms(3_600_000, 30, 1), 108_000);
+        assert_eq!(export_frame_time_ms(107_999, 30, 1), 3_599_966);
+    }
+
+    #[test]
+    fn fractional_fps_uses_rational_frame_boundaries() {
+        assert_eq!(export_frame_count_for_duration_ms(10_000, 30_000, 1001), 300);
+        assert_eq!(export_frame_time_ms(300, 30_000, 1001), 10_010);
+    }
 }
 
 #[derive(Debug, Clone)]

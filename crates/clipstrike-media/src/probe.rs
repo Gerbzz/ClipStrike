@@ -90,7 +90,7 @@ fn decode_duration_sync(uri: &str) -> Result<Option<Duration>, String> {
 
     pipeline
         .set_state(gst::State::Playing)
-        .map_err(|err| format!("Failed to start duration probe pipeline: {}", err))?;
+        .map_err(|err| clipstrike_core::media_uri::media_error(uri, "Failed to start duration probe pipeline", &err.to_string()))?;
 
     let bus = pipeline
         .bus()
@@ -118,10 +118,8 @@ fn decode_duration_sync(uri: &str) -> Result<Option<Duration>, String> {
                 }
                 gst::MessageView::Error(err) => {
                     let _ = pipeline.set_state(gst::State::Null);
-                    return Err(format!(
-                        "Decoded duration probe failed for {}: {}",
-                        uri,
-                        err.error()
+                    return Err(clipstrike_core::media_uri::media_error(
+                        uri, "Decoded duration probe failed", &err.error().to_string(),
                     ));
                 }
                 _ => {}
@@ -130,9 +128,8 @@ fn decode_duration_sync(uri: &str) -> Result<Option<Duration>, String> {
 
         if started_at.elapsed() >= timeout {
             let _ = pipeline.set_state(gst::State::Null);
-            return Err(format!(
-                "Timed out waiting for decoded duration probe on {} after {:?}",
-                uri, timeout
+            return Err(clipstrike_core::media_uri::media_error(
+                uri, "Decoded duration probe timed out", &format!("after {timeout:?}"),
             ));
         }
     }
@@ -152,7 +149,7 @@ pub fn probe_metadata_sync(uri: &str) -> Result<ClipMetadata, String> {
         .map_err(|e| format!("Failed to create Discoverer: {}", e))?;
     let info = discoverer
         .discover_uri(uri)
-        .map_err(|e| format!("Failed to discover URI ({}): {}", uri, e))?;
+        .map_err(|e| clipstrike_core::media_uri::media_error(uri, "Failed to discover URI", &e.to_string()))?;
 
     let discovered_duration = info
         .duration()
@@ -162,7 +159,7 @@ pub fn probe_metadata_sync(uri: &str) -> Result<ClipMetadata, String> {
         Err(err) => {
             log::warn!(
                 "Falling back to discoverer duration for {} because decoded probe failed: {}",
-                uri,
+                clipstrike_core::media_uri::source_label(uri),
                 err
             );
             None
@@ -174,7 +171,7 @@ pub fn probe_metadata_sync(uri: &str) -> Result<ClipMetadata, String> {
         if discovered != decoded {
             log::info!(
                 "Using decoded duration for {}: discovered_ms={} decoded_ms={}",
-                uri,
+                clipstrike_core::media_uri::source_label(uri),
                 discovered.as_millis(),
                 decoded.as_millis()
             );
@@ -225,7 +222,7 @@ pub fn generate_thumbnail_sync_into(
     );
 
     let pipeline = gst::parse::launch(&pipeline_str)
-        .map_err(|e| format!("Failed to parse pipeline: {}", e))?
+        .map_err(|e| clipstrike_core::media_uri::media_error(uri, "Failed to parse thumbnail pipeline", &e.to_string()))?
         .downcast::<gst::Pipeline>()
         .map_err(|_| "Failed to cast to Pipeline")?;
 
@@ -288,7 +285,7 @@ pub fn generate_thumbnail_sync(uri: &str, time_ms: i64) -> Result<(Vec<u8>, u32,
 pub fn generate_thumbnail_sync(uri: &str, _time_ms: i64) -> Result<(Vec<u8>, u32, u32), String> {
     Err(format!(
         "Thumbnail generation unavailable without GStreamer backend: {}",
-        uri
+        clipstrike_core::media_uri::source_label(uri)
     ))
 }
 
@@ -304,7 +301,7 @@ pub async fn generate_thumbnail(uri: String, time_ms: i64) -> Result<(Vec<u8>, u
 pub fn probe_metadata_sync(uri: &str) -> Result<ClipMetadata, String> {
     Err(format!(
         "Media probing is unavailable because the GStreamer backend is disabled: {}",
-        uri
+        clipstrike_core::media_uri::source_label(uri)
     ))
 }
 
@@ -331,6 +328,17 @@ mod tests {
         let uri = "file:///non/existent/file.mp4";
         let result = probe_metadata_sync(uri);
         assert!(result.is_err());
+    }
+
+    #[cfg(not(feature = "gstreamer-backend"))]
+    #[test]
+    fn unavailable_probe_error_redacts_remote_credentials_without_network_access() {
+        let uri = "https://alice:secret@example.com/movie.mp4?token=private";
+        let error = probe_metadata_sync(uri).unwrap_err();
+        assert!(error.contains("https media"), "{error}");
+        for secret in ["alice", "secret", "token", "private", "example.com"] {
+            assert!(!error.contains(secret), "{error}");
+        }
     }
 
     #[cfg(feature = "gstreamer-backend")]
@@ -394,4 +402,19 @@ mod tests {
         assert_eq!(select_authoritative_duration(None, None), None);
     }
 
+    #[cfg(feature = "gstreamer-backend")]
+    #[tokio::test]
+    async fn test_probe_real_file_repro() {
+        let path = std::path::PathBuf::from(
+            std::env::var_os("CLIPSTRIKE_REAL_MEDIA_FIXTURE")
+                .expect("set CLIPSTRIKE_REAL_MEDIA_FIXTURE to a real video file"),
+        );
+        assert!(path.is_file(), "real media fixture is missing: {}", path.display());
+        let uri = format!("file:///{}", path.to_string_lossy().replace('\\', "/"));
+        println!("Probing {}", clipstrike_core::media_uri::source_label(&uri));
+        let result = probe_metadata_sync(&uri).expect("probe failed");
+        println!("Metadata: {:?}", result);
+        assert!(result.duration.is_some());
+        assert!(result.duration.unwrap().as_millis() > 0);
+    }
 }

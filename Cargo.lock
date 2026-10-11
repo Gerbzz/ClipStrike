@@ -865,7 +865,9 @@ dependencies = [
  "opencv",
  "rayon",
  "serde",
+ "tempfile",
  "tokio",
+ "url",
  "wgpu",
 ]
 
@@ -877,6 +879,7 @@ dependencies = [
  "eframe",
  "glam",
  "log",
+ "naga",
  "tokio",
  "wgpu",
  "wgpu-hal",

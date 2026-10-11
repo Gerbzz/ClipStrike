@@ -210,6 +210,8 @@ impl EditorSession {
                 old_end: clip.end,
                 new_start,
                 new_end,
+                original_clip: None,
+                trimmed_clip: None,
             }),
             &mut self.project,
             &mut self.timeline,

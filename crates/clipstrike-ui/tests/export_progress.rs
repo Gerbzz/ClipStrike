@@ -4,9 +4,9 @@ use clipstrike_ui::export::{ExportProgress, export_frame_count_for_duration_ms};
 
 #[test]
 fn export_frame_count_rounds_up_and_never_returns_zero() {
-    assert_eq!(export_frame_count_for_duration_ms(0, 33), 1);
-    assert_eq!(export_frame_count_for_duration_ms(1_000, 333), 4);
-    assert_eq!(export_frame_count_for_duration_ms(1_000, 40), 25);
+    assert_eq!(export_frame_count_for_duration_ms(0, 30, 1), 1);
+    assert_eq!(export_frame_count_for_duration_ms(1_000, 10, 3), 4);
+    assert_eq!(export_frame_count_for_duration_ms(1_000, 25, 1), 25);
 }
 
 #[test]

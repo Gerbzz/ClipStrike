@@ -626,6 +626,31 @@ impl Timeline {
         }
     }
 
+    /// Restore an edited clip without changing its timeline order.
+    pub fn replace_clip(&mut self, clip: Clip) -> Result<(), String> {
+        let pos = self.clips.iter().position(|current| current.id == clip.id)
+            .ok_or_else(|| "Clip not found".to_string())?;
+        let old = &self.clips[pos];
+        self.snap_engine.remove_edge(old.start);
+        self.snap_engine.remove_edge(old.end);
+        self.snap_engine.add_edge(clip.start);
+        self.snap_engine.add_edge(clip.end);
+        self.clips[pos] = clip;
+        self.rebuild_tree();
+        self.check_for_transitions();
+        Ok(())
+    }
+
+    /// Keep clip stacking order stable when an edit temporarily removes a clip.
+    pub fn move_clip_to_index(&mut self, id: usize, index: usize) -> Result<(), String> {
+        let pos = self.clips.iter().position(|clip| clip.id == id)
+            .ok_or_else(|| "Clip not found".to_string())?;
+        let clip = self.clips.remove(pos);
+        self.clips.insert(index.min(self.clips.len()), clip);
+        self.rebuild_tree();
+        Ok(())
+    }
+
     pub fn rebuild_tree(&mut self) {
         let mut new_tree = IntervalTree::new();
         for clip in &self.clips {
@@ -675,113 +700,31 @@ impl Timeline {
                 return Err("Split point outside clip bounds".into());
             }
 
-            // Remove original
-            self.remove_clip(id);
-
-            // Add part 1
             let split_source_at = clip.source_time_at(split_at);
-            self.add_clip(Clip {
-                id, // Keep original ID
-                asset_id: clip.asset_id,
-                track_id: clip.track_id,
-                blend_mode: BlendMode::Normal,
-                start: clip.start,
-                end: split_at,
-                in_point: clip.in_point,
-                out_point: split_source_at,
-                brightness: clip.brightness.clone(),
-                contrast: clip.contrast.clone(),
-                saturation: clip.saturation.clone(),
-                grayscale: clip.grayscale.clone(),
-                blur_radius: clip.blur_radius.clone(),
-                volume: clip.volume.clone(),
-                pos_x: clip.pos_x.clone(),
-                pos_y: clip.pos_y.clone(),
-                scale_x: clip.scale_x.clone(),
-                scale_y: clip.scale_y.clone(),
-                rotation: clip.rotation.clone(),
-                opacity: clip.opacity.clone(),
-                speed: clip.speed.clone(),
-                pixelate_size: clip.pixelate_size.clone(),
-                color_tint_r: clip.color_tint_r.clone(),
-                color_tint_g: clip.color_tint_g.clone(),
-                color_tint_b: clip.color_tint_b.clone(),
-                chroma_key_threshold: clip.chroma_key_threshold.clone(),
-                chroma_key_fuzziness: clip.chroma_key_fuzziness.clone(),
-                chroma_key_r: clip.chroma_key_r.clone(),
-                chroma_key_g: clip.chroma_key_g.clone(),
-                chroma_key_b: clip.chroma_key_b.clone(),
-                gamma: clip.gamma.clone(),
-                hue: clip.hue.clone(),
-                lut_enabled: clip.lut_enabled.clone(),
-                lut_path: clip.lut_path.clone(),
-                lut_size: clip.lut_size,
-                reverse: clip.reverse,
-                freeze_frame_ms: clip.freeze_frame_ms,
-                audio_enabled: clip.audio_enabled,
-                video_enabled: clip.video_enabled,
-                stabilization_enabled: clip.stabilization_enabled,
-                motion_tracking_enabled: clip.motion_tracking_enabled,
-                stabilization_strength: clip.stabilization_strength.clone(),
-                object_detection_enabled: clip.object_detection_enabled,
-                tracking_data: clip.tracking_data.clone(),
-                detections: clip.detections.clone(),
-                effects: clip.effects.clone(),
-                group_id: clip.group_id,
-                color_tag: clip.color_tag,
-            });
+            let mut left = clip.clone();
+            left.end = split_at;
+            let mut right = clip.clone();
+            right.id = loop {
+                let candidate = rand::random::<usize>();
+                if !self.clips.iter().any(|existing| existing.id == candidate) {
+                    break candidate;
+                }
+            };
+            let right_id = right.id;
+            right.start = split_at;
+            if clip.reverse {
+                left.in_point = split_source_at;
+                right.out_point = split_source_at;
+            } else {
+                left.out_point = split_source_at;
+                right.in_point = split_source_at;
+            }
 
-            // Add part 2
-            self.add_clip(Clip {
-                id: rand::random::<usize>(),
-                asset_id: clip.asset_id,
-                track_id: clip.track_id,
-                blend_mode: BlendMode::Normal,
-                start: split_at,
-                end: clip.end,
-                in_point: split_source_at,
-                out_point: clip.out_point,
-                brightness: clip.brightness.clone(),
-                contrast: clip.contrast.clone(),
-                saturation: clip.saturation.clone(),
-                grayscale: clip.grayscale.clone(),
-                blur_radius: clip.blur_radius.clone(),
-                volume: clip.volume.clone(),
-                pos_x: clip.pos_x.clone(),
-                pos_y: clip.pos_y.clone(),
-                scale_x: clip.scale_x.clone(),
-                scale_y: clip.scale_y.clone(),
-                rotation: clip.rotation.clone(),
-                opacity: clip.opacity.clone(),
-                speed: clip.speed.clone(),
-                pixelate_size: clip.pixelate_size.clone(),
-                gamma: clip.gamma.clone(),
-                hue: clip.hue.clone(),
-                color_tint_r: clip.color_tint_r.clone(),
-                color_tint_g: clip.color_tint_g.clone(),
-                color_tint_b: clip.color_tint_b.clone(),
-                chroma_key_threshold: clip.chroma_key_threshold.clone(),
-                chroma_key_fuzziness: clip.chroma_key_fuzziness.clone(),
-                chroma_key_r: clip.chroma_key_r.clone(),
-                chroma_key_g: clip.chroma_key_g.clone(),
-                chroma_key_b: clip.chroma_key_b.clone(),
-                lut_enabled: clip.lut_enabled.clone(),
-                lut_path: clip.lut_path.clone(),
-                lut_size: clip.lut_size,
-                reverse: clip.reverse,
-                freeze_frame_ms: clip.freeze_frame_ms,
-                audio_enabled: clip.audio_enabled,
-                video_enabled: clip.video_enabled,
-                stabilization_enabled: clip.stabilization_enabled,
-                motion_tracking_enabled: clip.motion_tracking_enabled,
-                stabilization_strength: clip.stabilization_strength.clone(),
-                object_detection_enabled: clip.object_detection_enabled,
-                tracking_data: clip.tracking_data.clone(),
-                detections: clip.detections.clone(),
-                effects: clip.effects.clone(),
-                group_id: clip.group_id,
-                color_tag: clip.color_tag,
-            });
+            self.remove_clip(id);
+            self.add_clip(left);
+            self.add_clip(right);
+            self.move_clip_to_index(id, pos)?;
+            self.move_clip_to_index(right_id, pos + 1)?;
 
             Ok(())
         } else {
@@ -798,21 +741,40 @@ impl Timeline {
         max_source_duration_ms: i64,
     ) -> Result<(), String> {
         if let Some(pos) = self.clips.iter().position(|c| c.id == id) {
-            let mut new_in_point =
-                self.clips[pos].in_point + self.clips[pos].integrated_source_offset(new_start);
-            let mut new_out_point =
-                self.clips[pos].in_point + self.clips[pos].integrated_source_offset(new_end);
-
-            // Clamp to source bounds
-            new_in_point = new_in_point.clamp(0, max_source_duration_ms);
-            new_out_point = new_out_point.clamp(new_in_point, max_source_duration_ms);
-
             let old_clip = self.clips[pos].clone();
+            let sanitized_start = new_start.max(0);
+            let sanitized_end = new_end.max(sanitized_start + 1);
+            // Edges outside the current clip extrapolate the boundary speed so an
+            // outward trim can reveal the source footage that was trimmed earlier.
+            let source_offset = |time_ms: i64| -> i64 {
+                if time_ms < old_clip.start {
+                    -((old_clip.start.saturating_sub(time_ms) as f64
+                        * old_clip.speed_multiplier_at(old_clip.start) as f64).round() as i64)
+                } else if time_ms > old_clip.end {
+                    old_clip.integrated_source_offset(old_clip.end).saturating_add(
+                        (time_ms.saturating_sub(old_clip.end) as f64
+                            * old_clip.speed_multiplier_at(old_clip.end) as f64).round() as i64,
+                    )
+                } else {
+                    old_clip.integrated_source_offset(time_ms)
+                }
+            };
+            let start_offset = source_offset(sanitized_start);
+            let end_offset = source_offset(sanitized_end);
+            let source_limit = max_source_duration_ms.max(0);
+            let (raw_in, raw_out) = if old_clip.reverse {
+                (old_clip.out_point.saturating_sub(end_offset),
+                 old_clip.out_point.saturating_sub(start_offset))
+            } else {
+                (old_clip.in_point.saturating_add(start_offset),
+                 old_clip.in_point.saturating_add(end_offset))
+            };
+            let new_in_point = raw_in.clamp(0, source_limit);
+            let new_out_point = raw_out.clamp(new_in_point, source_limit);
+
             self.snap_engine.remove_edge(old_clip.start);
             self.snap_engine.remove_edge(old_clip.end);
 
-            let sanitized_start = new_start.max(0);
-            let sanitized_end = new_end.max(sanitized_start + 1);
             self.clips[pos].start = sanitized_start;
             self.clips[pos].end = sanitized_end;
             self.clips[pos].in_point = new_in_point;
@@ -1234,6 +1196,29 @@ mod tests {
                 .find_closest_edge_excluding(0, 10, &[])
                 .is_none()
         );
+    }
+
+    #[test]
+    fn outward_trim_reveals_earlier_and_later_source_frames() {
+        let mut timeline = Timeline::new();
+        timeline.add_clip(Clip::new(1, 1, 1, 500, 1500, 700, 1700));
+        timeline.trim(1, 300, 1800, 3000).unwrap();
+        let clip = &timeline.clips[0];
+        assert_eq!((clip.start, clip.end), (300, 1800));
+        assert_eq!((clip.in_point, clip.out_point), (500, 2000));
+    }
+
+    #[test]
+    fn reverse_trim_updates_source_edges_in_reverse_order() {
+        let mut timeline = Timeline::new();
+        let mut clip = Clip::new(1, 1, 1, 500, 1500, 700, 1700);
+        clip.reverse = true;
+        timeline.add_clip(clip);
+        timeline.trim(1, 700, 1300, 3000).unwrap();
+        let clip = &timeline.clips[0];
+        assert_eq!((clip.in_point, clip.out_point), (900, 1500));
+        assert_eq!(clip.source_time_at(700), 1500);
+        assert_eq!(clip.source_time_at(1300), 900);
     }
 
     #[test]

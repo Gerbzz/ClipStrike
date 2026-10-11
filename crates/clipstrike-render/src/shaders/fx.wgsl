@@ -46,11 +46,28 @@ fn hsv_to_rgb(c: vec3<f32>) -> vec3<f32> {
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let dims = textureDimensions(t_in);
-    let transformed = uniforms.transform * vec4<f32>(vec2<f32>(global_id.xy), 0.0, 1.0);
-    var coords = vec2<i32>(round(transformed.xy));
+    let dims = textureDimensions(t_out);
+    let output_coords = vec2<i32>(global_id.xy);
+    if (output_coords.x >= i32(dims.x) || output_coords.y >= i32(dims.y)) {
+        return;
+    }
 
+    // The clip matrix maps source pixels to output pixels. Inverse sampling
+    // writes every output pixel, including transparent borders after a move.
+    let m = uniforms.transform;
+    let det = m[0][0] * m[1][1] - m[1][0] * m[0][1];
+    if (abs(det) < 0.000001) {
+        textureStore(t_out, output_coords, vec4<f32>(0.0));
+        return;
+    }
+    let p = vec2<f32>(output_coords) - vec2<f32>(m[3][0], m[3][1]);
+    let source = vec2<f32>(
+        (m[1][1] * p.x - m[1][0] * p.y) / det,
+        (m[0][0] * p.y - m[0][1] * p.x) / det
+    );
+    var coords = vec2<i32>(round(source));
     if (coords.x < 0 || coords.y < 0 || coords.x >= i32(dims.x) || coords.y >= i32(dims.y)) {
+        textureStore(t_out, output_coords, vec4<f32>(0.0));
         return;
     }
 
@@ -62,6 +79,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Task 10.9: Blur
     var color = vec3<f32>(0.0);
+    var source_alpha = 0.0;
     var total_weight = 0.0;
     let radius = i32(uniforms.blur_radius);
 
@@ -71,17 +89,22 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 let offset_coords = coords + vec2<i32>(i, j);
                 if (offset_coords.x >= 0 && offset_coords.x < i32(dims.x) && 
                     offset_coords.y >= 0 && offset_coords.y < i32(dims.y)) {
-                    color += textureLoad(t_in, offset_coords, 0).rgb;
+                    let sample = textureLoad(t_in, offset_coords, 0);
+                    color += sample.rgb;
+                    source_alpha += sample.a;
                     total_weight += 1.0;
                 }
             }
         }
         color /= total_weight;
+        source_alpha /= total_weight;
     } else {
-        color = textureLoad(t_in, coords, 0).rgb;
+        let sample = textureLoad(t_in, coords, 0);
+        color = sample.rgb;
+        source_alpha = sample.a;
     }
 
-    var final_alpha = uniforms.alpha;
+    var final_alpha = source_alpha * uniforms.alpha;
 
     // Task 10.6: Chroma Key
     if (uniforms.chroma_key_threshold > 0.0) {
@@ -124,5 +147,5 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     color = mix(color, vec3<f32>(l), uniforms.grayscale);
 
     // Apply alpha and write out
-    textureStore(t_out, coords, vec4<f32>(color, final_alpha));
+    textureStore(t_out, output_coords, vec4<f32>(color, final_alpha));
 }

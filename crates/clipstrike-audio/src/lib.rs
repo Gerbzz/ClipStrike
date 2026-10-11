@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::mpsc;
 
 pub mod waveform;
+pub mod offline;
 
 pub struct AudioBuffer {
     pub samples: Vec<f32>,

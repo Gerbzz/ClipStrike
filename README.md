@@ -2,7 +2,7 @@
 
 **A native Rust editing workbench for assembling CS2 footage.** ClipStrike brings media organization, a multitrack timeline, clip properties, and capture-package handoff into one desktop project. It is an active prototype for creators who want to turn recorded takes into an editable cut, with the project and media pipeline kept in separate crates.
 
-> **Development status:** The editor model, desktop UI, project save/recovery, and capture-package import have automated coverage. The GStreamer media backend is optional and disabled in the default build. Real playback, audible audio, and encoded export have not passed production acceptance.
+> **Development status:** The editor model, desktop UI, project save/recovery, capture-package import, and shared GUI/offscreen renderer have automated coverage. A saved-project software H.264/AAC export passed an offscreen test using synthetic media and independent decode checks. The GStreamer backend is optional and disabled in the default build. Native-window interaction, speaker playback, broader real-media output, and clean-machine packaging have not passed acceptance.
 
 ## The editing workflow
 
@@ -19,9 +19,9 @@ A capture-package importer is also included for externally prepared takes. It cr
 | --- | --- | --- |
 | Timeline and project | Multitrack clip model, editing commands, snapping, markers, keyframes, transitions, save/reopen, and recovery paths | Frame-exact editing at fractional frame rates is not established |
 | Desktop UI | First-party Rust application built with egui/eframe and wgpu-backed rendering components | Visible native-window review is still pending |
-| Media | GStreamer-based probing, playback, and export code behind a Cargo feature | Default builds disable the backend; real playback and encoded export with sound are unverified |
+| Media | GStreamer-based probing, playback, and export behind a Cargo feature; a shared renderer also drives saved-project offscreen export | Default builds disable the backend; the verified software export uses synthetic media, while native-window playback, speaker output, and broader real-media acceptance remain open |
 | Capture handoff | Package validation, import into a new project, provenance, offline detection, and relinking | Package metadata and stream probes do not prove audible sound or capture origin |
-| Development tests | Core, UI harness, and synthetic package tests | Native media smoke tests need a configured desktop/media environment; one import UI harness is ignored by default |
+| Development tests | Core, UI harness, synthetic package, software export, and embedded workspace lifecycle tests | Native media tests need the configured SDK and FFmpeg tools; visible UI and audible playback review remain open; one import UI harness is ignored by default |
 
 The code is organized as six Cargo crates: <code>clipstrike-core</code> owns project and timeline rules; <code>clipstrike-ui</code> owns the editor interface; <code>clipstrike-media</code> owns media operations; <code>clipstrike-render</code> owns GPU composition helpers; <code>clipstrike-audio</code> owns audio helpers; and <code>clipstrike-app</code> launches the desktop window. See [architecture](docs/ARCHITECTURE.md) for the deeper module layout.
 
@@ -33,7 +33,9 @@ The code is organized as six Cargo crates: <code>clipstrike-core</code> owns pro
 
 **Recovery keeps the edit intact.** Project writes use a temporary file and a previous-version backup; autosave and recovery checkpoints are represented in the app. Capture imports retain media hashes and path hints. If linked media is missing, moved, or changed, the editor can mark it offline and leave the project structure available for relinking.
 
-**Media is a separate integration layer.** The wgpu renderer and GStreamer integration live outside the timeline model. That separation lets core editing behavior be tested with synthetic assets, while actual playback, audio, and encoded output can be validated against real footage later. The optional GStreamer SDK is a native dependency, not bundled project code.
+**Media is a separate integration layer.** The wgpu renderer and GStreamer integration live outside the timeline model. The shared production frame renderer drives both GUI and offscreen paths; the saved-project offscreen path has produced an independently decoded software-encoded video with audio from synthetic inputs. If NVIDIA hardware H.264 cannot start, the export UI offers a manual software-encoding retry. Media callbacks guard seek generations before publishing frames, and remote URI diagnostics redact credentials. These checks do not establish native-window playback or quality across real footage. The optional GStreamer SDK is a native dependency, not bundled project code.
+
+**The editor can be hosted inside another Rust app.** The WGPU-only [embedded workspace API](docs/EMBEDDED_EDITOR_API.md) opens a saved project in a host eframe window and delegates editing, preview, and export to the same editor. Lifecycle tests cover repeated open/close, texture cleanup, return requests, and export cancellation. Integration in DemoStrike and native pointer interaction remain separate verification work.
 
 ## Build and run
 
@@ -69,9 +71,9 @@ Importing a package is a handoff, not a quality verdict. A package marked “str
 
 ## Current limits and direction
 
-ClipStrike is a source build and local prototype. There is no published installer or release in this repository. Clean-machine setup, visible desktop review, real media playback, export with audio, power-loss recovery, and broader format coverage still need acceptance work.
+ClipStrike is a source build and local prototype. There is no published installer or release in this repository. A saved synthetic project passed an offscreen software video-and-audio export and decode check. The native GStreamer test run still logged nonfatal segment-format assertions that need diagnosis. Clean-machine setup, visible desktop and audible playback review, power-loss recovery, repeated NVENC hardware encoding, and broader real-media/format coverage still need acceptance work.
 
-Planned work includes validating the full media path on actual captures, tightening frame timing and relinking behavior, improving editor interaction, and testing packaging on clean Windows machines. These are goals, not shipped features.
+Planned work includes validating the full media path on actual captures, tightening fractional-frame timing and relinking behavior, improving editor interaction, and testing packaging on clean Windows machines. These are goals, not shipped features.
 
 ## Development and contribution
 

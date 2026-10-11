@@ -1,5 +1,21 @@
+#[path = "ui/export_session.rs"]
+mod export_session;
+mod embedded_workspace;
+pub use embedded_workspace::{EditorHostResources, EmbeddedEditorWorkspace};
+
 use crate::app_config::{AppConfig, ProjectProfile, ThemePreference};
-use crate::export::{ExportProgress, export_frame_count_for_duration_ms};
+use crate::export::{ExportProgress, export_frame_count_for_duration_ms, export_frame_time_ms};
+use crate::frame_renderer::{FrameRenderer, RenderLayer};
+use clipstrike_audio::offline::OfflineMix;
+
+fn escape_svg_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
 use clipstrike_audio::waveform::extract_waveform_sync;
 use clipstrike_core::bridges::inkscape::InkscapeBridge;
 use clipstrike_core::clip_defaults::{clamp_trim_to_asset_bounds, timeline_clip_end_ms};
@@ -9,15 +25,18 @@ use clipstrike_core::commands::{
 };
 use clipstrike_media::engine_manager::EngineManager;
 use clipstrike_media::export::{ExportFormat, ExportSettings, Exporter};
+#[cfg(all(not(target_arch = "wasm32"), feature = "gstreamer-backend"))]
+use clipstrike_media::export::ExportPreset;
 use clipstrike_media::probe::probe_metadata_sync;
-use clipstrike_render::fx::{ComposeUniforms, CompositorPipeline, FxPipeline, FxUniforms};
+use clipstrike_render::fx::FxUniforms;
 use clipstrike_render::gpu::{
-    FrameSourceKind, FrameTexture, FrameUploadRequest, TexturePool, read_texture_rgba_into,
+    FrameSourceKind, FrameTexture, FrameUploadRequest, read_texture_rgba_into,
 };
 
 use clipstrike_core::effects::{DetectedObject, MotionTrack, TrackPoint};
 use clipstrike_core::keyframes::{DEFAULT_KEYFRAME_SNAP_MS, InterpolationMode, KeyframedProperty};
 use clipstrike_core::labels::{timeline_clip_label, timeline_clip_tooltip};
+use clipstrike_core::media_uri::{media_error, source_label};
 use clipstrike_core::playback::{advance_playhead, clip_eos_step};
 use clipstrike_core::project::{
     Marker, MarkerToggleResult, MediaAsset, Project, Track, TransitionMaskAsset,
@@ -69,27 +88,17 @@ pub struct ClipStrikeApp {
     undo_stack: UndoStack,
 
     // Engine & GPU Integration
-    device: Option<Arc<wgpu::Device>>,
-    queue: Option<Arc<wgpu::Queue>>,
+    frame_renderer: Option<FrameRenderer>,
     wgpu_render_state: Option<eframe::egui_wgpu::RenderState>,
     engine_manager: Option<EngineManager>,
     audio_engine: Option<clipstrike_audio::PlaybackEngine>,
-    fx_pipeline: Option<FxPipeline>,
-    compositor_pipeline: Option<CompositorPipeline>,
     video_cache: clipstrike_render::cache::VideoCache,
-    texture_pool: Option<TexturePool>,
     frame_upload_rx: Option<tokio::sync::mpsc::Receiver<FrameUploadRequest>>,
-    _fx_output_texture: Option<wgpu::Texture>,
-    fx_output_view: Option<wgpu::TextureView>,
     fx_output_id: Option<egui::TextureId>,
-    fx_sampler: OnceCell<wgpu::Sampler>,
-
-    // Compositor accumulators
-    _accumulator_texture: Option<wgpu::Texture>,
-    accumulator_view: Option<wgpu::TextureView>,
     accumulator_id: Option<egui::TextureId>,
-    _scratch_texture: Option<wgpu::Texture>,
-    scratch_view: Option<wgpu::TextureView>,
+    offscreen_export: bool,
+    embedded_workspace: bool,
+    return_to_host_requested: bool,
 
     // Playback & Selection state
     is_playing: bool,
@@ -131,10 +140,16 @@ pub struct ClipStrikeApp {
     track_name_buffer: String,
     save_frame_buffer: Vec<u8>,
     export_preset_index: usize,
+    export_hardware_override: Option<bool>,
     export_output_path: Option<PathBuf>,
     export_notification: Option<String>,
+    published_export_path: Option<PathBuf>,
     capture_warning: Option<String>,
     active_export: Option<ActiveExportJob>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pending_export_preparation: Option<PendingExportPreparation>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pending_export_finalization: Option<PendingExportFinalization>,
 
     // Test Hooks Bounding Boxes
     test_first_track_rect: Option<egui::Rect>,
@@ -145,6 +160,7 @@ pub struct ClipStrikeApp {
     test_media_picker_paths: Option<Vec<PathBuf>>,
     #[cfg(not(target_arch = "wasm32"))]
     title_svg_edit_sessions: HashMap<usize, TitleEditSession>,
+    title_edit_nonce: u64,
     was_playing_before_scrub: bool,
     last_track_content_origin_x: Option<f32>,
 }
@@ -172,16 +188,39 @@ enum TrimSide {
 
 struct ActiveExportJob {
     output_path: PathBuf,
+    staging_path: PathBuf,
+    project_snapshot: Project,
+    audio_mix: Option<OfflineMix>,
     exporter: Exporter,
     progress: ExportProgress,
     settings: ExportSettings,
     next_frame_ms: i64,
-    frame_duration_ms: i64,
+    next_frame_index: u64,
     pending_capture: bool,
     capture_ready: bool,
+    frame_wait_started_at: Instant,
     started_at: Instant,
     restore_playhead_ms: i64,
     restore_is_playing: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct PendingExportPreparation {
+    output_path: PathBuf,
+    settings: ExportSettings,
+    total_frames: u64,
+    project_snapshot: Project,
+    clips_snapshot: Vec<Clip>,
+    receiver: std::sync::mpsc::Receiver<Result<Option<OfflineMix>, String>>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct PendingExportFinalization {
+    output_path: PathBuf,
+    project_snapshot: Project,
+    receiver: std::sync::mpsc::Receiver<Result<crate::audio_export::PreparedExport, String>>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -373,175 +412,161 @@ fn shortcut_consumed(ctx: &egui::Context, spec: &str) -> bool {
 
 #[allow(dead_code)]
 impl ClipStrikeApp {
+    #[cfg(all(not(target_arch = "wasm32"), feature = "gstreamer-backend"))]
+    pub fn export_saved_project_offscreen(
+        project_path: &Path,
+        output_path: &Path,
+        settings: ExportSettings,
+    ) -> Result<(), String> {
+        Self::export_saved_project_offscreen_with_after_start(
+            project_path, output_path, settings, |_| {},
+        )
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "gstreamer-backend"))]
+    fn export_saved_project_offscreen_with_after_start(
+        project_path: &Path,
+        output_path: &Path,
+        settings: ExportSettings,
+        after_start: impl FnOnce(&mut Self),
+    ) -> Result<(), String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build().map_err(|error| format!("Could not create WGPU runtime: {error}"))?;
+        let instance = wgpu::Instance::default();
+        let adapter = runtime.block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            compatible_surface: None, ..Default::default()
+        })).ok_or_else(|| "No offscreen WGPU adapter is available".to_string())?;
+        let (device, queue) = runtime.block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor::default(), None,
+        )).map_err(|error| format!("Could not create offscreen WGPU device: {error}"))?;
+
+        let mut app = Self::test_harness(Project::new("Offscreen export", 1920, 1080, 30.0));
+        app.offscreen_export = true;
+        app.open_project_unchecked(project_path.to_path_buf())?;
+        app.frame_renderer = Some(FrameRenderer::new(Arc::new(device), Arc::new(queue), 1920, 1080));
+        let (frame_sender, frame_receiver) = tokio::sync::mpsc::channel(32);
+        app.frame_upload_rx = Some(frame_receiver);
+        app.engine_manager = Some(EngineManager::new(1920, 1080, Some(frame_sender), None));
+        app.app_config.export_presets = vec![ExportPreset {
+            name: "Offscreen export".into(), description: "Saved project integration export".into(),
+            settings,
+        }];
+        app.export_preset_index = 0;
+        app.export_output_path = Some(output_path.to_path_buf());
+        let context = egui::Context::default();
+        app.begin_export(&context)?;
+        after_start(&mut app);
+        let started = Instant::now();
+        loop {
+            app.process_export_preparation(&context);
+            app.process_active_export_seek(&context);
+            app.apply_pending_frame_uploads();
+            app.render_composited_preview();
+            app.process_active_export_capture(&context);
+            app.process_export_finalization(&context);
+            if app.pending_export_preparation.is_none()
+                && app.active_export.is_none()
+                && app.pending_export_finalization.is_none()
+            {
+                return if app.published_export_path.as_deref() == Some(output_path) { Ok(()) } else {
+                    Err(app.export_notification.take().unwrap_or_else(|| "Export finished without an output file".into()))
+                };
+            }
+            if started.elapsed() >= std::time::Duration::from_secs(120) {
+                app.request_active_export_cancel();
+                app.process_active_export_seek(&context);
+                app.process_export_finalization(&context);
+                return Err("Offscreen export timed out and was canceled".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let app_config = AppConfig::load_or_default();
+        Self::new_with_config(cc, AppConfig::load_or_default(), false)
+    }
+
+    fn new_with_config(
+        cc: &eframe::CreationContext<'_>,
+        app_config: AppConfig,
+        embedded_workspace: bool,
+    ) -> Self {
         let wgpu_render_state = cc.wgpu_render_state.clone();
+        Self::new_with_owned_render_state(
+            &cc.egui_ctx,
+            wgpu_render_state,
+            app_config,
+            embedded_workspace,
+        )
+    }
+
+    fn new_with_owned_render_state(
+        egui_ctx: &egui::Context,
+        wgpu_render_state: Option<eframe::egui_wgpu::RenderState>,
+        app_config: AppConfig,
+        embedded_workspace: bool,
+    ) -> Self {
 
         if let Some(state) = &wgpu_render_state {
             let info = state.adapter.get_info();
             log::info!("WGPU adapter: {} ({:?})", info.name, info.backend);
         }
 
-        let mut style = (*cc.egui_ctx.style()).clone();
-        style.visuals = match app_config.theme {
-            ThemePreference::Dark => egui::Visuals::dark(),
-            ThemePreference::Light => egui::Visuals::light(),
-        };
-        cc.egui_ctx.set_style(style);
-        if app_config.fullscreen {
-            cc.egui_ctx
-                .send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        if !embedded_workspace {
+            let mut style = (*egui_ctx.style()).clone();
+            style.visuals = match app_config.theme {
+                ThemePreference::Dark => egui::Visuals::dark(),
+                ThemePreference::Light => egui::Visuals::light(),
+            };
+            for font_id in style.text_styles.values_mut() {
+                font_id.size *= 1.15;
+            }
+            egui_ctx.set_style(style);
+            if app_config.fullscreen {
+                egui_ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+            }
         }
 
-        let (
-            device,
-            queue,
-            texture_pool,
-            frame_upload_rx,
-            _fx_output_texture,
-            fx_output_view,
-            fx_output_id,
-            fx_pipeline,
-            compositor_pipeline,
-            _accumulator_texture,
-            accumulator_view,
-            accumulator_id,
-            _scratch_texture,
-            scratch_view,
-            engine_manager,
-            audio_engine,
-        ) = if let Some(wgpu_render_state) = cc.wgpu_render_state.as_ref() {
-            let device = wgpu_render_state.device.clone();
-            let queue = wgpu_render_state.queue.clone();
-
-            let mut pool = TexturePool::new(
-                device.clone(),
-                wgpu::TextureFormat::Rgba8Unorm,
-                1920,
-                1080,
-                10,
-            );
-
-            {
-                let mut renderer = wgpu_render_state.renderer.write();
-                for frame in pool.get_frames_mut() {
-                    frame.egui_id = Some(renderer.register_native_texture(
-                        &device,
-                        frame.preview_view(),
-                        wgpu::FilterMode::Linear,
-                    ));
-                }
-            }
-
-            let fx_output_texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("FxPreviewTexture"),
-                size: wgpu::Extent3d {
-                    width: 1920,
-                    height: 1080,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::STORAGE_BINDING
-                    | wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-            let fx_output_view =
-                fx_output_texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let fx_output_id = {
-                let mut renderer = wgpu_render_state.renderer.write();
-                renderer.register_native_texture(&device, &fx_output_view, wgpu::FilterMode::Linear)
+        let (frame_renderer, frame_upload_rx, engine_manager, audio_engine, fx_output_id, accumulator_id) =
+            if let Some(wgpu_render_state) = wgpu_render_state.as_ref() {
+                let device = wgpu_render_state.device.clone();
+                let queue = wgpu_render_state.queue.clone();
+                let mut frame_renderer = FrameRenderer::new(device.clone(), queue, 1920, 1080);
+                let (fx_output_id, accumulator_id) = {
+                    let mut renderer = wgpu_render_state.renderer.write();
+                    for frame in frame_renderer.texture_pool.get_frames_mut() {
+                        frame.egui_id = Some(renderer.register_native_texture(
+                            &device, frame.preview_view(), wgpu::FilterMode::Linear,
+                        ));
+                    }
+                    let fx_id = renderer.register_native_texture(
+                        &device, &frame_renderer.fx_output_view, wgpu::FilterMode::Linear,
+                    );
+                    let accumulator_id = renderer.register_native_texture(
+                        &device, &frame_renderer.accumulator_view, wgpu::FilterMode::Linear,
+                    );
+                    (fx_id, accumulator_id)
+                };
+                let audio_engine = clipstrike_audio::PlaybackEngine::new().ok();
+                let (frame_upload_tx, frame_upload_rx) = tokio::sync::mpsc::channel(32);
+                #[cfg(not(target_arch = "wasm32"))]
+                let engine_manager = EngineManager::new(
+                    app_config.default_project_profile.width as i32,
+                    app_config.default_project_profile.height as i32,
+                    Some(frame_upload_tx),
+                    audio_engine.as_ref().map(|engine| engine.handle()),
+                );
+                #[cfg(target_arch = "wasm32")]
+                let engine_manager = EngineManager::new(
+                    app_config.default_project_profile.width as i32,
+                    app_config.default_project_profile.height as i32,
+                    audio_engine.as_ref().map(|engine| engine.handle()),
+                );
+                (Some(frame_renderer), Some(frame_upload_rx), Some(engine_manager),
+                    audio_engine, Some(fx_output_id), Some(accumulator_id))
+            } else {
+                (None, None, None, None, None, None)
             };
-
-            let accum_texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Compositor Accumulator"),
-                size: wgpu::Extent3d {
-                    width: 1920,
-                    height: 1080,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::STORAGE_BINDING
-                    | wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::COPY_DST
-                    | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-            let accum_view = accum_texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let accum_id = {
-                let mut renderer = wgpu_render_state.renderer.write();
-                renderer.register_native_texture(&device, &accum_view, wgpu::FilterMode::Linear)
-            };
-
-            let scratch_texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Compositor Scratch"),
-                size: wgpu::Extent3d {
-                    width: 1920,
-                    height: 1080,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::STORAGE_BINDING
-                    | wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_SRC
-                    | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            let scratch_view = scratch_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-            let fx_pipeline = FxPipeline::new(&device, &queue);
-            let compositor_pipeline = CompositorPipeline::new(&device);
-            let audio_engine = clipstrike_audio::PlaybackEngine::new().ok();
-            let (frame_upload_tx, frame_upload_rx) = tokio::sync::mpsc::channel(32);
-            #[cfg(not(target_arch = "wasm32"))]
-            let engine_manager = EngineManager::new(
-                app_config.default_project_profile.width as i32,
-                app_config.default_project_profile.height as i32,
-                Some(frame_upload_tx),
-                audio_engine.as_ref().map(|engine| engine.handle()),
-            );
-            #[cfg(target_arch = "wasm32")]
-            let engine_manager = EngineManager::new(
-                app_config.default_project_profile.width as i32,
-                app_config.default_project_profile.height as i32,
-                audio_engine.as_ref().map(|engine| engine.handle()),
-            );
-
-            (
-                Some(device),
-                Some(queue),
-                Some(pool),
-                Some(frame_upload_rx),
-                Some(fx_output_texture),
-                Some(fx_output_view),
-                Some(fx_output_id),
-                Some(fx_pipeline),
-                Some(compositor_pipeline),
-                Some(accum_texture),
-                Some(accum_view),
-                Some(accum_id),
-                Some(scratch_texture),
-                Some(scratch_view),
-                Some(engine_manager),
-                audio_engine,
-            )
-        } else {
-            (
-                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
-                None, None,
-            )
-        };
 
         let profile = app_config.default_project_profile.clone();
         let mut project = Project::new(
@@ -553,13 +578,6 @@ impl ClipStrikeApp {
         project.tracks = Project::default_tracks(5);
         let master_volume = project.master_volume;
 
-        // Improve readability by increasing default font size
-        let mut style = (*cc.egui_ctx.style()).clone();
-        for font_id in style.text_styles.values_mut() {
-            font_id.size *= 1.15; // 15% larger text everywhere
-        }
-        cc.egui_ctx.set_style(style);
-
         Self {
             left_panel_tab: LeftPanelTab::ProjectFiles,
             zoom_level: 0.5,
@@ -570,25 +588,17 @@ impl ClipStrikeApp {
             saved_snapshot: project,
             pending_project_replace: None,
             undo_stack: UndoStack::new(),
-            device,
-            queue,
+            frame_renderer,
             wgpu_render_state,
             engine_manager,
             audio_engine,
-            fx_pipeline,
-            compositor_pipeline,
             video_cache: clipstrike_render::cache::VideoCache::new(60),
-            texture_pool,
             frame_upload_rx,
-            _fx_output_texture,
-            fx_output_view,
             fx_output_id,
-            fx_sampler: OnceCell::new(),
-            _accumulator_texture,
-            accumulator_view,
             accumulator_id,
-            _scratch_texture,
-            scratch_view,
+            offscreen_export: false,
+            embedded_workspace,
+            return_to_host_requested: false,
             is_playing: false,
             current_time_ms: 0,
             playhead_ms: 0,
@@ -613,6 +623,7 @@ impl ClipStrikeApp {
             test_media_picker_paths: None,
             #[cfg(not(target_arch = "wasm32"))]
             title_svg_edit_sessions: HashMap::new(),
+            title_edit_nonce: rand::random::<u64>(),
             loop_enabled: false,
             loop_start_ms: 0,
             loop_end_ms: 10000,
@@ -626,10 +637,16 @@ impl ClipStrikeApp {
             track_name_buffer: String::new(),
             save_frame_buffer: Vec::new(),
             export_preset_index: 0,
+            export_hardware_override: None,
             export_output_path: None,
             export_notification: None,
+            published_export_path: None,
             capture_warning: None,
             active_export: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            pending_export_preparation: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            pending_export_finalization: None,
             show_title_editor: false,
             editing_title: None,
             was_playing_before_scrub: false,
@@ -652,25 +669,17 @@ impl ClipStrikeApp {
             saved_snapshot: project,
             pending_project_replace: None,
             undo_stack: UndoStack::new(),
-            device: None,
-            queue: None,
+            frame_renderer: None,
             wgpu_render_state: None,
             engine_manager: None,
             audio_engine: None,
-            fx_pipeline: None,
-            compositor_pipeline: None,
             video_cache: clipstrike_render::cache::VideoCache::new(60),
-            texture_pool: None,
             frame_upload_rx: None,
-            _fx_output_texture: None,
-            fx_output_view: None,
             fx_output_id: None,
-            fx_sampler: OnceCell::new(),
-            _accumulator_texture: None,
-            accumulator_view: None,
             accumulator_id: None,
-            _scratch_texture: None,
-            scratch_view: None,
+            offscreen_export: false,
+            embedded_workspace: false,
+            return_to_host_requested: false,
             is_playing: false,
             current_time_ms: 0,
             playhead_ms: 0,
@@ -702,10 +711,16 @@ impl ClipStrikeApp {
             track_name_buffer: String::new(),
             save_frame_buffer: Vec::new(),
             export_preset_index: 0,
+            export_hardware_override: None,
             export_output_path: None,
             export_notification: None,
+            published_export_path: None,
             capture_warning: None,
             active_export: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            pending_export_preparation: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            pending_export_finalization: None,
             test_first_track_rect: None,
             test_first_asset_rect: None,
             test_first_clip_rect: None,
@@ -714,6 +729,7 @@ impl ClipStrikeApp {
             test_media_picker_paths: None,
             #[cfg(not(target_arch = "wasm32"))]
             title_svg_edit_sessions: HashMap::new(),
+            title_edit_nonce: rand::random::<u64>(),
             was_playing_before_scrub: false,
             last_track_content_origin_x: None,
         }
@@ -830,24 +846,7 @@ impl ClipStrikeApp {
             .ok_or_else(|| format!("Title {title_id} not found"))?;
 
         #[cfg(not(target_arch = "wasm32"))]
-        let uri = {
-            let svg_path = Self::title_svg_temp_path(title.id);
-            if let Some(parent) = svg_path.parent() {
-                std::fs::create_dir_all(parent).map_err(|err| {
-                    format!(
-                        "Failed to create title asset directory {}: {err}",
-                        parent.display()
-                    )
-                })?;
-            }
-            std::fs::write(&svg_path, &title.svg_content).map_err(|err| {
-                format!(
-                    "Failed to write title asset SVG {}: {err}",
-                    svg_path.display()
-                )
-            })?;
-            Self::file_uri_from_path(&svg_path)?
-        };
+        let uri = Self::materialize_title_svg(&title)?;
 
         #[cfg(target_arch = "wasm32")]
         let uri = {
@@ -966,7 +965,7 @@ impl ClipStrikeApp {
         ));
         let fill = egui::Color32::from_rgba_premultiplied(accent.r(), accent.g(), accent.b(), 110);
         let stroke = egui::Stroke::new(
-            1.0,
+            1.0_f32,
             egui::Color32::from_rgba_premultiplied(accent.r(), accent.g(), accent.b(), 210),
         );
         let text_color = ctx.style().visuals.text_color();
@@ -1249,8 +1248,17 @@ impl ClipStrikeApp {
     }
 
     fn persist_app_config(&self) {
+        if self.offscreen_export || self.embedded_workspace { return; }
         if let Err(err) = self.app_config.save() {
             log::error!("Failed to save app config: {}", err);
+        }
+    }
+
+    fn handle_quit_action(&mut self, ctx: &egui::Context) {
+        if self.embedded_workspace {
+            self.return_to_host_requested = true;
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -1265,11 +1273,47 @@ impl ClipStrikeApp {
         project
     }
 
+    fn export_snapshot_matches(&self, snapshot: &Project) -> bool {
+        let current = &self.project;
+        current.name == snapshot.name
+            && current.width == snapshot.width
+            && current.height == snapshot.height
+            && current.framerate == snapshot.framerate
+            && current.master_volume == snapshot.master_volume
+            && current.tracks == snapshot.tracks
+            && current.assets == snapshot.assets
+            && current.capture_sources == snapshot.capture_sources
+            && current.titles == snapshot.titles
+            && current.generators == snapshot.generators
+            && current.transition_masks == snapshot.transition_masks
+            && self.timeline.clips == snapshot.clips
+            && self.timeline.transitions == snapshot.transitions
+            && current.markers == snapshot.markers
+            && current.watermark_asset_id == snapshot.watermark_asset_id
+            && current.watermark_opacity == snapshot.watermark_opacity
+            && current.watermark_scale == snapshot.watermark_scale
+            && current.watermark_pos_x == snapshot.watermark_pos_x
+            && current.watermark_pos_y == snapshot.watermark_pos_y
+    }
+
     fn has_unsaved_changes(&self) -> bool {
         self.snapshot_project() != self.saved_snapshot
     }
 
     fn reset_runtime_state(&mut self, project: Project, path: Option<PathBuf>) {
+        if let Some(job) = &mut self.active_export {
+            job.progress.request_cancel();
+        }
+        self.title_svg_edit_sessions.clear();
+        self.title_edit_nonce = rand::random::<u64>();
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(pending) = self.pending_export_preparation.take() {
+            pending.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(pending) = self.pending_export_finalization.take() {
+            pending.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         self.timeline = project.to_timeline();
         self.project = project;
         self.current_project_path = path;
@@ -1316,8 +1360,9 @@ impl ClipStrikeApp {
     }
 
     fn open_project_unchecked(&mut self, path: PathBuf) -> Result<(), String> {
-        let (project, warnings) = Project::load_with_capture_warnings(&path)
+        let (mut project, warnings) = Project::load_with_capture_warnings(&path)
             .map_err(|err| err.to_string())?;
+        Self::regenerate_title_assets(&mut project)?;
         self.reset_runtime_state(project, Some(path.clone()));
         if let Some(first) = warnings.first() {
             self.capture_warning = Some(if warnings.len() == 1 { first.clone() }
@@ -1339,19 +1384,36 @@ impl ClipStrikeApp {
         }
     }
 
+    fn save_and_apply_pending_project(&mut self) -> Result<(), String> {
+        self.save_project()?;
+        // Save As returns Ok when its picker is canceled. Keep the pending
+        // replacement and current edit in that case.
+        if self.has_unsaved_changes() {
+            return Ok(());
+        }
+        self.discard_and_apply_pending_project()
+    }
+
     fn draw_pending_project_replace(&mut self, ctx: &egui::Context) {
         if self.pending_project_replace.is_none() { return; }
+        let mut save_and_continue = false;
         let mut discard = false;
         let mut cancel = false;
         egui::Window::new("Unsaved project changes")
             .collapsible(false).resizable(false).show(ctx, |ui| {
                 ui.label("Save the current project before replacing it, or discard these edits.");
                 ui.horizontal(|ui| {
+                    save_and_continue = ui.button("Save and continue").clicked();
                     discard = ui.button("Discard edits and continue").clicked();
                     cancel = ui.button("Cancel").clicked();
                 });
             });
         if cancel { self.pending_project_replace = None; }
+        if save_and_continue {
+            if let Err(error) = self.save_and_apply_pending_project() {
+                self.export_notification = Some(format!("Could not save and open project: {error}"));
+            }
+        }
         if discard {
             if let Err(error) = self.discard_and_apply_pending_project() {
                 self.export_notification = Some(format!("Could not open project: {error}"));
@@ -1430,8 +1492,9 @@ impl ClipStrikeApp {
     }
 
     fn restore_recovery_unchecked(&mut self, path: &Path) -> Result<(), String> {
-        let (project, warnings) = Project::load_with_capture_warnings(&path)
+        let (mut project, warnings) = Project::load_with_capture_warnings(&path)
             .map_err(|err| err.to_string())?;
+        Self::regenerate_title_assets(&mut project)?;
         let saved_snapshot = self.saved_snapshot.clone();
         self.reset_runtime_state(project, self.current_project_path.clone());
         self.saved_snapshot = saved_snapshot;
@@ -1455,7 +1518,13 @@ impl ClipStrikeApp {
     }
 
     fn draw_export_dialog(&mut self, ctx: &egui::Context) {
-        let exporting = self.active_export.is_some();
+        let exporting = self.active_export.is_some()
+            || {
+                #[cfg(not(target_arch = "wasm32"))]
+                { self.pending_export_preparation.is_some() || self.pending_export_finalization.is_some() }
+                #[cfg(target_arch = "wasm32")]
+                { false }
+            };
         if !self.show_export_dialog && !exporting {
             return;
         }
@@ -1481,6 +1550,15 @@ impl ClipStrikeApp {
             .default_width(420.0)
             .show(ctx, |ui| {
                 if exporting {
+                    ui.small("Editing the project during export cancels this render.");
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if self.pending_export_preparation.is_some() {
+                        ui.label("Preparing soundtrack and checking media…");
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if self.pending_export_finalization.is_some() {
+                        ui.label("Verifying encoded video and publishing export…");
+                    }
                     if let Some(job) = &self.active_export {
                         ui.label(format!("Exporting to {}", job.output_path.display()));
                         ui.label(format!(
@@ -1554,6 +1632,22 @@ impl ClipStrikeApp {
                             preset.settings.bitrate_kbps,
                         ));
                     }
+                    if self.export_settings_for_selected_preset().codec
+                        == clipstrike_media::export::VideoCodec::H264
+                    {
+                        let mut use_hardware = self
+                            .export_settings_for_selected_preset()
+                            .use_hardware_acceleration;
+                        if ui
+                            .checkbox(&mut use_hardware, "Hardware H.264 encoding")
+                            .changed()
+                        {
+                            self.export_hardware_override = Some(use_hardware);
+                        }
+                        if !use_hardware {
+                            ui.small("Software H.264 encoding; use this if the hardware encoder cannot start.");
+                        }
+                    }
 
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -1598,7 +1692,10 @@ impl ClipStrikeApp {
         }
         if request_start {
             if let Err(err) = self.begin_export(ctx) {
-                self.export_notification = Some(format!("Export failed: {err}"));
+                self.export_notification = Some(format!(
+                    "Export failed: {}",
+                    Self::export_failure_message(&err)
+                ));
                 log::error!("Failed to start export: {}", err);
             }
         }
@@ -1606,7 +1703,7 @@ impl ClipStrikeApp {
             self.request_active_export_cancel();
         }
 
-        self.show_export_dialog = open && !self.active_export.is_some();
+        self.show_export_dialog = open && !exporting;
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1638,7 +1735,7 @@ impl ClipStrikeApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn pick_media_files(&mut self) -> Option<Vec<PathBuf>> {
-        #[cfg(test)]
+        // Integration harnesses compile the library without cfg(test).
         if let Some(paths) = self.test_media_picker_paths.take() {
             return Some(paths);
         }
@@ -1716,8 +1813,114 @@ impl ClipStrikeApp {
         None
     }
 
-    fn title_svg_temp_path(title_id: usize) -> PathBuf {
-        std::env::temp_dir().join(format!("title_{}.svg", title_id))
+    fn title_svg_temp_path(&self, title_id: usize) -> PathBuf {
+        std::env::temp_dir().join("clipstrike-title-edits")
+            .join(format!("{}-{}", std::process::id(), self.title_edit_nonce))
+            .join(format!("title_{}.svg", title_id))
+    }
+
+    fn title_svg_asset_path(title: &clipstrike_core::project::TitleAsset) -> PathBuf {
+        // Stable content identity prevents two projects with the same title ID
+        // from ever rewriting one another's rendered SVG.
+        let hash = title.svg_content.as_bytes().iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ *byte as u64).wrapping_mul(0x100000001b3)
+        });
+        std::env::temp_dir().join("clipstrike-title-assets")
+            .join(format!("title_{}_{hash:016x}.svg", title.id))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn materialize_title_svg(title: &clipstrike_core::project::TitleAsset) -> Result<String, String> {
+        let path = Self::title_svg_asset_path(title);
+        std::fs::create_dir_all(path.parent().unwrap())
+            .map_err(|error| format!("Could not create title cache directory: {error}"))?;
+        if path.exists() {
+            let existing = std::fs::read_to_string(&path)
+                .map_err(|error| format!("Could not read title SVG {}: {error}", path.display()))?;
+            if existing != title.svg_content {
+                return Err(format!("Title SVG content collision at {}", path.display()));
+            }
+            return Self::file_uri_from_path(&path);
+        }
+        let partial = path.with_extension(format!("svg.{}-{}.partial", std::process::id(), rand::random::<u64>()));
+        std::fs::write(&partial, &title.svg_content)
+            .map_err(|error| format!("Could not stage title SVG {}: {error}", partial.display()))?;
+        let renamed = std::fs::rename(&partial, &path);
+        let _ = std::fs::remove_file(&partial);
+        if let Err(error) = renamed {
+            if !path.exists() { return Err(format!("Could not publish title SVG {}: {error}", path.display())); }
+            let existing = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
+            if existing != title.svg_content { return Err(format!("Title SVG content collision at {}", path.display())); }
+        }
+        Self::file_uri_from_path(&path)
+    }
+
+    fn title_asset_matches(asset: &MediaAsset, title_id: usize) -> bool {
+        let legacy = format!("title_{title_id}.svg");
+        let prefix = format!("title_{title_id}_");
+        let path = url::Url::parse(&asset.uri).ok()
+            .and_then(|uri| uri.to_file_path().ok())
+            .unwrap_or_else(|| PathBuf::from(&asset.uri));
+        path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+            name == legacy || (name.starts_with(&prefix) && name.ends_with(".svg"))
+        })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn regenerate_title_assets(project: &mut Project) -> Result<(), String> {
+        for title in &project.titles {
+            if !project.assets.iter().any(|asset| Self::title_asset_matches(asset, title.id)) {
+                continue;
+            }
+            let uri = Self::materialize_title_svg(title)?;
+            for asset in &mut project.assets {
+                if Self::title_asset_matches(asset, title.id) {
+                    asset.uri = uri.clone();
+                    asset.name = title.name.clone();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn regenerate_title_assets(_project: &mut Project) -> Result<(), String> { Ok(()) }
+
+    fn apply_title_edit(&mut self, title: clipstrike_core::project::TitleAsset) -> Result<(), String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let uri = Self::materialize_title_svg(&title)?;
+        #[cfg(target_arch = "wasm32")]
+        let uri = {
+            use base64::{Engine as _, engine::general_purpose};
+            format!("data:image/svg+xml;base64,{}", general_purpose::STANDARD.encode(&title.svg_content))
+        };
+        let old_uri = self.project.titles.iter().find(|item| item.id == title.id)
+            .map(|old| {
+                use base64::{Engine as _, engine::general_purpose};
+                format!("data:image/svg+xml;base64,{}", general_purpose::STANDARD.encode(&old.svg_content))
+            });
+        let mut affected_assets = Vec::new();
+        for asset in &mut self.project.assets {
+            if Self::title_asset_matches(asset, title.id)
+                || old_uri.as_ref().is_some_and(|old| asset.uri == *old) {
+                affected_assets.push(asset.id);
+                asset.uri = uri.clone();
+                asset.name = title.name.clone();
+            }
+        }
+        if let Some(existing) = self.project.titles.iter_mut().find(|item| item.id == title.id) {
+            *existing = title;
+        } else {
+            self.project.titles.push(title);
+        }
+        let affected_clips = self.timeline.clips.iter()
+            .filter(|clip| affected_assets.contains(&clip.asset_id))
+            .map(|clip| clip.id).collect::<Vec<_>>();
+        if let Some(manager) = &mut self.engine_manager {
+            for clip_id in affected_clips { let _ = manager.remove_clip_engine(clip_id); }
+        }
+        self.video_cache.clear();
+        Ok(())
     }
 
     fn refresh_title_svg_from_path(
@@ -1727,15 +1930,14 @@ impl ClipStrikeApp {
     ) -> Result<Vec<usize>, String> {
         let svg_content = std::fs::read_to_string(svg_path)
             .map_err(|err| format!("Failed to read edited SVG {}: {err}", svg_path.display()))?;
-        let title = self
+        let mut title = self
             .project
             .titles
-            .iter_mut()
+            .iter()
             .find(|candidate| candidate.id == title_id)
+            .cloned()
             .ok_or_else(|| format!("Title {title_id} not found"))?;
         title.svg_content = svg_content;
-
-        let svg_uri = Self::file_uri_from_path(svg_path)?;
         let affected_clip_ids = self
             .timeline
             .clips
@@ -1744,11 +1946,11 @@ impl ClipStrikeApp {
                 self.project
                     .assets
                     .iter()
-                    .any(|asset| asset.id == clip.asset_id && asset.uri == svg_uri)
+                    .any(|asset| asset.id == clip.asset_id && Self::title_asset_matches(asset, title_id))
             })
             .map(|clip| clip.id)
             .collect();
-
+        self.apply_title_edit(title)?;
         Ok(affected_clip_ids)
     }
 
@@ -1767,7 +1969,7 @@ impl ClipStrikeApp {
         self.title_svg_edit_sessions.insert(
             title_id,
             TitleEditSession {
-                svg_path: Self::title_svg_temp_path(title_id),
+                svg_path: self.title_svg_temp_path(title_id),
                 watcher,
                 events: rx,
             },
@@ -1790,7 +1992,7 @@ impl ClipStrikeApp {
             return Err("Configure an Inkscape executable path in Preferences first".to_string());
         }
 
-        let svg_path = Self::title_svg_temp_path(title_id);
+        let svg_path = self.title_svg_temp_path(title_id);
         let existing_session = self.title_svg_edit_sessions.contains_key(&title_id);
         if let Some(parent) = svg_path.parent() {
             std::fs::create_dir_all(parent).map_err(|err| {
@@ -1857,6 +2059,7 @@ impl ClipStrikeApp {
                             let _ = engine_manager.remove_clip_engine(clip_id);
                         }
                     }
+                    self.video_cache.clear();
                 }
                 Err(err) => log::warn!(
                     "Failed to refresh title SVG {}: {}",
@@ -1894,9 +2097,9 @@ impl ClipStrikeApp {
                 .unwrap_or(0),
             Err(err) => {
                 if suppress_import_warnings {
-                    log::debug!("Failed to probe media metadata for {}: {}", uri, err);
+                    log::debug!("{}", media_error(&uri, "Failed to probe media metadata", &err));
                 } else {
-                    log::warn!("Failed to probe media metadata for {}: {}", uri, err);
+                    log::warn!("{}", media_error(&uri, "Failed to probe media metadata", &err));
                 }
                 0
             }
@@ -1905,9 +2108,9 @@ impl ClipStrikeApp {
             Ok(levels) => levels,
             Err(err) => {
                 if suppress_import_warnings {
-                    log::debug!("Failed to extract waveform for {}: {}", uri, err);
+                    log::debug!("{}", media_error(&uri, "Failed to extract waveform", &err));
                 } else {
-                    log::warn!("Failed to extract waveform for {}: {}", uri, err);
+                    log::warn!("{}", media_error(&uri, "Failed to extract waveform", &err));
                 }
                 Vec::new()
             }
@@ -2090,12 +2293,6 @@ impl ClipStrikeApp {
         (!samples.is_empty()).then_some(samples)
     }
 
-    fn fx_sampler(&self, device: &wgpu::Device) -> &wgpu::Sampler {
-        Self::cached_value(&self.fx_sampler, || {
-            device.create_sampler(&wgpu::SamplerDescriptor::default())
-        })
-    }
-
     fn preview_texture_source_kind(frame: &FrameTexture) -> FrameSourceKind {
         clipstrike_render::gpu::frame_source_kind(
             frame.external_texture_id,
@@ -2223,16 +2420,8 @@ impl ClipStrikeApp {
         if Self::preview_texture_should_bypass_fx(clip, self.playhead_ms, source_kind) {
             return Some(texture_id);
         }
-        let (device, queue, fx_pipeline, fx_output_view, fx_output_id) = match (
-            &self.device,
-            &self.queue,
-            &self.fx_pipeline,
-            &self.fx_output_view,
-            &self.fx_output_id,
-        ) {
-            (Some(d), Some(q), Some(fp), Some(fov), Some(fid)) => (d, q, fp, fov, fid),
-            _ => return Some(texture_id), // Fallback to raw texture if no GPU fx
-        };
+        let (Some(renderer), Some(fx_output_id)) = (&self.frame_renderer, &self.fx_output_id)
+            else { return Some(texture_id); };
 
         let params = FxUniforms {
             brightness: clip.brightness.get_value_at(self.playhead_ms),
@@ -2251,14 +2440,13 @@ impl ClipStrikeApp {
             ..Default::default()
         };
 
-        let fx_sampler = self.fx_sampler(device);
-        fx_pipeline.run(
-            device,
-            queue,
+        renderer.fx_pipeline.run(
+            &renderer.device,
+            &renderer.queue,
             frame.preview_view(),
-            fx_output_view,
+            &renderer.fx_output_view,
             None,
-            fx_sampler,
+            &renderer.sampler,
             params,
         );
         Some(*fx_output_id)
@@ -2387,22 +2575,9 @@ impl ClipStrikeApp {
     }
 
     fn save_current_frame_to_path(&mut self, path: &std::path::Path) -> Result<(), String> {
-        let texture_pool = self
-            .texture_pool
-            .as_ref()
+        let renderer = self.frame_renderer.as_ref()
             .ok_or_else(|| "WGPU state missing".to_string())?;
-        let queue = self
-            .queue
-            .as_ref()
-            .ok_or_else(|| "WGPU state missing".to_string())?;
-        let device = self
-            .device
-            .as_ref()
-            .ok_or_else(|| "WGPU state missing".to_string())?;
-        let fx_output_texture = self
-            ._fx_output_texture
-            .as_ref()
-            .ok_or_else(|| "WGPU state missing".to_string())?;
+        let texture_pool = &renderer.texture_pool;
 
         let (frame_index, width, height) = {
             let frame = texture_pool
@@ -2416,9 +2591,9 @@ impl ClipStrikeApp {
         self.save_frame_buffer.clear();
         if self.selected_clip_id.is_some() {
             read_texture_rgba_into(
-                device,
-                queue,
-                fx_output_texture,
+                &renderer.device,
+                &renderer.queue,
+                &renderer.fx_output_texture,
                 width,
                 height,
                 &mut self.save_frame_buffer,
@@ -2430,8 +2605,8 @@ impl ClipStrikeApp {
                 .find(|texture| texture.ready && texture.index == frame_index)
                 .ok_or_else(|| "No frame available to export".to_string())?;
             read_texture_rgba_into(
-                device,
-                queue,
+                &renderer.device,
+                &renderer.queue,
                 &frame.texture,
                 width,
                 height,
@@ -2490,247 +2665,6 @@ impl ClipStrikeApp {
     fn pick_export_save_path(&self, _settings: &ExportSettings) -> Option<PathBuf> {
         log::warn!("Export dialog is not available on web builds.");
         None
-    }
-
-    fn capture_composited_preview_rgba_buffer(&mut self) -> Result<(u32, u32), String> {
-        let texture_pool = self
-            .texture_pool
-            .as_ref()
-            .ok_or_else(|| "WGPU state missing".to_string())?;
-        let queue = self
-            .queue
-            .as_ref()
-            .ok_or_else(|| "WGPU state missing".to_string())?;
-        let device = self
-            .device
-            .as_ref()
-            .ok_or_else(|| "WGPU state missing".to_string())?;
-        let accumulator_texture = self
-            ._accumulator_texture
-            .as_ref()
-            .ok_or_else(|| "WGPU state missing".to_string())?;
-
-        let width = texture_pool.width;
-        let height = texture_pool.height;
-        self.save_frame_buffer.clear();
-        read_texture_rgba_into(
-            device,
-            queue,
-            accumulator_texture,
-            width,
-            height,
-            &mut self.save_frame_buffer,
-        )?;
-        Ok((width, height))
-    }
-
-    fn resize_rgba_buffer(
-        pixels: &[u8],
-        source_width: u32,
-        source_height: u32,
-        target_width: u32,
-        target_height: u32,
-    ) -> Result<Vec<u8>, String> {
-        if source_width == target_width && source_height == target_height {
-            return Ok(pixels.to_vec());
-        }
-
-        let source_image = image::RgbaImage::from_raw(source_width, source_height, pixels.to_vec())
-            .ok_or_else(|| "Failed to build export image buffer".to_string())?;
-        Ok(image::imageops::resize(
-            &source_image,
-            target_width,
-            target_height,
-            image::imageops::FilterType::Triangle,
-        )
-        .into_raw())
-    }
-
-    fn export_settings_for_selected_preset(&self) -> ExportSettings {
-        self.app_config
-            .export_presets
-            .get(self.export_preset_index)
-            .map(|preset| preset.settings.clone())
-            .unwrap_or_default()
-    }
-
-    fn export_destination_directory(&self) -> Option<PathBuf> {
-        self.export_output_path
-            .as_ref()
-            .and_then(|path| path.parent().map(Path::to_path_buf))
-            .or_else(|| self.app_config.last_export_directory.clone())
-    }
-
-    fn remember_export_directory(&mut self, path: &Path) {
-        if let Some(parent) = path.parent() {
-            self.app_config.last_export_directory = Some(parent.to_path_buf());
-            self.persist_app_config();
-        }
-    }
-
-    fn begin_export(&mut self, ctx: &egui::Context) -> Result<(), String> {
-        if self.active_export.is_some() {
-            return Err("An export is already running".to_string());
-        }
-
-        let settings = self.export_settings_for_selected_preset();
-        let output_path = if let Some(path) = self.export_output_path.clone() {
-            path
-        } else {
-            self.pick_export_save_path(&settings)
-                .ok_or_else(|| "Export cancelled before selecting an output file".to_string())?
-        };
-        self.export_output_path = Some(output_path.clone());
-        self.remember_export_directory(&output_path);
-
-        let frame_duration_ms = ((1000.0 * settings.fps_den.max(1) as f64)
-            / settings.fps_num.max(1) as f64)
-            .round()
-            .max(1.0) as i64;
-        let total_frames =
-            export_frame_count_for_duration_ms(self.timeline_end_ms(), frame_duration_ms);
-        let exporter = Exporter::new(&output_path, &settings)?;
-        exporter.start()?;
-
-        let restore_playhead_ms = self.playhead_ms;
-        let restore_is_playing = self.is_playing;
-        self.set_playing_state(false);
-        self.playhead_ms = 0;
-        self.seek_playhead();
-
-        self.active_export = Some(ActiveExportJob {
-            output_path,
-            exporter,
-            progress: ExportProgress::new(total_frames),
-            settings,
-            next_frame_ms: 0,
-            frame_duration_ms,
-            pending_capture: false,
-            capture_ready: false,
-            started_at: Instant::now(),
-            restore_playhead_ms,
-            restore_is_playing,
-        });
-        self.export_notification = Some("Export started".to_string());
-        self.show_export_dialog = false;
-        ctx.request_repaint();
-        Ok(())
-    }
-
-    fn request_active_export_cancel(&mut self) {
-        if let Some(job) = &mut self.active_export {
-            job.progress.request_cancel();
-            self.export_notification = Some("Export cancel requested".to_string());
-        }
-    }
-
-    fn restore_after_export(&mut self, restore_playhead_ms: i64, restore_is_playing: bool) {
-        self.playhead_ms = restore_playhead_ms;
-        self.seek_playhead();
-        self.set_playing_state(restore_is_playing);
-    }
-
-    fn finalize_export_job(&mut self, job: ActiveExportJob, outcome: Result<(), String>) {
-        let _ = job.exporter.stop();
-        let restore_playhead_ms = job.restore_playhead_ms;
-        let restore_is_playing = job.restore_is_playing;
-        let output_path = job.output_path.clone();
-        self.active_export = None;
-        self.show_export_dialog = false;
-        self.restore_after_export(restore_playhead_ms, restore_is_playing);
-
-        match outcome {
-            Ok(()) => {
-                self.export_notification =
-                    Some(format!("Export complete: {}", output_path.display()));
-            }
-            Err(err) => {
-                let _ = std::fs::remove_file(&output_path);
-                self.export_notification = Some(format!("Export failed: {err}"));
-            }
-        }
-    }
-
-    fn process_active_export_seek(&mut self, ctx: &egui::Context) {
-        let timeline_end_ms = self.timeline_end_ms();
-        let mut next_seek_ms = None;
-        let mut cancel_requested = false;
-        if let Some(job) = &mut self.active_export {
-            cancel_requested = job.progress.cancel_requested();
-            if !job.pending_capture {
-                next_seek_ms = Some(job.next_frame_ms.min(timeline_end_ms));
-                job.pending_capture = true;
-                job.capture_ready = false;
-            }
-        }
-
-        if cancel_requested {
-            let job = self.active_export.take().expect("export job should exist");
-            self.finalize_export_job(job, Err("Export canceled".to_string()));
-            return;
-        }
-
-        if let Some(next_seek_ms) = next_seek_ms {
-            self.playhead_ms = next_seek_ms;
-            self.seek_playhead();
-            ctx.request_repaint();
-        }
-    }
-
-    fn process_active_export_capture(&mut self, ctx: &egui::Context) {
-        let Some(mut job) = self.active_export.take() else {
-            return;
-        };
-
-        if job.progress.cancel_requested() {
-            self.finalize_export_job(job, Err("Export canceled".to_string()));
-            return;
-        }
-
-        if !job.pending_capture {
-            self.active_export = Some(job);
-            return;
-        }
-
-        if !job.capture_ready {
-            job.capture_ready = true;
-            self.active_export = Some(job);
-            ctx.request_repaint();
-            return;
-        }
-
-        let capture_result = (|| {
-            let (source_width, source_height) = self.capture_composited_preview_rgba_buffer()?;
-            let export_pixels = Self::resize_rgba_buffer(
-                &self.save_frame_buffer,
-                source_width,
-                source_height,
-                job.settings.width,
-                job.settings.height,
-            )?;
-            job.exporter.push_frame(&export_pixels)?;
-            job.progress.mark_frame_complete();
-            job.pending_capture = false;
-            job.capture_ready = false;
-            job.next_frame_ms = job.next_frame_ms.saturating_add(job.frame_duration_ms);
-            Ok(())
-        })();
-
-        if let Err(err) = capture_result {
-            self.finalize_export_job(job, Err(err));
-            return;
-        }
-
-        if job.progress.is_finished() {
-            let finalize_result = (|| {
-                job.exporter.end_of_stream()?;
-                Ok(())
-            })();
-            self.finalize_export_job(job, finalize_result);
-        } else {
-            self.active_export = Some(job);
-            ctx.request_repaint();
-        }
     }
 
     fn draw_clip_waveform(
@@ -2886,7 +2820,7 @@ impl ClipStrikeApp {
         painter.rect_stroke(
             curve_rect,
             4.0,
-            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+            egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
         );
 
         let duration_ms = (clip_end - clip_start).max(1);
@@ -2919,7 +2853,7 @@ impl ClipStrikeApp {
                     egui::pos2(curve_rect.right(), y),
                 ],
                 egui::Stroke::new(
-                    1.0,
+                    1.0_f32,
                     ui.visuals()
                         .widgets
                         .noninteractive
@@ -2936,7 +2870,7 @@ impl ClipStrikeApp {
                 egui::pos2(playhead_x, curve_rect.top()),
                 egui::pos2(playhead_x, curve_rect.bottom()),
             ],
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 80, 80)),
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(200, 80, 80)),
         );
 
         let sample_count = 48;
@@ -2951,7 +2885,7 @@ impl ClipStrikeApp {
         }
         painter.add(egui::Shape::line(
             points,
-            egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 200, 140)),
+            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(80, 200, 140)),
         ));
 
         let pointer_pos = response.interact_pointer_pos();
@@ -3178,6 +3112,52 @@ impl ClipStrikeApp {
         })
     }
 
+    fn compositing_clips_in_render_order(&self) -> impl Iterator<Item = &Clip> {
+        self.visible_tracks_in_render_order()
+            .flat_map(|track| self.clips_for_track_at_playhead(track.id))
+    }
+
+    fn clip_has_static_visual(&self, clip: &Clip) -> bool {
+        let Some(asset) = self.project.assets.iter().find(|asset| asset.id == clip.asset_id) else {
+            return false;
+        };
+        let path = url::Url::parse(&asset.uri)
+            .map(|uri| uri.path().to_ascii_lowercase())
+            .unwrap_or_else(|_| asset.uri.to_ascii_lowercase());
+        matches!(
+            path.rsplit('.').next(),
+            Some("svg" | "png" | "jpg" | "jpeg" | "bmp" | "gif" | "webp" | "tiff")
+        )
+    }
+
+    fn fresh_preview_frame_for_clip(&self, clip: &Clip) -> Option<&FrameTexture> {
+        let pool = &self.frame_renderer.as_ref()?.texture_pool;
+        let expected_source_ms = (!self.clip_has_static_visual(clip))
+            .then(|| clip.source_time_at(self.playhead_ms));
+        let tolerance_ms = (self.frame_duration_ms() * 3).max(100);
+        pool.frame_for_clip_at(clip.id, expected_source_ms, tolerance_ms)
+    }
+
+    fn fresh_export_frame_for_clip(&self, clip: &Clip) -> Option<&FrameTexture> {
+        let pool = &self.frame_renderer.as_ref()?.texture_pool;
+        if self.clip_has_static_visual(clip) {
+            pool.frame_for_clip(clip.id)
+        } else {
+            let source_ns = clip.source_time_at(self.playhead_ms).max(0) as u64 * 1_000_000;
+            pool.frame_for_clip_covering_ns(clip.id, source_ns)
+        }
+    }
+
+    fn refresh_frame_seek_generations(&mut self, clip_ids: &[usize]) {
+        let Some(engine_manager) = &self.engine_manager else { return };
+        let Some(renderer) = &mut self.frame_renderer else { return };
+        for clip_id in clip_ids {
+            if let Some(generation) = engine_manager.frame_generation(*clip_id) {
+                renderer.texture_pool.expect_seek_generation(*clip_id, generation);
+            }
+        }
+    }
+
     fn blend_mode_to_u32(mode: clipstrike_core::timeline::BlendMode) -> u32 {
         use clipstrike_core::timeline::BlendMode;
         match mode {
@@ -3199,6 +3179,11 @@ impl ClipStrikeApp {
         prewarm_clips: &[Clip],
         seek_now: bool,
     ) {
+        // Still decoders often produce one preroll frame and cannot seek.
+        // Keep that frame's engine generation for the entire visible interval.
+        let static_clip_ids: Vec<usize> = active_clips.iter().chain(prewarm_clips.iter())
+            .filter(|clip| self.clip_has_static_visual(clip))
+            .map(|clip| clip.id).collect();
         let engine_manager = match &mut self.engine_manager {
             Some(em) => em,
             None => return,
@@ -3217,7 +3202,12 @@ impl ClipStrikeApp {
             active_clips.iter().map(|clip| clip.id).collect::<Vec<_>>(),
             prewarm_clips.iter().map(|clip| clip.id).collect::<Vec<_>>()
         );
-        engine_manager.remove_unused(&sync_ids);
+        let removed_ids = engine_manager.remove_unused(&sync_ids);
+        if let Some(renderer) = &mut self.frame_renderer {
+            for clip_id in removed_ids {
+                renderer.texture_pool.release_clip_frames(clip_id);
+            }
+        }
 
         let mut audio_sources = Vec::new();
 
@@ -3226,17 +3216,17 @@ impl ClipStrikeApp {
             if let Some(asset) = self.project.assets.iter().find(|a| a.id == clip.asset_id) {
                 if asset.duration_ms == 0 {
                     log::debug!(
-                        "sync_engines_for_playhead: skipping zero-duration asset for clip_id={} asset_id={} uri={}",
+                        "sync_engines_for_playhead: skipping zero-duration asset for clip_id={} asset_id={} source={}",
                         clip.id,
                         asset.id,
-                        asset.uri
+                        source_label(&asset.uri)
                     );
                 } else {
                     log::debug!(
-                        "sync_engines_for_playhead: clip_id={} asset_id={} uri={} video_enabled={} audio_enabled={}",
+                        "sync_engines_for_playhead: clip_id={} asset_id={} source={} video_enabled={} audio_enabled={}",
                         clip.id,
                         asset.id,
-                        asset.uri,
+                        source_label(&asset.uri),
                         clip.video_enabled,
                         clip.audio_enabled
                     );
@@ -3244,7 +3234,7 @@ impl ClipStrikeApp {
                         Ok(created) => {
                             if created {
                                 created_engine = true;
-                                if prewarm_clips
+                                if !static_clip_ids.contains(&clip.id) && prewarm_clips
                                     .iter()
                                     .any(|warm_clip| warm_clip.id == clip.id)
                                 {
@@ -3292,12 +3282,17 @@ impl ClipStrikeApp {
 
         if seek_now {
             for clip in prewarm_clips {
-                let _ = engine_manager.seek_clips(std::slice::from_ref(clip), clip.start);
+                if !static_clip_ids.contains(&clip.id) {
+                    let _ = engine_manager.seek_clips(std::slice::from_ref(clip), clip.start);
+                }
             }
         }
 
         if seek_now || created_engine {
-            engine_manager.seek_clips(active_clips, self.playhead_ms);
+            let seekable: Vec<Clip> = active_clips.iter()
+                .filter(|clip| !static_clip_ids.contains(&clip.id))
+                .cloned().collect();
+            engine_manager.seek_clips(&seekable, self.playhead_ms);
         }
 
         if self.is_playing {
@@ -3306,14 +3301,18 @@ impl ClipStrikeApp {
         } else {
             engine_manager.pause_all();
         }
+        self.refresh_frame_seek_generations(&sync_ids);
     }
 
     fn interactive_seek_playhead_active_only(&mut self) {
         let (all_active_clips, _) = self.active_clips_for_playhead();
+        let seekable: Vec<Clip> = all_active_clips.iter()
+            .filter(|clip| !self.clip_has_static_visual(clip)).cloned().collect();
         self.sync_engines_for_playhead(&all_active_clips, &[], false);
         if let Some(engine_manager) = &self.engine_manager {
-            engine_manager.seek_clips_interactive(&all_active_clips, self.playhead_ms);
+            engine_manager.seek_clips_interactive(&seekable, self.playhead_ms);
         }
+        self.refresh_frame_seek_generations(&all_active_clips.iter().map(|clip| clip.id).collect::<Vec<_>>());
         if let Some(audio) = &self.audio_engine {
             audio.set_playhead(self.playhead_ms);
         }
@@ -3387,6 +3386,8 @@ impl ClipStrikeApp {
 
         let mut open = self.show_title_editor;
         let mut save_title: Option<clipstrike_core::project::TitleAsset> = None;
+        let title_width = self.project.width;
+        let title_height = self.project.height;
 
         egui::Window::new("Title Editor")
             .open(&mut open)
@@ -3401,6 +3402,7 @@ impl ClipStrikeApp {
 
                     ui.horizontal(|ui| {
                         ui.label("Template:");
+                        let previous_template = title.template;
                         egui::ComboBox::from_id_salt("title_template")
                             .selected_text(format!("{:?}", title.template))
                             .show_ui(ui, |ui| {
@@ -3409,6 +3411,13 @@ impl ClipStrikeApp {
                                 ui.selectable_value(&mut title.template, TitleTemplate::LowerThird, "Lower Third");
                                 ui.selectable_value(&mut title.template, TitleTemplate::TopLeft, "Top Left");
                             });
+                        if title.template != previous_template {
+                            (title.x, title.y) = match title.template {
+                                clipstrike_core::project::TitleTemplate::LowerThird => (0.5, 0.85),
+                                clipstrike_core::project::TitleTemplate::TopLeft => (0.1, 0.1),
+                                _ => (0.5, 0.5),
+                            };
+                        }
                     });
 
                     ui.horizontal(|ui| {
@@ -3448,13 +3457,9 @@ impl ClipStrikeApp {
                     if ui.button("Save Title Asset").clicked() {
                         use clipstrike_core::project::TitleTemplate;
 
-                        let (final_x, final_y, anchor) = match title.template {
-                            TitleTemplate::Centered => (0.5, 0.5, "middle"),
-                            TitleTemplate::LowerThird => (0.5, 0.85, "middle"),
-                            TitleTemplate::TopLeft => (0.1, 0.1, "start"),
-                            TitleTemplate::EndCredits | TitleTemplate::Subtitle | TitleTemplate::Watermark => {
-                                (0.5, 0.5, "middle")
-                            }
+                        let anchor = match title.template {
+                            TitleTemplate::TopLeft => "start",
+                            _ => "middle",
                         };
 
                         let r = title.color[0];
@@ -3463,16 +3468,18 @@ impl ClipStrikeApp {
                         let a = title.color[3] as f32 / 255.0;
 
                         title.svg_content = format!(
-                            r#"<svg width="1920" height="1080" xmlns="http://www.w3.org/2000/svg">
+                            r#"<svg width="{}" height="{}" xmlns="http://www.w3.org/2000/svg">
                                 <text x="{}" y="{}" font-family="{}" font-size="{}" fill="rgba({},{},{},{})" text-anchor="{}">{}</text>
                             </svg>"#,
-                            final_x * 1920.0,
-                            final_y * 1080.0,
-                            title.font_family,
+                            title_width,
+                            title_height,
+                            title.x * title_width as f32,
+                            title.y * title_height as f32,
+                            escape_svg_text(&title.font_family),
                             title.font_size,
                             r, g, b, a,
                             anchor,
-                            title.text
+                            escape_svg_text(&title.text)
                         );
 
                         save_title = Some(title.clone());
@@ -3481,16 +3488,22 @@ impl ClipStrikeApp {
             });
 
         if let Some(title) = save_title {
-            self.project.titles.push(title);
-            self.editing_title = None;
-            self.show_title_editor = false;
+            match self.apply_title_edit(title) {
+                Ok(()) => {
+                    self.editing_title = None;
+                    open = false;
+                }
+                Err(error) => {
+                    self.export_notification = Some(format!("Title save failed: {error}"));
+                }
+            }
         }
         self.show_title_editor = open;
     }
 }
 
-impl eframe::App for ClipStrikeApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl ClipStrikeApp {
+    pub(crate) fn show_workspace(&mut self, ctx: &egui::Context) {
         #[cfg(target_arch = "wasm32")]
         {
             // Process incoming test commands
@@ -3533,6 +3546,7 @@ impl eframe::App for ClipStrikeApp {
                                 split_at: playhead,
                                 original_clip: None,
                                 new_clip_id: None,
+                                split_clips: None,
                             }),
                             &mut self.project,
                             &mut self.timeline,
@@ -3547,6 +3561,8 @@ impl eframe::App for ClipStrikeApp {
                                 old_end: 5000,
                                 new_start: 1000,
                                 new_end: 4000,
+                                original_clip: None,
+                                trimmed_clip: None,
                             }),
                             &mut self.project,
                             &mut self.timeline,
@@ -3940,8 +3956,13 @@ impl eframe::App for ClipStrikeApp {
                         self.show_export_dialog = true;
                     }
                     ui.separator();
-                    if ui.button("Quit").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    let quit_label = if self.embedded_workspace {
+                        "Return to Capture"
+                    } else {
+                        "Quit"
+                    };
+                    if ui.button(quit_label).clicked() {
+                        self.handle_quit_action(ctx);
                     }
                 });
                 ui.menu_button("Edit", |ui| {
@@ -4272,6 +4293,8 @@ impl eframe::App for ClipStrikeApp {
             }
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
+        self.process_export_preparation(ctx);
         self.process_active_export_seek(ctx);
         self.draw_export_dialog(ctx);
 
@@ -4392,7 +4415,7 @@ impl eframe::App for ClipStrikeApp {
                         }
                     }
 
-                    if ruler_res.drag_released() {
+                    if ruler_res.drag_stopped() {
                         if self.was_playing_before_scrub {
                             self.is_playing = true;
                             let (active_clips, _) = self.active_clips_for_playhead();
@@ -4442,9 +4465,9 @@ impl eframe::App for ClipStrikeApp {
                             + (marker.time_ms as f32 * self.zoom_level * 0.1);
                         let color = Self::marker_color(marker);
                         let stroke_width = if self.selected_marker_id == Some(marker.id) {
-                            2.5
+                            2.5_f32
                         } else {
-                            1.5
+                            1.5_f32
                         };
 
                         let marker_handle_rect = egui::Rect::from_min_max(
@@ -4528,7 +4551,7 @@ impl eframe::App for ClipStrikeApp {
                             ui.painter().rect_stroke(
                                 bubble_rect,
                                 4.0,
-                                egui::Stroke::new(1.0, color),
+                                egui::Stroke::new(1.0_f32, color),
                             );
                             ui.painter().text(
                                 bubble_rect.center(),
@@ -4996,6 +5019,7 @@ impl eframe::App for ClipStrikeApp {
                                                         Some(SeparateAudioCommand {
                                                             clip_id: clip.id,
                                                             audio_clip,
+                                                            original_clip: None,
                                                         });
                                                     ui.close_menu();
                                                 }
@@ -5029,7 +5053,7 @@ impl eframe::App for ClipStrikeApp {
                                                 base_color
                                             };
 
-                                            if let Some(frame) = self.texture_pool.as_ref().and_then(|pool| pool.frame_for_clip(clip.id)) {
+                                            if let Some(frame) = self.frame_renderer.as_ref().and_then(|renderer| renderer.texture_pool.frame_for_clip(clip.id)) {
                                                 if let Some(texture_id) = frame.egui_id {
                                                     let thumb_height = paint_rect.height();
                                                     let thumb_width = (thumb_height * 1.77).max(10.0);
@@ -5050,8 +5074,8 @@ impl eframe::App for ClipStrikeApp {
                                                 }
                                             }
 
-                                            let has_thumbnail = self.texture_pool.as_ref()
-                                                .and_then(|pool| pool.frame_for_clip(clip.id))
+                                            let has_thumbnail = self.frame_renderer.as_ref()
+                                                .and_then(|renderer| renderer.texture_pool.frame_for_clip(clip.id))
                                                 .is_some();
                                             let fill_alpha = if has_thumbnail {
                                                 120
@@ -5087,7 +5111,7 @@ impl eframe::App for ClipStrikeApp {
                                             ui.painter().rect_stroke(
                                                 paint_rect,
                                                 4.0,
-                                                egui::Stroke::new(2.0, egui::Color32::from_rgb(
+                                                egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(
                                                     clip.color_tag[0],
                                                     clip.color_tag[1],
                                                     clip.color_tag[2],
@@ -5151,7 +5175,7 @@ impl eframe::App for ClipStrikeApp {
                                                             egui::pos2(x, mid_y + half_height),
                                                         ],
                                                         egui::Stroke::new(
-                                                            1.0,
+                                                            1.0_f32,
                                                             egui::Color32::from_white_alpha(150),
                                                         ),
                                                     );
@@ -5249,7 +5273,7 @@ impl eframe::App for ClipStrikeApp {
                                                         ui.painter().rect_stroke(
                                                             paint_rect,
                                                             4.0,
-                                                            egui::Stroke::new(2.0, egui::Color32::from_rgb(
+                                                            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(
                                                                 clip.color_tag[0],
                                                                 clip.color_tag[1],
                                                                 clip.color_tag[2],
@@ -5457,6 +5481,8 @@ impl eframe::App for ClipStrikeApp {
                                                 old_end: c_old_end,
                                                 new_start,
                                                 new_end,
+                                                original_clip: None,
+                                                trimmed_clip: None,
                                             }));
                                         } else {
                                             let c_new_start = c_old_start + delta_ms;
@@ -5511,7 +5537,7 @@ impl eframe::App for ClipStrikeApp {
                                     egui::pos2(playhead_x, timeline_rect.top()),
                                     egui::pos2(playhead_x, timeline_rect.bottom()),
                                 ],
-                                egui::Stroke::new(2.0, egui::Color32::RED),
+                                egui::Stroke::new(2.0_f32, egui::Color32::RED),
                             );
                         }
                     } else {
@@ -5525,7 +5551,7 @@ impl eframe::App for ClipStrikeApp {
                                     egui::pos2(playhead_x, timeline_rect.top()),
                                     egui::pos2(playhead_x, timeline_rect.bottom()),
                                 ],
-                                egui::Stroke::new(2.0, egui::Color32::RED),
+                                egui::Stroke::new(2.0_f32, egui::Color32::RED),
                             );
                         }
                     }
@@ -5537,6 +5563,7 @@ impl eframe::App for ClipStrikeApp {
                                 split_at,
                                 original_clip: None,
                                 new_clip_id: None,
+                                split_clips: None,
                             }),
                             &mut self.project,
                             &mut self.timeline,
@@ -5904,6 +5931,11 @@ impl eframe::App for ClipStrikeApp {
                                         ui.horizontal(|ui| {
                                             ui.label("\u{1F3F7}");
                                             let title_label_res = ui.label(&title_name);
+                                            if ui.small_button("Edit").clicked() {
+                                                self.editing_title = self.project.titles.iter()
+                                                    .find(|title| title.id == title_id).cloned();
+                                                self.show_title_editor = true;
+                                            }
 
                                             #[cfg(not(target_arch = "wasm32"))]
                                             title_label_res.context_menu(|ui| {
@@ -6305,42 +6337,7 @@ impl eframe::App for ClipStrikeApp {
                     }
                 });
         }
-        let pending_frame_upload_requests = self.collect_pending_frame_upload_requests();
-        let queue = self.queue.clone();
-        let device = self.device.clone();
-        let wgpu_render_state = self.wgpu_render_state.clone();
-        if let (Some(texture_pool), Some(queue), Some(device), Some(wgpu_render_state)) = (
-            &mut self.texture_pool,
-            queue.as_ref(),
-            device.as_ref(),
-            wgpu_render_state.as_ref(),
-        ) {
-            for request in pending_frame_upload_requests {
-                let clip_id = request.clip_id;
-                match texture_pool.apply_frame_upload_request(queue, request) {
-                    Ok(_) => {
-                        if let Some(frame) = texture_pool.frame_for_clip(clip_id) {
-                            if let Some(egui_id) = frame.egui_id {
-                                let mut renderer = wgpu_render_state.renderer.write();
-                                renderer.update_egui_texture_from_wgpu_texture(
-                                    device,
-                                    frame.preview_view(),
-                                    wgpu::FilterMode::Linear,
-                                    egui_id,
-                                );
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        log::warn!(
-                            "Failed to apply frame upload request for clip {}: {}",
-                            clip_id,
-                            err
-                        );
-                    }
-                }
-            }
-        }
+        self.apply_pending_frame_uploads();
 
         // CENTRAL PANEL: Video Preview
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -6355,141 +6352,7 @@ impl eframe::App for ClipStrikeApp {
 
                 ui.painter().rect_filled(rect, 4.0, egui::Color32::BLACK);
 
-                // Draw active clips using the CompositorPipeline for professional track blending.
-                let mut frame_rendered = false;
-                if let (
-                    Some(device),
-                    Some(queue),
-                    Some(fx_pipeline),
-                    Some(compositor_pipeline),
-                    Some(fx_output_view),
-                    Some(accumulator_view),
-                    Some(scratch_view),
-                ) = (
-                    &self.device,
-                    &self.queue,
-                    &self.fx_pipeline,
-                    &self.compositor_pipeline,
-                    &self.fx_output_view,
-                    &self.accumulator_view,
-                    &self.scratch_view,
-                ) {
-                    // Clear accumulator to black at the start of the frame
-                    let mut encoder =
-                        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("Clear Accumulator"),
-                        });
-                    {
-                        let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("Clear Pass"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: accumulator_view,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                            })],
-                            depth_stencil_attachment: None,
-                            timestamp_writes: None,
-                            occlusion_query_set: None,
-                        });
-                    }
-                    queue.submit(Some(encoder.finish()));
-
-                    let fx_sampler = self.fx_sampler(device);
-
-                    if let Some(texture_pool) = &self.texture_pool {
-                        for track in self.visible_tracks_in_render_order() {
-                            let mut blend_mode = clipstrike_core::timeline::BlendMode::Normal;
-                            let mut saw_clip = false;
-
-                            for clip in self.clips_for_track_at_playhead(track.id) {
-                                saw_clip = true;
-                                blend_mode = clip.blend_mode;
-
-                                if let Some(frame) = texture_pool.frame_for_clip(clip.id) {
-                                    let transform = Self::preview_transform_for_clip(
-                                        clip,
-                                        self.playhead_ms,
-                                        texture_pool.width,
-                                        texture_pool.height,
-                                    );
-                                    let fx_params = FxUniforms {
-                                        brightness: clip.brightness.get_value_at(self.playhead_ms),
-                                        contrast: clip.contrast.get_value_at(self.playhead_ms),
-                                        saturation: clip.saturation.get_value_at(self.playhead_ms),
-                                        grayscale: clip.grayscale.get_value_at(self.playhead_ms),
-                                        blur_radius: clip
-                                            .blur_radius
-                                            .get_value_at(self.playhead_ms),
-                                        alpha: clip.opacity.get_value_at(self.playhead_ms),
-                                        transform,
-                                        ..Default::default()
-                                    };
-                                    fx_pipeline.run(
-                                        device,
-                                        queue,
-                                        frame.preview_view(),
-                                        fx_output_view,
-                                        None,
-                                        fx_sampler,
-                                        fx_params,
-                                    );
-                                }
-                            }
-
-                            if !saw_clip {
-                                continue;
-                            }
-
-                            let compose_params = ComposeUniforms {
-                                blend_mode: Self::blend_mode_to_u32(blend_mode),
-                                opacity: 1.0,
-                                watermark_enabled: 0,
-                                watermark_opacity: 1.0,
-                                watermark_rect: [0.0, 0.0, 0.0, 0.0],
-                            };
-                            compositor_pipeline.run(
-                                device,
-                                queue,
-                                fx_output_view,
-                                accumulator_view,
-                                scratch_view,
-                                fx_output_view,
-                                fx_sampler,
-                                compose_params,
-                            );
-
-                            // Copy scratch back to accumulator to avoid resource aliasing in next track
-                            let mut copy_encoder =
-                                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                    label: Some("Copy Scratch to Accum"),
-                                });
-                            copy_encoder.copy_texture_to_texture(
-                                wgpu::ImageCopyTexture {
-                                    texture: self._scratch_texture.as_ref().unwrap(),
-                                    mip_level: 0,
-                                    origin: wgpu::Origin3d::ZERO,
-                                    aspect: wgpu::TextureAspect::All,
-                                },
-                                wgpu::ImageCopyTexture {
-                                    texture: self._accumulator_texture.as_ref().unwrap(),
-                                    mip_level: 0,
-                                    origin: wgpu::Origin3d::ZERO,
-                                    aspect: wgpu::TextureAspect::All,
-                                },
-                                wgpu::Extent3d {
-                                    width: 1920,
-                                    height: 1080,
-                                    depth_or_array_layers: 1,
-                                },
-                            );
-                            queue.submit(Some(copy_encoder.finish()));
-                            frame_rendered = true;
-                        }
-                    }
-                }
+                let frame_rendered = self.render_composited_preview();
 
                 if frame_rendered {
                     ui.painter().image(
@@ -6580,6 +6443,55 @@ impl eframe::App for ClipStrikeApp {
         self.draw_library_drag_preview(ctx);
         self.process_active_export_capture(ctx);
         self.draw_title_editor(ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.process_export_finalization(ctx);
+    }
+}
+
+impl eframe::App for ClipStrikeApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.show_workspace(ctx);
+    }
+}
+
+impl Drop for ClipStrikeApp {
+    fn drop(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(pending) = self.pending_export_preparation.take() {
+                pending.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some(pending) = self.pending_export_finalization.take() {
+                pending.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        if let Some(mut job) = self.active_export.take() {
+            job.progress.request_cancel();
+            let staging_path = job.staging_path.clone();
+            let _ = job.exporter.stop();
+            drop(job);
+            let _ = std::fs::remove_file(staging_path);
+        }
+
+        // Decoder workers must stop before their GPU preview views are released.
+        self.engine_manager.take();
+        self.audio_engine.take();
+        if let Some(state) = &self.wgpu_render_state {
+            let mut renderer = state.renderer.write();
+            if let Some(frame_renderer) = &mut self.frame_renderer {
+                for frame in frame_renderer.texture_pool.get_frames_mut() {
+                    if let Some(id) = frame.egui_id.take() {
+                        renderer.free_texture(&id);
+                    }
+                }
+            }
+            if let Some(id) = self.fx_output_id.take() {
+                renderer.free_texture(&id);
+            }
+            if let Some(id) = self.accumulator_id.take() {
+                renderer.free_texture(&id);
+            }
+        }
     }
 }
 
@@ -6589,6 +6501,180 @@ mod tests {
     use clipstrike_core::capture_package::CapturedAsset;
     use clipstrike_core::project::MediaAsset;
     use std::path::PathBuf;
+
+    #[test]
+    fn embedded_workspace_opens_saved_project_and_draws_without_rewriting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("captured.cstrike");
+        let project = Project::new("Captured edit", 320, 180, 10.0);
+        project.save(&path).unwrap();
+        let original_bytes = std::fs::read(&path).unwrap();
+
+        let blank = ClipStrikeApp::test_harness(Project::new("Blank", 320, 180, 10.0));
+        let mut workspace = EmbeddedEditorWorkspace::from_app(blank, &path).unwrap();
+        assert_eq!(workspace.project_path(), Some(path.as_path()));
+        assert_eq!(workspace.project_snapshot().name, "Captured edit");
+        assert!(!workspace.has_unsaved_changes());
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| workspace.show(ctx));
+        assert!(!output.shapes.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+    }
+
+    #[test]
+    fn embedded_workspace_rejects_replacing_unsaved_editor_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("captured.cstrike");
+        Project::new("Captured edit", 320, 180, 10.0)
+            .save(&path)
+            .unwrap();
+        let original_bytes = std::fs::read(&path).unwrap();
+
+        let mut dirty = ClipStrikeApp::test_harness(Project::new("Working", 320, 180, 10.0));
+        dirty.project.name = "Unsaved changes".into();
+        let result = EmbeddedEditorWorkspace::from_app(dirty, &path);
+        assert!(result.is_err(), "embedding must not discard unsaved edits");
+        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+    }
+
+    #[test]
+    fn embedded_quit_requests_a_return_to_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("captured.cstrike");
+        Project::new("Captured edit", 320, 180, 10.0)
+            .save(&path)
+            .unwrap();
+        let mut app = ClipStrikeApp::test_harness(Project::new("Working", 320, 180, 10.0));
+        app.embedded_workspace = true;
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| app.handle_quit_action(ctx));
+        assert!(
+            !output
+                .viewport_output
+                .values()
+                .flat_map(|view| &view.commands)
+                .any(|command| matches!(command, egui::ViewportCommand::Close))
+        );
+
+        let mut workspace = EmbeddedEditorWorkspace::from_app(app, &path).unwrap();
+        assert!(workspace.take_return_request());
+        assert!(!workspace.take_return_request());
+    }
+
+    #[test]
+    fn save_and_continue_preserves_dirty_edit_before_opening_another_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first.cstrike");
+        let second_path = dir.path().join("second.cstrike");
+        Project::new("First", 320, 180, 10.0).save(&first_path).unwrap();
+        Project::new("Second", 320, 180, 10.0).save(&second_path).unwrap();
+
+        let mut app = ClipStrikeApp::test_harness(Project::new("Blank", 320, 180, 10.0));
+        app.open_project_unchecked(first_path.clone()).unwrap();
+        app.project.name = "Saved first edit".into();
+        app.open_project_at_path(second_path.clone()).unwrap();
+        assert!(app.pending_project_replace.is_some());
+
+        app.save_and_apply_pending_project().unwrap();
+
+        assert_eq!(Project::load(&first_path).unwrap().name, "Saved first edit");
+        assert_eq!(app.current_project_path.as_deref(), Some(second_path.as_path()));
+        assert_eq!(app.project.name, "Second");
+        assert!(!app.has_unsaved_changes());
+    }
+
+    #[test]
+    fn software_h264_override_reaches_export_settings() {
+        let mut app = ClipStrikeApp::test_harness(Project::new("Export", 320, 180, 10.0));
+        assert!(app.export_settings_for_selected_preset().use_hardware_acceleration);
+        app.export_hardware_override = Some(false);
+        assert!(!app.export_settings_for_selected_preset().use_hardware_acceleration);
+        assert_eq!(
+            app.export_settings_for_selected_preset().codec,
+            clipstrike_media::export::VideoCodec::H264
+        );
+    }
+
+    #[test]
+    fn nvenc_session_failure_gives_software_recovery_instruction() {
+        let error = "gst_nv_encoder_init_session (): Failed to open session";
+        let message = ClipStrikeApp::export_failure_message(error);
+        assert!(message.contains("Turn off Hardware H.264 encoding"));
+        assert!(message.contains(error));
+        assert_eq!(ClipStrikeApp::export_failure_message("disk full"), "disk full");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn export_frame_readiness_rejects_a_nearby_but_noncovering_video_frame() {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let instance = wgpu::Instance::default();
+        let adapter = runtime.block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            compatible_surface: None, ..Default::default()
+        })).unwrap();
+        let (device, queue) = runtime.block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor::default(), None,
+        )).unwrap();
+        let mut app = ClipStrikeApp::test_harness(Project::new("Exact frame", 2, 2, 30.0));
+        app.project.assets.push(MediaAsset {
+            id: 1, name: "Video".into(), uri: "file:///source.mp4".into(),
+            duration_ms: 1_000, audio_levels: vec![],
+        });
+        let clip = Clip::new(7, 1, app.project.tracks[0].id, 0, 1_000, 0, 1_000);
+        let mut renderer = FrameRenderer::new(Arc::new(device), Arc::new(queue), 2, 2);
+        renderer.texture_pool.expect_seek_generation(7, 8);
+        renderer.upload(FrameUploadRequest {
+            clip_id: 7, timestamp_ms: 100, pts_ns: Some(100_000_000),
+            duration_ns: Some(33_000_000), seek_generation: 8,
+            external_texture_id: None, native_d3d12_shared_handle: None,
+            pixels: vec![255; 16],
+        }).unwrap();
+        app.frame_renderer = Some(renderer);
+        app.playhead_ms = 200;
+        assert!(app.fresh_preview_frame_for_clip(&clip).is_some(),
+            "interactive preview is permitted to show a nearby frame");
+        assert!(app.fresh_export_frame_for_clip(&clip).is_none(),
+            "export must wait for the exact decoded source interval");
+    }
+
+    #[test]
+    fn svg_title_text_is_escaped_before_embedding() {
+        assert_eq!(
+            escape_svg_text("A&B <tag> \"quote\""),
+            "A&amp;B &lt;tag&gt; &quot;quote&quot;"
+        );
+    }
+
+    #[cfg(not(feature = "gstreamer-backend"))]
+    #[test]
+    fn unavailable_export_preserves_destination_and_cleans_staging() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let destination = dir.path().join("edit.mp4");
+        let mut project = Project::new("Export", 320, 180, 30.0);
+        project.assets.push(MediaAsset {
+            id: 1,
+            name: "still".into(),
+            uri: "file:///still.png".into(),
+            duration_ms: 1000,
+            audio_levels: Vec::new(),
+        });
+        project.clips.push(Clip::new(1, 1, 1, 0, 1000, 0, 1000));
+        let mut app = ClipStrikeApp::test_harness(project);
+        app.export_output_path = Some(destination.clone());
+        let ctx = egui::Context::default();
+
+        std::fs::write(&destination, b"keep me").unwrap();
+        let error = app.begin_export(&ctx).unwrap_err();
+        assert!(error.contains("already exists"));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"keep me");
+
+        std::fs::remove_file(&destination).unwrap();
+        let error = app.begin_export(&ctx).unwrap_err();
+        assert!(error.contains("no GStreamer backend"));
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
 
     #[test]
     fn new_and_open_keep_unsaved_editorial_state_until_discard() {
@@ -6743,6 +6829,28 @@ mod tests {
     }
 
     #[test]
+    fn compositor_selects_every_overlapping_clip_in_track_and_stack_order() {
+        let mut app = ClipStrikeApp::test_harness(Project::new("Overlaps", 320, 180, 30.0));
+        app.project.tracks.iter_mut().find(|track| track.id == 4).unwrap().visible = false;
+        app.project.clips = vec![
+            Clip::new(20, 1, 5, 0, 100, 0, 100),
+            Clip::new(30, 1, 3, 0, 100, 0, 100),
+            Clip::new(10, 1, 5, 25, 125, 0, 100),
+            Clip::new(40, 1, 4, 0, 100, 0, 100),
+            Clip::new(50, 1, 1, 100, 150, 0, 50),
+        ];
+        app.timeline = app.project.to_timeline();
+
+        app.playhead_ms = 50;
+        let ids: Vec<_> = app.compositing_clips_in_render_order().map(|clip| clip.id).collect();
+        assert_eq!(ids, vec![30, 20, 10]);
+
+        app.playhead_ms = 100;
+        let ids: Vec<_> = app.compositing_clips_in_render_order().map(|clip| clip.id).collect();
+        assert_eq!(ids, vec![50, 10]);
+    }
+
+    #[test]
     fn add_asset_to_timeline_uses_first_visible_track() {
         let mut app = ClipStrikeApp::test_harness(Project::new("Add Asset", 1920, 1080, 60.0));
         for track in &mut app.project.tracks {
@@ -6825,6 +6933,7 @@ mod tests {
         assert_eq!(clip.asset_id, asset.id);
         assert!(!clip.audio_enabled, "title clips should stay silent");
         assert!(clip.video_enabled, "title clips should render video");
+        assert!(app.clip_has_static_visual(clip), "title SVG must not expire by video timestamp");
     }
 
     #[test]
@@ -6895,6 +7004,9 @@ mod tests {
             .try_send(clipstrike_render::gpu::FrameUploadRequest {
                 clip_id: 7,
                 timestamp_ms: 99,
+                pts_ns: None,
+                duration_ns: None,
+                seek_generation: 4,
                 external_texture_id: Some(12),
                 native_d3d12_shared_handle: None,
                 pixels: vec![1, 2, 3, 4],
@@ -6905,6 +7017,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].clip_id, 7);
         assert_eq!(requests[0].timestamp_ms, 99);
+        assert_eq!(requests[0].seek_generation, 4);
         assert_eq!(requests[0].external_texture_id, Some(12));
     }
 
@@ -6991,20 +7104,250 @@ mod tests {
 
     #[test]
     fn title_svg_temp_path_uses_title_id() {
-        let path = ClipStrikeApp::title_svg_temp_path(17);
+        let mut app = ClipStrikeApp::test_harness(Project::new("Edit Path", 320, 180, 30.0));
+        let path = app.title_svg_temp_path(17);
 
         assert_eq!(
             path.file_name().and_then(|name| name.to_str()),
             Some("title_17.svg")
         );
+        let other = ClipStrikeApp::test_harness(Project::new("Other Edit Path", 320, 180, 30.0));
+        assert_ne!(path, other.title_svg_temp_path(17));
+        app.reset_runtime_state(Project::new("Next Project", 320, 180, 30.0), None);
+        assert_ne!(path, app.title_svg_temp_path(17));
+    }
+
+    #[test]
+    fn title_edit_updates_timeline_asset_and_reopen_regenerates_missing_svg() {
+        let mut app = ClipStrikeApp::test_harness(Project::new("Title Persistence", 320, 180, 30.0));
+        let title_id = rand::random::<usize>();
+        let project_path = std::env::temp_dir().join(format!(
+            "clipstrike-title-reopen-{}-{}.json", std::process::id(), title_id,
+        ));
+        let mut title = clipstrike_core::project::TitleAsset {
+            id: title_id, name: "Before".into(),
+            template: clipstrike_core::project::TitleTemplate::Centered,
+            text: "Before".into(), font_family: "Arial".into(), font_size: 48.0,
+            color: [255, 255, 255, 255], x: 0.5, y: 0.5,
+            svg_content: "<svg><text>Before</text></svg>".into(),
+        };
+        app.project.titles.push(title.clone());
+        let asset_id = app.materialize_title_asset(title_id).unwrap();
+        let clip = Clip::new(rand::random::<usize>(), asset_id, app.project.tracks[0].id, 0, 1000, 0, 1000);
+        app.timeline.clips.push(clip.clone());
+        app.project.clips.push(clip);
+        app.video_cache.insert(0, vec![0; 4], 1, 1);
+
+        title.name = "After".into();
+        title.svg_content = "<svg><text>After</text></svg>".into();
+        let title_path = ClipStrikeApp::title_svg_asset_path(&title);
+        app.apply_title_edit(title).unwrap();
+        assert_eq!(std::fs::read_to_string(&title_path).unwrap(), "<svg><text>After</text></svg>");
+        assert_eq!(app.project.assets.iter().find(|asset| asset.id == asset_id).unwrap().name, "After");
+        assert_eq!(app.video_cache.len(), 0);
+
+        app.save_project_to_path(project_path.clone()).unwrap();
+        std::fs::remove_file(&title_path).unwrap();
+        let mut reopened = ClipStrikeApp::test_harness(Project::new("Empty", 320, 180, 30.0));
+        reopened.open_project_unchecked(project_path.clone()).unwrap();
+        assert_eq!(std::fs::read_to_string(&title_path).unwrap(), "<svg><text>After</text></svg>");
+        assert_eq!(reopened.project.clips[0].asset_id, asset_id);
+        assert_eq!(reopened.project.assets.iter().find(|asset| asset.id == asset_id).unwrap().name, "After");
+        std::fs::remove_file(title_path).unwrap();
+        std::fs::remove_file(project_path).unwrap();
+    }
+
+    #[test]
+    fn projects_with_equal_title_ids_keep_distinct_render_assets() {
+        let title_id = rand::random::<usize>();
+        let make_title = |text: &str| clipstrike_core::project::TitleAsset {
+            id: title_id, name: text.into(),
+            template: clipstrike_core::project::TitleTemplate::Centered,
+            text: text.into(), font_family: "Arial".into(), font_size: 32.0,
+            color: [255, 255, 255, 255], x: 0.5, y: 0.5,
+            svg_content: format!("<svg><text>{text}</text></svg>"),
+        };
+        let mut first = ClipStrikeApp::test_harness(Project::new("First", 320, 180, 30.0));
+        let mut second = ClipStrikeApp::test_harness(Project::new("Second", 320, 180, 30.0));
+        first.project.titles.push(make_title("Alpha"));
+        second.project.titles.push(make_title("Beta"));
+        let first_asset = first.materialize_title_asset(title_id).unwrap();
+        let second_asset = second.materialize_title_asset(title_id).unwrap();
+        let first_uri = first.project.assets.iter().find(|asset| asset.id == first_asset).unwrap().uri.clone();
+        let second_uri = second.project.assets.iter().find(|asset| asset.id == second_asset).unwrap().uri.clone();
+        assert_ne!(first_uri, second_uri);
+        let first_path = url::Url::parse(&first_uri).unwrap().to_file_path().unwrap();
+        let second_path = url::Url::parse(&second_uri).unwrap().to_file_path().unwrap();
+        let paths = [first_path.clone(), second_path.clone()];
+        let project_paths = [0, 1].map(|index| std::env::temp_dir().join(format!(
+            "clipstrike-title-collision-{}-{title_id}-{index}.cstrike", std::process::id(),
+        )));
+        first.save_project_to_path(project_paths[0].clone()).unwrap();
+        second.save_project_to_path(project_paths[1].clone()).unwrap();
+        for path in &paths { std::fs::remove_file(path).unwrap(); }
+        first.open_project_unchecked(project_paths[0].clone()).unwrap();
+        second.open_project_unchecked(project_paths[1].clone()).unwrap();
+        assert_eq!(std::fs::read_to_string(&first_path).unwrap(), "<svg><text>Alpha</text></svg>");
+        assert_eq!(std::fs::read_to_string(&second_path).unwrap(), "<svg><text>Beta</text></svg>");
+        for path in paths { std::fs::remove_file(path).unwrap(); }
+        for path in project_paths { std::fs::remove_file(path).unwrap(); }
+    }
+
+    #[test]
+    fn export_snapshot_rejects_gain_title_undo_open_and_new_mutations() {
+        let mut app = ClipStrikeApp::test_harness(Project::new("Export Snapshot", 320, 180, 30.0));
+        let track_id = app.project.tracks[0].id;
+        app.project.assets.push(MediaAsset {
+            id: 7, name: "Game".into(), uri: "file:///game.mp4".into(),
+            duration_ms: 1000, audio_levels: Vec::new(),
+        });
+        app.project.titles.push(clipstrike_core::project::TitleAsset {
+            id: 8, name: "Caption".into(),
+            template: clipstrike_core::project::TitleTemplate::Centered,
+            text: "Original".into(), font_family: "Arial".into(), font_size: 32.0,
+            color: [255, 255, 255, 255], x: 0.5, y: 0.5,
+            svg_content: "<svg>Original</svg>".into(),
+        });
+        app.undo_stack.push(
+            Box::new(AddClipCommand { clip: Clip::new(9, 7, track_id, 0, 1000, 0, 1000) }),
+            &mut app.project, &mut app.timeline,
+        );
+        let snapshot = app.snapshot_project();
+        assert!(app.export_snapshot_matches(&snapshot));
+
+        app.timeline.clips[0].start = 100;
+        assert!(!app.export_snapshot_matches(&snapshot), "timeline move must cancel export");
+        app.timeline.clips[0].start = 0;
+        app.timeline.clips[0].volume.default_value = 0.25;
+        assert!(!app.export_snapshot_matches(&snapshot), "gain edit must cancel export");
+        app.timeline.clips[0].volume.default_value = 1.0;
+        app.project.titles[0].text = "Edited".into();
+        assert!(!app.export_snapshot_matches(&snapshot), "title edit must cancel export");
+        app.project.titles[0].text = "Original".into();
+        app.undo_stack.undo(&mut app.project, &mut app.timeline);
+        assert!(!app.export_snapshot_matches(&snapshot), "undo must cancel export");
+
+        let other_path = std::env::temp_dir().join(format!(
+            "clipstrike-export-open-{}-{}.cstrike", std::process::id(), rand::random::<u64>(),
+        ));
+        Project::new("Opened", 320, 180, 30.0).save(&other_path).unwrap();
+        app.open_project_unchecked(other_path.clone()).unwrap();
+        assert!(!app.export_snapshot_matches(&snapshot), "open must cancel export");
+        std::fs::remove_file(other_path).unwrap();
+        app.reset_runtime_state(Project::new("New", 320, 180, 30.0), None);
+        assert!(!app.export_snapshot_matches(&snapshot), "new must cancel export");
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "gstreamer-backend"))]
+    #[test]
+    fn competing_destination_after_export_start_returns_error_without_overwriting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.mp4");
+        let project_path = dir.path().join("race.cstrike");
+        let destination = dir.path().join("race.mp4");
+        std::fs::write(
+            &source,
+            include_bytes!("../../clipstrike-media/tests/fixtures/preview-with-audio.mp4"),
+        ).unwrap();
+        let mut project = Project::new("Publication race", 320, 180, 10.0);
+        project.tracks.push(Track::new(1, "Video"));
+        project.assets.push(clipstrike_core::project::MediaAsset {
+            id: 1, name: "Synthetic source".into(),
+            uri: url::Url::from_file_path(&source).unwrap().to_string(),
+            duration_ms: 2_000, audio_levels: vec![],
+        });
+        let mut clip = Clip::new(1, 1, project.tracks[0].id, 0, 100, 100, 200);
+        clip.audio_enabled = false;
+        project.clips.push(clip);
+        project.save(&project_path).unwrap();
+
+        let competitor = b"another process's movie";
+        let settings = ExportSettings { width: 320, height: 180, fps_num: 10, fps_den: 1, ..Default::default() };
+        let result = ClipStrikeApp::export_saved_project_offscreen_with_after_start(
+            &project_path,
+            &destination,
+            settings.clone(),
+            |_| {
+                assert!(!destination.exists());
+                std::fs::write(&destination, competitor).unwrap();
+            },
+        );
+        assert!(result.as_ref().unwrap_err().contains("destination already exists"), "{result:?}");
+        assert_eq!(std::fs::read(&destination).unwrap(), competitor);
+
+        let canceled_destination = dir.path().join("canceled.mp4");
+        let started = Instant::now();
+        let canceled = ClipStrikeApp::export_saved_project_offscreen_with_after_start(
+            &project_path, &canceled_destination, settings,
+            |app| app.request_active_export_cancel(),
+        );
+        assert!(canceled.as_ref().unwrap_err().contains("canceled"), "{canceled:?}");
+        assert!(!canceled_destination.exists());
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn edit_during_paused_finalization_discards_stage_before_publication() {
+        fn paused_case(
+            app: &mut ClipStrikeApp,
+            destination: PathBuf,
+            staging: PathBuf,
+            mutate: impl FnOnce(&mut ClipStrikeApp),
+        ) {
+            let snapshot = app.snapshot_project();
+            std::fs::write(&staging, b"verified but unpublished").unwrap();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let worker_stage = staging.clone();
+            let worker = std::thread::spawn(move || {
+                resume_rx.recv().unwrap();
+                let _ = sender.send(Ok(crate::audio_export::PreparedExport::fixture_from_staging(worker_stage)));
+            });
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            app.pending_export_finalization = Some(PendingExportFinalization {
+                output_path: destination.clone(), project_snapshot: snapshot,
+                receiver, cancel: Arc::clone(&cancel),
+            });
+            mutate(app);
+            resume_tx.send(()).unwrap();
+            worker.join().unwrap();
+            app.process_export_finalization(&egui::Context::default());
+            assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+            assert!(!staging.exists(), "the unpublished stage must be removed");
+            assert!(app.export_notification.as_deref().unwrap().contains("discarded"));
+        }
+
+        let mut app = ClipStrikeApp::test_harness(Project::new("Finalization Race", 320, 180, 30.0));
+        app.project.titles.push(clipstrike_core::project::TitleAsset {
+            id: 11, name: "Caption".into(),
+            template: clipstrike_core::project::TitleTemplate::Centered,
+            text: "Before".into(), font_family: "Arial".into(), font_size: 32.0,
+            color: [255, 255, 255, 255], x: 0.5, y: 0.5,
+            svg_content: "<svg>Before</svg>".into(),
+        });
+        let unique = format!("{}-{}", std::process::id(), rand::random::<u64>());
+        let root = std::env::temp_dir();
+        let existing = root.join(format!("clipstrike-final-existing-{unique}.mp4"));
+        let stage_one = root.join(format!("clipstrike-final-stage-one-{unique}.partial"));
+        std::fs::write(&existing, b"user's existing movie").unwrap();
+        paused_case(&mut app, existing.clone(), stage_one, |app| app.project.master_volume = 0.5);
+        assert_eq!(std::fs::read(&existing).unwrap(), b"user's existing movie");
+
+        let absent = root.join(format!("clipstrike-final-absent-{unique}.mp4"));
+        let stage_two = root.join(format!("clipstrike-final-stage-two-{unique}.partial"));
+        paused_case(&mut app, absent.clone(), stage_two, |app| app.project.titles[0].text = "After".into());
+        assert!(!absent.exists(), "title edit must prevent a newly published movie");
+        std::fs::remove_file(existing).unwrap();
     }
 
     #[test]
     fn refresh_title_svg_from_path_updates_title_and_returns_matching_clip_ids() {
         let mut app = ClipStrikeApp::test_harness(Project::new("Title Refresh", 1920, 1080, 30.0));
         let title_id = rand::random::<usize>();
-        let temp_path = ClipStrikeApp::title_svg_temp_path(title_id);
+        let temp_path = app.title_svg_temp_path(title_id);
         let updated_svg = "<svg><text>Updated</text></svg>";
+        std::fs::create_dir_all(temp_path.parent().unwrap()).expect("create edit directory");
         std::fs::write(&temp_path, updated_svg).expect("write temp svg");
 
         let temp_uri = ClipStrikeApp::file_uri_from_path(&temp_path).expect("temp path uri");

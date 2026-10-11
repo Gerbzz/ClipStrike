@@ -196,9 +196,9 @@ mod tests {
         fs::create_dir_all(&temp_dir).expect("create temp dir");
 
         let source_path = temp_dir.join("source.png");
-        image::RgbaImage::from_pixel(16, 16, image::Rgba([32, 96, 160, 255]))
+        image::RgbaImage::from_pixel(64, 32, image::Rgba([24, 120, 200, 255]))
             .save(&source_path)
-            .expect("write synthetic source image");
+            .expect("write source image");
 
         let (sender, mut receiver) = tokio::sync::mpsc::channel(10);
         let generator = ProxyGenerator::new(sender);

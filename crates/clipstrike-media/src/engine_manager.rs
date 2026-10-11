@@ -1,6 +1,7 @@
 use crate::engine::VideoEngine;
 use clipstrike_audio::AudioHandle;
 use clipstrike_core::timeline::Clip;
+use clipstrike_core::media_uri::source_label;
 use clipstrike_render::gpu::FrameUploadRequest;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -67,9 +68,9 @@ impl EngineManager {
             let sender = None;
 
             log::debug!(
-                "EngineManager::sync_clip creating engine for clip_id={} uri={} video_enabled={} audio_enabled={}",
+                "EngineManager::sync_clip creating engine for clip_id={} source={} video_enabled={} audio_enabled={}",
                 clip.id,
-                uri,
+                source_label(uri),
                 clip.video_enabled,
                 clip.audio_enabled
             );
@@ -162,6 +163,10 @@ impl EngineManager {
     /// Returns the source media position in milliseconds, or `None` if unavailable.
     pub fn query_clip_position_ms(&self, clip_id: usize) -> Option<i64> {
         self.engines.get(&clip_id)?.query_position_ms()
+    }
+
+    pub fn frame_generation(&self, clip_id: usize) -> Option<u64> {
+        Some(self.engines.get(&clip_id)?.frame_generation())
     }
 
     pub fn remove_clip_engine(&mut self, clip_id: usize) -> bool {

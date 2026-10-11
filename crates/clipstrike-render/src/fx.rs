@@ -422,6 +422,20 @@ mod tests {
     use glam::Vec3;
 
     #[test]
+    fn effect_and_compositor_shaders_validate() {
+        for source in [include_str!("shaders/fx.wgsl"), include_str!("shaders/compositor.wgsl")] {
+            let module = naga::front::wgsl::parse_str(source)
+                .unwrap_or_else(|error| panic!("{}", error.emit_to_string(source)));
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .expect("shader must pass WGSL validation");
+        }
+    }
+
+    #[test]
     fn test_fx_uniforms_default() {
         let uniforms = FxUniforms::default();
         assert_eq!(uniforms.brightness, 1.0);

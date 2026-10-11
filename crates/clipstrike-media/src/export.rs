@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "gstreamer-backend")]
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ExportFormat {
@@ -192,7 +194,7 @@ mod imp {
         height: u32,
         fps_num: i32,
         fps_den: i32,
-        next_pts_ns: AtomicU64,
+        next_frame_index: AtomicU64,
         _output_path: PathBuf,
     }
 
@@ -248,9 +250,7 @@ mod imp {
                     .map_err(|e: glib::error::BoolError| e.to_string())?,
             ));
             appsrc.set_format(gst::Format::Time);
-            let frame_duration_ns = frame_duration_nanos(settings.fps_num, settings.fps_den);
-            appsrc.set_duration(Some(gst::ClockTime::from_nseconds(frame_duration_ns)));
-
+            // appsrc duration is the duration of the whole stream, not one frame.
             let mut elements: Vec<&gst::Element> =
                 vec![appsrc.upcast_ref(), &videoconvert, &encoder];
             if let Some(parser) = &parser {
@@ -270,7 +270,7 @@ mod imp {
                 height: settings.height,
                 fps_num: settings.fps_num,
                 fps_den: settings.fps_den,
-                next_pts_ns: AtomicU64::new(0),
+                next_frame_index: AtomicU64::new(0),
                 _output_path: output_path.as_ref().to_path_buf(),
             })
         }
@@ -285,10 +285,10 @@ mod imp {
         pub fn push_frame(&self, bytes: &[u8]) -> Result<(), String> {
             let mut buffer = gst::Buffer::with_size(bytes.len())
                 .map_err(|_| "Failed to allocate export buffer".to_string())?;
-            let frame_duration_ns = self.frame_duration_nanos();
-            let pts_ns = self
-                .next_pts_ns
-                .fetch_add(frame_duration_ns, Ordering::Relaxed);
+            let frame_index = self.next_frame_index.fetch_add(1, Ordering::Relaxed);
+            let pts_ns = frame_pts_nanos(frame_index, self.fps_num, self.fps_den);
+            let next_pts_ns = frame_pts_nanos(frame_index + 1, self.fps_num, self.fps_den);
+            let frame_duration_ns = next_pts_ns.saturating_sub(pts_ns);
             {
                 let buffer_mut = buffer
                     .get_mut()
@@ -344,15 +344,11 @@ mod imp {
             (self.fps_num, self.fps_den)
         }
 
-        fn frame_duration_nanos(&self) -> u64 {
-            frame_duration_nanos(self.fps_num, self.fps_den)
-        }
     }
 
-    fn frame_duration_nanos(fps_num: i32, fps_den: i32) -> u64 {
-        let fps_num = fps_num.max(1) as u64;
-        let fps_den = fps_den.max(1) as u64;
-        (1_000_000_000u64.saturating_mul(fps_den) / fps_num).max(1)
+    fn frame_pts_nanos(frame_index: u64, fps_num: i32, fps_den: i32) -> u64 {
+        let numerator = u128::from(frame_index) * 1_000_000_000u128 * fps_den.max(1) as u128;
+        (numerator / fps_num.max(1) as u128).min(u128::from(u64::MAX)) as u64
     }
 
     fn make_first_available_element(
@@ -408,40 +404,28 @@ mod imp {
 
 #[cfg(not(feature = "gstreamer-backend"))]
 mod imp {
-    use super::{ExportSettings, Path, PathBuf};
+    use super::{ExportSettings, Path};
 
-    pub struct Exporter {
-        _output_path: PathBuf,
-        width: u32,
-        height: u32,
-        fps_num: i32,
-        fps_den: i32,
-    }
+    pub struct Exporter;
 
     impl Exporter {
         pub fn new<P: AsRef<Path>>(
-            output_path: P,
-            settings: &ExportSettings,
+            _output_path: P,
+            _settings: &ExportSettings,
         ) -> Result<Self, String> {
-            Ok(Self {
-                _output_path: output_path.as_ref().to_path_buf(),
-                width: settings.width,
-                height: settings.height,
-                fps_num: settings.fps_num,
-                fps_den: settings.fps_den,
-            })
+            Err("Video export is unavailable: this build has no GStreamer backend".into())
         }
 
         pub fn start(&self) -> Result<(), String> {
-            Ok(())
+            Err("Video export is unavailable: this build has no GStreamer backend".into())
         }
 
         pub fn push_frame(&self, _bytes: &[u8]) -> Result<(), String> {
-            Ok(())
+            Err("Video export is unavailable: this build has no GStreamer backend".into())
         }
 
         pub fn end_of_stream(&self) -> Result<(), String> {
-            Ok(())
+            Err("Video export is unavailable: this build has no GStreamer backend".into())
         }
 
         pub fn stop(&self) -> Result<(), String> {
@@ -449,18 +433,32 @@ mod imp {
         }
 
         pub fn frame_size(&self) -> usize {
-            (self.width as usize)
-                .saturating_mul(self.height as usize)
-                .saturating_mul(4)
+            0
         }
 
         pub fn fps(&self) -> (i32, i32) {
-            (self.fps_num, self.fps_den)
+            (0, 1)
         }
     }
 }
 
 pub use imp::Exporter;
+#[cfg(all(test, not(feature = "gstreamer-backend")))]
+mod unavailable_tests {
+    #[test]
+    fn disabled_backend_cannot_report_export_success_or_create_file() {
+        let path = std::env::temp_dir().join(format!(
+            "clipstrike-disabled-export-{}.mp4",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let error = super::Exporter::new(&path, &super::ExportSettings::default())
+            .err()
+            .expect("disabled backend must fail");
+        assert!(error.contains("no GStreamer backend"));
+        assert!(!path.exists());
+    }
+}
 #[cfg(all(test, feature = "gstreamer-backend"))]
 mod tests {
     use super::Exporter;
