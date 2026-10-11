@@ -1,0 +1,8 @@
+asset:        synthetic-chronological.cstrike
+title:        Synthetic ClipStrike importer timeline fixture
+author:       ClipStrike contributors
+source:       original synthetic test data; no demo, match, player or captured media
+license:      first-party license not selected
+license-file: none
+added:        2026-10-11 by ClipStrike contributors
+notes:        Invented 60 fps cuts at 1.0 and 2.2 seconds; media URI placeholders only.

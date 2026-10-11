@@ -1,52 +1,123 @@
-﻿[workspace]
-members = [
-    "crates/clipstrike-audio",
-    "crates/clipstrike-core",
-    "crates/clipstrike-media",
-    "crates/clipstrike-render",
-    "crates/clipstrike-ui",
-    "crates/clipstrike-app",
-]
-default-members = [
-    "crates/clipstrike-audio",
-    "crates/clipstrike-core",
-    "crates/clipstrike-media",
-    "crates/clipstrike-render",
-    "crates/clipstrike-ui",
-    "crates/clipstrike-app",
-]
-resolver = "2"
+[workspace]
+resolver = "3"
+members = ["apps/filmcraft", "crates/aac", "crates/ac3", "crates/apv", "crates/audio-dsp", "crates/av1", "crates/bitstream", "crates/captions", "crates/cfb", "crates/codecs", "crates/color", "crates/dnx", "crates/edit", "crates/engine", "crates/export", "crates/format", "crates/frame", "crates/geom", "crates/gpu", "crates/h264", "crates/h264enc", "crates/hevc", "crates/interchange", "crates/isobmff", "crates/matroska", "crates/media", "crates/mpeg2v", "crates/mpegts", "crates/mxf", "crates/ogg", "crates/opus", "crates/platform", "crates/project", "crates/prores", "crates/render", "crates/scopes", "crates/speech", "crates/testkit", "crates/text", "crates/time", "crates/tts", "crates/tts-text", "crates/ui-egui", "crates/vp9"]
+default-members = ["apps/filmcraft"]
 
 [workspace.package]
+version = "0.6.0"
 edition = "2024"
-version = "0.1.0"
-license = "MIT"
+license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+repository = "https://github.com/storytold/filmcraft"
 
 [workspace.dependencies]
-bytemuck = { version = "1.18", features = ["derive"] }
-eframe = { version = "0.30", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "glow"] }
-egui = "0.30"
-egui_extras = { version = "0.30", features = ["image"] }
-env_logger = "0.11"
-futures = "0.3"
-glam = "0.29"
-glib = "0.20"
-gstreamer = { version = "0.23", package = "gstreamer" }
-gstreamer-app = "0.23"
-gstreamer-gl = "0.23"
-gstreamer-pbutils = "0.23"
-gstreamer-video = "0.23"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-base64 = "0.22"
-cpal = "0.15"
+filmcraft-time = { path = "crates/time" }
+filmcraft-geom = { path = "crates/geom" }
+filmcraft-color = { path = "crates/color" }
+filmcraft-bitstream = { path = "crates/bitstream" }
+filmcraft-isobmff = { path = "crates/isobmff" }
+filmcraft-matroska = { path = "crates/matroska" }
+filmcraft-mxf = { path = "crates/mxf" }
+filmcraft-cfb = { path = "crates/cfb" }
+filmcraft-mpegts = { path = "crates/mpegts" }
+filmcraft-mpeg2v = { path = "crates/mpeg2v" }
+filmcraft-ac3 = { path = "crates/ac3" }
+filmcraft-ogg = { path = "crates/ogg" }
+filmcraft-h264 = { path = "crates/h264" }
+filmcraft-hevc = { path = "crates/hevc" }
+filmcraft-vp9 = { path = "crates/vp9" }
+filmcraft-prores = { path = "crates/prores" }
+filmcraft-dnx = { path = "crates/dnx" }
+filmcraft-apv = { path = "crates/apv" }
+filmcraft-av1 = { path = "crates/av1" }
+filmcraft-aac = { path = "crates/aac" }
+filmcraft-opus = { path = "crates/opus" }
+filmcraft-h264enc = { path = "crates/h264enc" }
+filmcraft-audio-dsp = { path = "crates/audio-dsp" }
+filmcraft-frame = { path = "crates/frame" }
+filmcraft-media = { path = "crates/media" }
+filmcraft-codecs = { path = "crates/codecs" }
+filmcraft-project = { path = "crates/project" }
+filmcraft-edit = { path = "crates/edit" }
+filmcraft-interchange = { path = "crates/interchange" }
+filmcraft-text = { path = "crates/text" }
+filmcraft-captions = { path = "crates/captions" }
+filmcraft-speech = { path = "crates/speech" }
+filmcraft-tts = { path = "crates/tts" }
+filmcraft-tts-text = { path = "crates/tts-text" }
+filmcraft-render = { path = "crates/render" }
+filmcraft-gpu = { path = "crates/gpu" }
+filmcraft-scopes = { path = "crates/scopes" }
+filmcraft-export = { path = "crates/export" }
+filmcraft-format = { path = "crates/format" }
+filmcraft-engine = { path = "crates/engine" }
+filmcraft-ui-egui = { path = "crates/ui-egui" }
+filmcraft-platform = { path = "crates/platform" }
+filmcraft-testkit = { path = "crates/testkit" }
+thiserror = "2"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
 log = "0.4"
-proptest = "1.6"
-rand = "0.8"
-rfd = "0.15"
-rayon = "1.10"
-ringbuf = "0.4"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1.41", default-features = false, features = ["macros", "rt", "sync", "time"] }
-wgpu = "23.0"
-winit = "0.30"
+rayon = "1"
+proptest = "1"
+roxmltree = "0.21"
+egui = "0.36"
+eframe = { version = "0.36", default-features = false }
+egui_kittest = "0.36"
+rfd = "0.17"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+too_many_arguments = "allow"
+needless_range_loop = "allow"
+type_complexity = "allow"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package.filmcraft-h264]
+opt-level = 3
+
+[profile.dev.package.filmcraft-h264enc]
+opt-level = 3
+
+[profile.dev.package.filmcraft-hevc]
+opt-level = 3
+
+[profile.dev.package.filmcraft-prores]
+opt-level = 3
+
+[profile.dev.package.filmcraft-dnx]
+opt-level = 3
+
+[profile.dev.package.filmcraft-apv]
+opt-level = 3
+
+[profile.dev.package.filmcraft-av1]
+opt-level = 3
+
+[profile.dev.package.filmcraft-aac]
+opt-level = 3
+
+[profile.dev.package.filmcraft-audio-dsp]
+opt-level = 3
+
+[profile.dev.package.filmcraft-mxf]
+opt-level = 3
+
+[profile.dev.package.filmcraft-opus]
+opt-level = 3
+
+[profile.dev.package.filmcraft-vp9]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,50 +1,17 @@
-﻿/target
-
-# Node
-node_modules/
-.npm-cache/
-
-# Logs and Build artifacts
-*.log
-*.tmp
-*.msi
-*.zip
-gst_extracted/
-test-results/
-
-# Temporary check/output files
-*_check*.txt
-build_*.txt
-test_out.txt
-test_results.txt
-final_*.txt
-
-# Local tooling and scratch files
-.gemini/
-.superpowers/
-.gitconfig
-skills/
-cgc-mcp.skill
-4053
-head_ui.rs
-head_ui_utf8.txt
-orig_ui_head.rs
-server.err
-server.out
-ui-debug-screenshot.png
-New Project.mp4
-PythonDatatempclipstrike-*
-
-# Local media, demo data, and machine state
-*.dem
-*.raw.json
-*.sqlite
-*.sqlite-*
-*.db
-*.mp4
-*.mov
-*.wav
+/target/
+/contributors/
+/assets/app-icon/
+/docs/brand/
 *.exe
-app_test_logs.txt
-git_status.txt
-git_cmd_status.txt
+*.dll
+*.pdb
+*.log
+*.db
+*.sqlite
+*.fcproj
+!crates/format/tests/fixtures/*.fcproj
+*.mp4
+*.wav
+*.dem
+*.cstrike
+!apps/filmcraft/tests/fixtures/synthetic-chronological.cstrike
