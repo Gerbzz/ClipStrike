@@ -1,8 +1,24 @@
-# ClipStrike — FilmCraft editor source candidate
+# ClipStrike
 
-This is a source-only candidate to replace the old ClipStrike shell with the actual FilmCraft-based native editor. It retains FilmCraft's editor shell, engine, timeline, media pool, project model, codecs and export UI, with ClipStrike importer, branding, safety and playback changes. The separate Windows preview currently uses the `clipstrike-seek-next` binary; the primary local launcher has not been promoted.
+**by PWDS**
 
-This source checkpoint is published as a normal descendant of the earlier `Gerbzz/Clipstrike` main at `fdf2f6ac8828374b803577ae1f6b310b73860075`. DemoStrike pins that historical commit. Repository history remains intact; no release binary or installer is provided.
+**Your footage. Your timeline.**
+
+ClipStrike is a desktop workspace for turning source footage into an edit. Organize media, review clips, build a cut across tracks, and save an editable project; its `.cstrike` importer reads capture packages without changing the originals.
+
+### Highlights
+
+- Arrange video and audio on a multitrack timeline.
+- Keep source media and project edits organized.
+- Bring supported `.cstrike` capture packages into the editor.
+
+## Current status
+
+Source-only Windows editor candidate. The separate `clipstrike-seek-next` preview has had bounded local checks, but this published source package has not completed its own build and test pass. Native interaction, speaker output, and end-to-end sound/picture sync remain unverified; no release installer is provided.
+
+## Edit a project
+
+Bring footage into the media pool, review source clips, and arrange the parts you want on the multitrack timeline. Save the project to keep the cut editable. The supported `.cstrike` importer reads a capture package conservatively and leaves its input project alone.
 
 ## Reproduce the bounded Windows checkpoint
 
@@ -22,3 +38,11 @@ The original migration checkout passed 132 UI, 10 source-viewer and 48 app tests
 The `.cstrike` importer is conservative and does not modify input projects. Native mouse/keyboard and accessibility use, speaker output and end-to-end sound/picture sync remain unverified. The current preview checkpoint is not a release or general media-fidelity claim.
 
 See [SOURCE_SCOPE.md](SOURCE_SCOPE.md) for exact source and licensing boundaries and [ATTRIBUTION.md](ATTRIBUTION.md) for bundled donor assets. No first-party ClipStrike license grant is made by the donor license files.
+
+## Next steps
+
+Build and test this exact source package, then verify native controls, speaker output, and sound/picture sync with reviewed footage before packaging a release.
+
+## Source history and credits
+
+This editor candidate retains FilmCraft's editor, engine, timeline, media pool, project model, codec, and export UI, with ClipStrike importer, branding, safety, and playback changes. It descends from the earlier ClipStrike main at `fdf2f6ac8828374b803577ae1f6b310b73860075`, which DemoStrike still pins. See [SOURCE_SCOPE.md](SOURCE_SCOPE.md) for the exact source and license boundary and [ATTRIBUTION.md](ATTRIBUTION.md) for bundled donor assets. Donor license files do not grant terms for all first-party ClipStrike changes.
