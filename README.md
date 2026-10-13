@@ -2,7 +2,7 @@
 
 This is a source-only candidate to replace the old ClipStrike shell with the actual FilmCraft-based native editor. It retains FilmCraft's editor shell, engine, timeline, media pool, project model, codecs and export UI, with ClipStrike importer, branding, safety and playback changes. The separate Windows preview currently uses the `clipstrike-seek-next` binary; the primary local launcher has not been promoted.
 
-The source is staged as a normal descendant of public `Gerbzz/Clipstrike` main at `fdf2f6ac8828374b803577ae1f6b310b73860075`. DemoStrike pins that historical commit. No repository history is rewritten, and this candidate has not been pushed.
+This source checkpoint is published as a normal descendant of the earlier `Gerbzz/Clipstrike` main at `fdf2f6ac8828374b803577ae1f6b310b73860075`. DemoStrike pins that historical commit. Repository history remains intact; no release binary or installer is provided.
 
 ## Reproduce the bounded Windows checkpoint
 
