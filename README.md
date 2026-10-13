@@ -18,7 +18,11 @@ Source-only Windows editor candidate. The separate `clipstrike-seek-next` previe
 
 ## Edit a project
 
-Bring footage into the media pool, review source clips, and arrange the parts you want on the multitrack timeline. Save the project to keep the cut editable. The supported `.cstrike` importer reads a capture package conservatively and leaves its input project alone.
+1. Bring source footage into the media pool and review it in the source viewer.
+2. Place the parts you want on video and audio tracks, then save the editable project.
+3. For a supported capture handoff, use the `.cstrike` importer. It reads the input conservatively and leaves the source project unchanged.
+
+The current source checkout still needs its own build and hands-on playback review before these steps can serve as release instructions.
 
 ## Reproduce the bounded Windows checkpoint
 
@@ -33,7 +37,7 @@ cargo test --locked -p filmcraft --bin clipstrike-seek-next --features seek-chec
 cargo build --locked -p filmcraft --bin clipstrike-seek-next --features seek-checkpoint
 ```
 
-The original migration checkout passed 132 UI, 10 source-viewer and 48 app tests, built `clipstrike-seek-next.exe` at SHA-256 `80c85828719378c5bd7d1babd4933fddc9b86f43ef5f320b26b6289b7e1ec16d`, and passed a bounded real-project live-seek trace. Independent review reproduced importer refusals and seek/pause progression. This selected source package has a newly synthetic importer fixture and a reduced workspace lockfile, so **its own build/tests remain pending** while the heavy build slot is paused.
+The original migration checkout passed 132 UI, 10 source-viewer and 48 app tests, built `clipstrike-seek-next.exe` at SHA-256 `80c85828719378c5bd7d1babd4933fddc9b86f43ef5f320b26b6289b7e1ec16d`, and passed a bounded real-project live-seek trace. Independent review reproduced importer refusals and seek/pause progression. This selected source package has a newly synthetic importer fixture and a reduced workspace lockfile, so **its own build/tests remain pending**.
 
 The `.cstrike` importer is conservative and does not modify input projects. Native mouse/keyboard and accessibility use, speaker output and end-to-end sound/picture sync remain unverified. The current preview checkpoint is not a release or general media-fidelity claim.
 
