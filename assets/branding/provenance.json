@@ -1,0 +1,21 @@
+{
+  "app": "ClipStrike",
+  "asset": "assets/branding/ClipStrike.png",
+  "method": "Lossless rectangular extraction of original pixels with ImageMagick. No scaling, recoloring, tracing, generation, transparency fabrication or animal changes. Original cream outside rounded corners retained. Labels excluded.",
+  "coordinate_system": "Origin top-left; crop bounds [left, top, right, bottom), right/bottom exclusive.",
+  "source_sha256": "511411a7067620626aa7ca176ef259a994395a391128db66d7c80c9418c4e3b2",
+  "crop_bounds": [
+    32,
+    0,
+    688,
+    656
+  ],
+  "dimensions": [
+    656,
+    656
+  ],
+  "sha256": "b98b2fad3c7fae44a563f62012d0e2bebbfd030ddc779d0dd9ed25acae416dc4",
+  "decoded_rgb_sha256": "ba9cf8121f7637f722f7c4f423cf7f61b21744bfac56f2b8ae046fbd3cdce8b6",
+  "pixel_equality_verified": true,
+  "git_blob_sha": "25f315bfe88689eca3f90b04d284ace4a9efc50a"
+}
