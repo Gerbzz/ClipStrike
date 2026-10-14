@@ -1,6 +1,11 @@
 # ClipStrike
 
-**by PWDS**
+<p align="center">
+  <a href="https://prowebdevsolutions.com"><picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/branding/PWDS-logo-orange.svg">
+    <img src="assets/branding/PWDS-logo.png" alt="PWDS company logo" width="120">
+  </picture></a>
+</p>
 
 **Your footage. Your timeline.**
 
@@ -50,3 +55,7 @@ Build and test this exact source package, then verify native controls, speaker o
 ## Source history and credits
 
 This editor candidate retains FilmCraft's editor, engine, timeline, media pool, project model, codec, and export UI, with ClipStrike importer, branding, safety, and playback changes. It descends from the earlier ClipStrike main at `fdf2f6ac8828374b803577ae1f6b310b73860075`, which DemoStrike still pins. See [SOURCE_SCOPE.md](SOURCE_SCOPE.md) for the exact source and license boundary and [ATTRIBUTION.md](ATTRIBUTION.md) for bundled donor assets. Donor license files do not grant terms for all first-party ClipStrike changes.
+
+## PWDS brand artwork
+
+The company mark in this masthead is the existing [official PWDS logo](https://github.com/Gerbzz/PWDS-Website/blob/main/public/prowebdevsolutions-logo.png), with the [official orange display asset](https://prowebdevsolutions.com/images/prowebdevsolutions-logo-orange.svg) for dark backgrounds. Any app logo above it remains the original Strike suite artwork.
