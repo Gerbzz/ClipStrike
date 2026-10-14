@@ -1,0 +1,8 @@
+asset:        clipstrike-editor-current.png
+title:        ClipStrike editor procedural demo screenshot
+author:       ClipStrike contributors
+source:       original app-generated screenshot from source revision aed090a37a75e5fdb69a7d0c2072e9fad4b6e2c7
+license:      First-party copyright retained; no separate grant selected
+license-file: none
+added:        2026-10-14 by Codex for Gerbzz
+notes:        1500x900 full-window image of the source-generated demo, with no imported media; see docs/SCREENSHOT_PROVENANCE.md

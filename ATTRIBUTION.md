@@ -12,5 +12,6 @@ This selected source subset is based on FilmCraft commit `2ff3f5e266838700c292a3
 | `crates/platform/src/nvenc/ffi.rs` | NVIDIA `nvEncodeAPI.h` structures transcribed by FilmCraft contributors | MIT notice retained in file header |
 | `apps/filmcraft/tests/fixtures/synthetic-chronological.cstrike` | New, invented ClipStrike importer test data; no match or captured media | First-party license not selected |
 | Code-drawn ClipStrike wordmark and window icon | ClipStrike contributors; `crates/ui-egui/src/brand.rs`, `apps/filmcraft/src/main.rs` | First-party license not selected |
+| `assets/screenshots/clipstrike-editor-current.png` | App-generated full-window image of the procedural demo; [capture provenance](docs/SCREENSHOT_PROVENANCE.md) and adjacent sidecar | First-party copyright retained; no separate grant selected |
 
 Each bundled font has an adjacent `.attribution` sidecar and its OFL text. The importer fixture also has a sidecar describing its synthetic origin. Optional `craft-fonts` input is not bundled. Upstream ArtCraft marks, donor app icons, screenshots, promotional media and reference projects are excluded.

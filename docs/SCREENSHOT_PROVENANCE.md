@@ -1,0 +1,7 @@
+# ClipStrike screenshot provenance
+
+The [README image](../assets/screenshots/clipstrike-editor-current.png) is a 1500 × 900 PNG captured on 2026-10-14 from the exact public `main` source revision `aed090a37a75e5fdb69a7d0c2072e9fad4b6e2c7`. Cargo built `filmcraft`'s `clipstrike` desktop binary offline with `--locked` and one job against a retained target cache. The build completed in 20 minutes 58 seconds. The executable SHA-256 was `9F9A1FF72E0E0B432BF15602ED54A12C219CB079E37FAD3EE77BA1A5CC55D59F` (63,427,584 bytes).
+
+The app launched with `--demo --no-recover`, a fresh isolated data directory, and its localhost control server. Its demo creates procedural scenes and audio from source code, without imported files. The app's `file.saveAs` command saved the generated project as `ClipStrike Demo.fcproj` in the isolated capture directory; that project was not published. The `ui.resize` and `ui.screenshot` commands returned a complete 1500 × 900 app-rendered window PNG, and `app.quit` closed the process. The image was visually checked before publication. PNG SHA-256: `7CF1CA5840F9597BF9AF26EA52E4D5D1C1B1A9E40041F4B935A79BE28F21175A` (5,401,378 bytes).
+
+This shows the current editor with a synthetic sunset preview, media bins, and multitrack timeline. It does not establish native mouse or keyboard behavior, accessibility, speaker playback, export fidelity, or sound/picture sync. The published source's test suite was not run in this capture pass. No installer or release binary was made.
