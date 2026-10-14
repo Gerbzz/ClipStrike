@@ -1,4 +1,8 @@
-# ClipStrike
+<p align="center">
+  <img src="assets/branding/ClipStrike.png" alt="Original ClipStrike kingfisher logo" width="160" height="160">
+</p>
+
+<h1 align="center">ClipStrike</h1>
 
 <p align="center">
   <a href="https://prowebdevsolutions.com"><picture>
