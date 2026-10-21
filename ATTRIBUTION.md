@@ -15,3 +15,5 @@ This selected source subset is based on FilmCraft commit `2ff3f5e266838700c292a3
 | `assets/screenshots/clipstrike-editor-current.png` | App-generated full-window image of the procedural demo; [capture provenance](docs/SCREENSHOT_PROVENANCE.md) and adjacent sidecar | First-party copyright retained; no separate grant selected |
 
 Each bundled font has an adjacent `.attribution` sidecar and its OFL text. The importer fixture also has a sidecar describing its synthetic origin. Optional `craft-fonts` input is not bundled. Upstream ArtCraft marks, donor app icons, screenshots, promotional media and reference projects are excluded.
+
+The export renderer-pool admission control and its bounded reentrancy regression are adapted from FilmCraft commit [`8309f21a6c3f34ddf190af7fd9bfd913053a1fd5`](https://github.com/storytold/filmcraft/commit/8309f21a6c3f34ddf190af7fd9bfd913053a1fd5), under the retained donor MIT/Apache-2.0 terms. The ClipStrike regression additionally crosses audio interleave boundaries and checks that an overlapped step reads audio.

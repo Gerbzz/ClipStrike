@@ -1,0 +1,59 @@
+name: Export correctness
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/export.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - 'assets/fonts/**'
+  push:
+    branches:
+      - main
+      - room/export-renderer-admission-control
+    paths:
+      - '.github/workflows/export.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - 'assets/fonts/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: export-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  export:
+    name: Export (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_TERM_COLOR: always
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the exact commit under review
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Prepare Rust
+        run: |
+          git rev-parse HEAD
+          rustup update stable --no-self-update
+          rustc +stable --version
+          cargo +stable --version
+      - name: Run bounded renderer and cleanup regressions
+        run: cargo +stable test --locked -p filmcraft-export --test renderer_reentrancy --test pool_trim -- --test-threads=1
+      - name: Run the export library suite
+        run: cargo +stable test --locked -p filmcraft-export --lib -- --test-threads=1
