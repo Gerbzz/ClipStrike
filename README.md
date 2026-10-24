@@ -15,6 +15,12 @@
 
 ClipStrike is a desktop workspace for turning source footage into an edit. Organize media, review clips, build a cut across tracks, and save an editable project; its `.cstrike` importer reads capture packages without changing the originals.
 
+## Rust direction and migration status
+
+- **Target:** A Rust-native video editor, extending the selected FilmCraft foundation rather than restarting an already-Rust application.
+- **Current implementation:** The [Cargo workspace](Cargo.toml) and [desktop entry point](apps/filmcraft/src/main.rs) are already Rust, with ClipStrike capture-import, safety and playback adaptations.
+- **Remaining migration:** Continue adapting and validating the Rust editor. Native controls, playback and sound/picture sync, broader media fidelity and release packaging remain open; an existing Rust codebase is not a finished product.
+
 ![ClipStrike editor showing a procedural sunset preview, media bins, and video and audio tracks](assets/screenshots/clipstrike-editor-current.png)
 
 This image was captured from the current public source using the app's own window screenshot command. Its built-in demo uses procedural media; no personal footage or match recording is included. See [screenshot provenance](docs/SCREENSHOT_PROVENANCE.md).
