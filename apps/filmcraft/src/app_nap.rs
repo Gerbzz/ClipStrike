@@ -16,7 +16,7 @@ pub fn disable() -> bool {
     {
         use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
         let options = NSActivityOptions::UserInitiatedAllowingIdleSystemSleep | NSActivityOptions::LatencyCritical;
-        let reason = NSString::from_str("ClipStrike plays and renders video in the background");
+        let reason = NSString::from_str("FilmStrike plays and renders video in the background");
         let token = NSProcessInfo::processInfo().beginActivityWithOptions_reason(options, &reason);
         // The activity lasts while the token is alive: keep it for the life of the process.
         std::mem::forget(token);

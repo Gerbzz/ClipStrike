@@ -1,6 +1,6 @@
 [package]
 name = "filmcraft"
-description = "ClipStrike editor built on the FilmCraft application"
+description = "FilmStrike editor built on the FilmCraft application"
 version.workspace = true
 edition.workspace = true
 default-run = "clipstrike"

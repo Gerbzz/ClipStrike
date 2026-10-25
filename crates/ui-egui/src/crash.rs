@@ -68,7 +68,7 @@ fn write_log(summary: &str) {
     let bt = std::backtrace::Backtrace::force_capture();
     let secs = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(f, "=== {} ClipStrike {} (unix {secs})\n{summary}\n{bt}\n", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        let _ = writeln!(f, "=== {} FilmStrike {} (unix {secs})\n{summary}\n{bt}\n", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
     }
 }
 

@@ -9,7 +9,7 @@
 # 净室实现：每条译文均由英文含义直接译出，使用通用的中文视频剪辑术语（剪辑、时间轴、序列、
 #   轨道、关键帧……）。未参考或复制任何专有本地化资源、字符串表或产品界面。产品与技术名称
 #   （FilmCraft、ArtCraft、Lumetri、ProRes、LUFS……）保留原文拼写。
-	About ClipStrike	关于 ClipStrike
+	About FilmStrike	关于 FilmStrike
 	Add Audio Submix Track	添加音频子混音轨道
 	Add Caption at Playhead	在播放头处添加字幕
 	Add Chapter Marker…	添加章节标记…
@@ -3532,19 +3532,19 @@
 	Delete Caption Tracks	删除多个字幕轨道
 	Delete Empty Caption Tracks	删除空字幕轨道
 
-# ClipStrike source labels
+# FilmStrike source labels
 	Audio output failed: playing without sound (check Settings ? Audio Hardware)	音频输出失败：正在无声播放（请检查“设置 > 音频硬件”）
 	Audio output is not responding: playing without sound (check Settings ? Audio Hardware)	音频输出无响应：正在无声播放（请检查“设置 > 音频硬件”）
 	FilmCraft source and license	FilmCraft 源代码和许可证
-	Quit ClipStrike	退出 ClipStrike
+	Quit FilmStrike	退出 FilmStrike
 	Clip gain	片段增益
 	Volume effect	音量效果
-	ClipStrike Graphics Template	ClipStrike 图形模板
-	ClipStrike Project	ClipStrike 项目
-	ClipStrike hit an error	ClipStrike 遇到错误
-	ClipStrike keeps the rest of the RAM free for other applications.	ClipStrike 将剩余内存留给其他应用程序。
-	ClipStrike quit unexpectedly while “{name}” had unsaved changes.	ClipStrike 在“{name}”存在未保存的更改时意外退出。
-	ClipStrike was closed while “{name}” had unsaved changes.	ClipStrike 在“{name}”存在未保存的更改时被关闭。
-	Not supported by ClipStrike's encoders yet	ClipStrike 的编码器尚不支持
-	Saved as a ClipStrike graphics template (.fcgt) in your templates folder.	已作为 ClipStrike 图形模板（.fcgt）保存到你的模板文件夹。
+	FilmStrike Graphics Template	FilmStrike 图形模板
+	FilmStrike Project	FilmStrike 项目
+	FilmStrike hit an error	FilmStrike 遇到错误
+	FilmStrike keeps the rest of the RAM free for other applications.	FilmStrike 将剩余内存留给其他应用程序。
+	FilmStrike quit unexpectedly while “{name}” had unsaved changes.	FilmStrike 在“{name}”存在未保存的更改时意外退出。
+	FilmStrike was closed while “{name}” had unsaved changes.	FilmStrike 在“{name}”存在未保存的更改时被关闭。
+	Not supported by FilmStrike's encoders yet	FilmStrike 的编码器尚不支持
+	Saved as a FilmStrike graphics template (.fcgt) in your templates folder.	已作为 FilmStrike 图形模板（.fcgt）保存到你的模板文件夹。
 	FilmCraft Help…	FilmCraft 帮助…

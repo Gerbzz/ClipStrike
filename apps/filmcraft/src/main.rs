@@ -1,4 +1,4 @@
-//! ClipStrike desktop app.
+//! FilmStrike desktop app (formerly ClipStrike).
 //!
 //! Usage: `filmcraft [--control <port>] [--demo|--empty] [--recover|--no-recover] [--data-dir <dir>]
 //! [project.fcproj | media files…]`; `--help` prints the options, `--version` the version. An
@@ -52,7 +52,7 @@ fn app_icon() -> egui::IconData {
     egui::IconData { rgba: include_bytes!("../../../assets/branding/ClipStrike-128.rgba").to_vec(), width: 128, height: 128 }
 }
 
-/// Keep ClipStrike preferences, autosaves and recovery separate from ClipStrike.
+/// Keep the legacy ClipStrike data location so the display rename preserves saved state.
 fn clipstrike_data_dir() -> Option<std::path::PathBuf> {
     let env = |key: &str| std::env::var_os(key).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
     if let Some(path) = env("CLIPSTRIKE_DATA_DIR") {
@@ -79,7 +79,7 @@ fn tell(text: &str, error: bool) {
     #[cfg(all(target_os = "windows", not(debug_assertions)))]
     {
         let level = if error { rfd::MessageLevel::Error } else { rfd::MessageLevel::Info };
-        let _ = rfd::MessageDialog::new().set_level(level).set_title("ClipStrike").set_description(text).show();
+        let _ = rfd::MessageDialog::new().set_level(level).set_title("FilmStrike").set_description(text).show();
     }
 }
 
@@ -121,7 +121,7 @@ fn main() -> eframe::Result {
     };
     let legacy_loaded = prepared_legacy.is_some();
     let log_dir = data_dir.clone().or_else(clipstrike_data_dir).map(|d| d.join(logging::LOG_DIR));
-    log::info!("ClipStrike {} ({} {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
+    log::info!("FilmStrike {} ({} {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
     // The log file lives next to the crash logs; opened after the arguments, so `--help`,
     // `--version` and usage errors leave no file behind. Records logged until now go in first.
     if let Some(logger) = logger {
@@ -144,7 +144,7 @@ fn main() -> eframe::Result {
     register_gpu_frame_renderer();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("ClipStrike")
+            .with_title("FilmStrike")
             .with_inner_size([1600.0, 980.0])
             .with_min_inner_size([900.0, 560.0])
             .with_drag_and_drop(true)
@@ -166,6 +166,7 @@ fn main() -> eframe::Result {
         graphics::configure(&mut options, eframe::wgpu::Backends::from_env());
         options
     };
+    // Retain the legacy eframe application name for persistence compatibility.
     let started = eframe::run_native(
         "ClipStrike",
         options,
@@ -250,7 +251,7 @@ fn main() -> eframe::Result {
             }));
             app.hooks.pick_save = Some(Box::new(|name: &str| {
                 rfd::FileDialog::new()
-                    .add_filter(filmcraft_ui_egui::i18n::t("ClipStrike Project"), &file_filters::extensions(&["fcproj"]))
+                    .add_filter(filmcraft_ui_egui::i18n::t("FilmStrike Project"), &file_filters::extensions(&["fcproj"]))
                     .set_file_name(name)
                     .save_file()
                     .map(|p| p.to_string_lossy().to_string())
@@ -288,7 +289,7 @@ fn main() -> eframe::Result {
             }));
             app.hooks.pick_open_project = Some(Box::new(|| {
                 rfd::FileDialog::new()
-                    .add_filter(filmcraft_ui_egui::i18n::t("ClipStrike Project"), &file_filters::extensions(&["fcproj"]))
+                    .add_filter(filmcraft_ui_egui::i18n::t("FilmStrike Project"), &file_filters::extensions(&["fcproj"]))
                     .pick_file()
                     .map(|p| p.to_string_lossy().to_string())
             }));
@@ -309,10 +310,10 @@ fn main() -> eframe::Result {
     // The window could not be created (no usable GPU / graphics driver, no display): say so
     // instead of exiting silently, and keep the reason in the crash log.
     if let Err(e) = &started {
-        let msg = format!("ClipStrike could not start its window: {e}\n\nUpdating the graphics driver usually fixes this.");
+        let msg = format!("FilmStrike could not start its window: {e}\n\nUpdating the graphics driver usually fixes this.");
         log::error!("{msg}");
         filmcraft_ui_egui::crash::record(&msg);
-        let _ = rfd::MessageDialog::new().set_title("ClipStrike").set_description(&msg).set_level(rfd::MessageLevel::Error).show();
+        let _ = rfd::MessageDialog::new().set_title("FilmStrike").set_description(&msg).set_level(rfd::MessageLevel::Error).show();
     }
     started
 }

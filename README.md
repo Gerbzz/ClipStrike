@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="assets/branding/ClipStrike.png" alt="Approved ClipStrike kingfisher logo" width="160" height="160">
+  <img src="assets/branding/ClipStrike.png" alt="Approved FilmStrike kingfisher logo" width="160" height="160">
 </p>
 
-<h1 align="center">ClipStrike</h1>
+<h1 align="center">FilmStrike</h1>
 
 <p align="center">
   <a href="https://prowebdevsolutions.com"><picture>
@@ -13,7 +13,11 @@
 
 **Your footage. Your timeline.**
 
-ClipStrike is a desktop workspace for turning source footage into an edit. Organize media, review clips, build a cut across tracks, and save an editable project; its `.cstrike` importer reads capture packages without changing the originals.
+FilmStrike (formerly ClipStrike) is a desktop workspace for turning source footage into an edit. Organize media, review clips, build a cut across tracks, and save an editable project; its `.cstrike` importer reads capture packages without changing the originals.
+
+## Name and compatibility
+
+FilmStrike is the new display name; this is not a new project format or installation. Existing `.fcproj` projects, `.cstrike` imports, media paths, saved settings and recovery data remain unchanged. Build and launch using the existing `clipstrike` executable names below; a `filmstrike` executable is not introduced. The repository remains `Gerbzz/ClipStrike`. See [rename compatibility](docs/FILMSTRIKE_RENAME.md) for preserved identifiers.
 
 ## Rust direction and migration status
 
@@ -23,7 +27,7 @@ ClipStrike is a desktop workspace for turning source footage into an edit. Organ
 
 ![ClipStrike editor showing a procedural sunset preview, media bins, and video and audio tracks](assets/screenshots/clipstrike-editor-current.png)
 
-This image was captured from the current public source using the app's own window screenshot command. Its built-in demo uses procedural media; no personal footage or match recording is included. See [screenshot provenance](docs/SCREENSHOT_PROVENANCE.md).
+This historical image shows the editor before the FilmStrike display rename and was captured from the public source using the app's own window screenshot command. Its built-in demo uses procedural media; no personal footage or match recording is included. See [screenshot provenance](docs/SCREENSHOT_PROVENANCE.md).
 
 ## Highlights
 

@@ -27,7 +27,7 @@ pub fn install(app: &FilmcraftApp, ctx: egui::Context) -> (Receiver<String>, Sho
     let mut native: Vec<(String, MenuItem)> = Vec::new();
     let mut titles: Vec<(String, Submenu)> = Vec::new();
     let bar = Menu::new();
-    let app_menu = Submenu::new("ClipStrike", true);
+    let app_menu = Submenu::new("FilmStrike", true);
     // FilmCraft ▸ Settings ▸ <category> (Premiere's app-menu layout; General is Cmd+,)
     let settings = Submenu::new(app.ui.language.tr("Settings"), true);
     titles.push(("Settings".into(), settings.clone()));
@@ -38,14 +38,14 @@ pub fn install(app: &FilmcraftApp, ctx: egui::Context) -> (Receiver<String>, Sho
         let _ = settings.append(&mi);
     }
     let _ = app_menu.append_items(&[
-        &MenuItem::with_id("app.about", "About ClipStrike", true, None),
+        &MenuItem::with_id("app.about", "About FilmStrike", true, None),
         &PredefinedMenuItem::separator(),
         &settings,
         &PredefinedMenuItem::separator(),
-        &PredefinedMenuItem::hide(None),
+        &PredefinedMenuItem::hide(Some("Hide FilmStrike")),
         &PredefinedMenuItem::hide_others(None),
         &PredefinedMenuItem::separator(),
-        &PredefinedMenuItem::quit(None),
+        &PredefinedMenuItem::quit(Some("Quit FilmStrike")),
     ]);
     let _ = bar.append(&app_menu);
     for top in MENUS {

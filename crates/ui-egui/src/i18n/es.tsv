@@ -14,7 +14,7 @@
 # way. Product and technology names (FilmCraft, ArtCraft, Lumetri, ProRes, LUFS…) keep their
 # spelling. "video" is written without an accent, as in the rest of this catalog.
 
-	About ClipStrike	Acerca de ClipStrike
+	About FilmStrike	Acerca de FilmStrike
 	Add Audio Submix Track	Añadir pista de submezcla de audio
 	Add Caption at Playhead	Añadir subtítulo en el cabezal
 	Add Chapter Marker…	Añadir marcador de capítulo…
@@ -3551,19 +3551,19 @@
 	Notes for this project: to-dos, instructions, frame numbers… Saved with the project.	Notas de este proyecto: tareas pendientes, instrucciones, números de fotograma… Se guardan con el proyecto.
 	Use Effect Shutter Angle	Usar el ángulo de obturación del efecto
 
-# ClipStrike source labels
+# FilmStrike source labels
 	Audio output failed: playing without sound (check Settings ? Audio Hardware)	Falló la salida de audio: se reproduce sin sonido (revisa Ajustes > Hardware de audio)
 	Audio output is not responding: playing without sound (check Settings ? Audio Hardware)	La salida de audio no responde: se reproduce sin sonido (revisa Ajustes > Hardware de audio)
 	FilmCraft source and license	Código fuente y licencia de FilmCraft
-	Quit ClipStrike	Salir de ClipStrike
+	Quit FilmStrike	Salir de FilmStrike
 	Clip gain	Ganancia del clip
 	Volume effect	Efecto de volumen
-	ClipStrike Graphics Template	Plantilla de gráficos de ClipStrike
-	ClipStrike Project	Proyecto de ClipStrike
-	ClipStrike hit an error	ClipStrike ha encontrado un error
-	ClipStrike keeps the rest of the RAM free for other applications.	ClipStrike deja el resto de la RAM libre para otras aplicaciones.
-	ClipStrike quit unexpectedly while “{name}” had unsaved changes.	ClipStrike se cerró de forma inesperada mientras “{name}” tenía cambios sin guardar.
-	ClipStrike was closed while “{name}” had unsaved changes.	ClipStrike se cerró mientras “{name}” tenía cambios sin guardar.
-	Not supported by ClipStrike's encoders yet	Los codificadores de ClipStrike aún no lo admiten
-	Saved as a ClipStrike graphics template (.fcgt) in your templates folder.	Se guarda como plantilla de gráficos de ClipStrike (.fcgt) en tu carpeta de plantillas.
+	FilmStrike Graphics Template	Plantilla de gráficos de FilmStrike
+	FilmStrike Project	Proyecto de FilmStrike
+	FilmStrike hit an error	FilmStrike ha encontrado un error
+	FilmStrike keeps the rest of the RAM free for other applications.	FilmStrike deja el resto de la RAM libre para otras aplicaciones.
+	FilmStrike quit unexpectedly while “{name}” had unsaved changes.	FilmStrike se cerró de forma inesperada mientras “{name}” tenía cambios sin guardar.
+	FilmStrike was closed while “{name}” had unsaved changes.	FilmStrike se cerró mientras “{name}” tenía cambios sin guardar.
+	Not supported by FilmStrike's encoders yet	Los codificadores de FilmStrike aún no lo admiten
+	Saved as a FilmStrike graphics template (.fcgt) in your templates folder.	Se guarda como plantilla de gráficos de FilmStrike (.fcgt) en tu carpeta de plantillas.
 	FilmCraft Help…	Ayuda de FilmCraft…

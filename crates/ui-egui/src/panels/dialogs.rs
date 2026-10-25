@@ -32,7 +32,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let mut open = true;
     match d {
         Dialog::About => {
-            egui::Window::new("About ClipStrike")
+            egui::Window::new("About FilmStrike")
                 .id(egui::Id::new("About ClipStrike"))
                 .open(&mut open)
                 .collapsible(false)
@@ -447,11 +447,11 @@ fn about_tab(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
     use crate::links;
     let t = app.tokens;
     ui.set_width(380.0);
-    // Original ClipStrike wordmark.
+    // Original FilmStrike wordmark.
     let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
     crate::brand::paint_wordmark(ui, egui::pos2(r.min.x, r.center().y), 20.0, app.ui.dark);
     ui.add_space(6.0);
-    ui.heading("ClipStrike");
+    ui.heading("FilmStrike");
     ui.label(tlf!("Version {version}", version = env!("CARGO_PKG_VERSION")));
     ui.label("Built from the open source FilmCraft editor under MIT OR Apache-2.0.");
     ui.add_space(10.0);

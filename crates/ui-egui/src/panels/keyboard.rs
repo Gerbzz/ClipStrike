@@ -129,7 +129,7 @@ pub const COMMANDS: &[UiCommand] = &[
     uic!("textPanel.showProgramTranscript", "Show Program Transcript", [], None),
     uic!("graphics.beginTextEditing", "Begin Text Editing for a Graphic Layer", [], Some("Cmd+Alt+'")),
     uic!("help.filmcraftHelp", "FilmCraft Help…", ["Help"], Some("F1")),
-    uic!("app.quit", "Quit ClipStrike", [], Some("Cmd+Q")),
+    uic!("app.quit", "Quit FilmStrike", [], Some("Cmd+Q")),
 ];
 
 /// FilmCraft's documentation (Help ▸ FilmCraft Help…, F1).
