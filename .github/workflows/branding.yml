@@ -1,0 +1,35 @@
+name: Approved branding contracts
+on:
+  pull_request:
+    paths:
+      - 'assets/branding/**'
+      - 'apps/filmcraft/**'
+      - 'scripts/*brand*'
+      - '.github/workflows/branding.yml'
+permissions:
+  contents: read
+jobs:
+  branding:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      CLIPSTRIKE_REQUIRE_WINRES: '1'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install Pillow==12.3.0
+      - run: python scripts/check_branding.py
+      - name: Regenerate derived icons
+        run: python scripts/generate_brand_icons.py
+      - name: Verify reproducible derived icons
+        run: git diff --exit-code -- assets/branding
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Native package tests
+        run: cargo test --locked -p filmcraft
+      - name: Build native package
+        run: cargo build --locked -p filmcraft
