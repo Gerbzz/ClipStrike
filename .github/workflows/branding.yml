@@ -4,6 +4,9 @@ on:
     paths:
       - 'assets/branding/**'
       - 'apps/filmcraft/**'
+      - 'crates/ui-egui/**'
+      - 'README.md'
+      - 'docs/FILMSTRIKE_RENAME.md'
       - 'scripts/*brand*'
       - '.github/workflows/branding.yml'
 permissions:
@@ -24,6 +27,7 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install Pillow==12.3.0
       - run: python scripts/check_branding.py
+      - run: python scripts/check_brand_rename.py
       - name: Regenerate derived icons
         run: python scripts/generate_brand_icons.py
       - name: Verify reproducible derived icons

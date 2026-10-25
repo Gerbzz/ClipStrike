@@ -589,7 +589,7 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
     let empty = params.as_object().is_none_or(|m| m.is_empty());
     match id {
         "graphics.template.install" if params.get("path").is_none() => {
-            let path = app.hooks.pick_open_file.as_mut().and_then(|f| f(tl!("ClipStrike Graphics Template"), &["fcgt"]))?;
+            let path = app.hooks.pick_open_file.as_mut().and_then(|f| f(tl!("FilmStrike Graphics Template"), &["fcgt"]))?;
             let r = app.session.execute(id, json!({"path": path})).map_err(|e| e.to_string());
             invalidate(ctx);
             Some(r)
@@ -669,7 +669,7 @@ fn export_dialog(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     });
                 }
             });
-            ui.label(egui::RichText::new(tl!("Saved as a ClipStrike graphics template (.fcgt) in your templates folder.")).weak().size(11.0));
+            ui.label(egui::RichText::new(tl!("Saved as a FilmStrike graphics template (.fcgt) in your templates folder.")).weak().size(11.0));
             if !d.error.is_empty() {
                 ui.colored_label(Color32::from_rgb(0xff, 0x80, 0x80), &d.error);
             }

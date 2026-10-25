@@ -212,7 +212,7 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
             let (filter, ext, name) = if id == "file.exportAle" {
                 (tl!("Avid Log Exchange"), "ale", format!("{}.ale", app.session.project.name))
             } else {
-                (tl!("ClipStrike Project"), "fcproj", tlf!("{name} Selection.fcproj", name = app.session.project.name))
+                (tl!("FilmStrike Project"), "fcproj", tlf!("{name} Selection.fcproj", name = app.session.project.name))
             };
             let Some(path) = app.hooks.pick_save_as.as_mut().and_then(|f| f(filter, &[ext], &name)) else {
                 return Some(Ok(Value::Null));
