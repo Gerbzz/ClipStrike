@@ -1,70 +1,82 @@
 {
   "app": "ClipStrike",
   "asset": "assets/branding/ClipStrike.png",
-  "method": "Measured rounded alpha mask applied to the original 656x656 logo tile, then translated by whole pixels to center its visible bounds. Original visible RGB and masked visible RGBA were verified unchanged.",
-  "source_tile": {
-    "repository": "Gerbzz/ClipStrike",
-    "commit": "d57b36ef96ad00217060913e10eb4ecd355c6d1b",
-    "path": "assets/branding/ClipStrike.png",
-    "sha256": "b98b2fad3c7fae44a563f62012d0e2bebbfd030ddc779d0dd9ed25acae416dc4",
-    "git_blob_sha": "25f315bfe88689eca3f90b04d284ace4a9efc50a"
-  },
-  "mask_and_centering": {
-    "inset_pixels": 1.5,
-    "masked_alpha_bbox": [
-      9,
-      25,
-      627,
-      630
-    ],
-    "centered_alpha_bbox": [
-      19,
-      25,
-      637,
-      630
-    ],
-    "integer_translation": [
-      10,
-      0
-    ],
-    "padding_ltrb": [
-      19,
-      25,
-      19,
-      26
-    ],
-    "original_visible_rgb_exact": true,
-    "masked_visible_rgba_exact": true,
-    "transparent_corners": true
-  },
+  "method": "Byte-exact approved 2026-10-25 corrected 512px handoff. No cropping, translation, recoloring or padding changes.",
+  "sha256": "2180863c3e8962940d5335e30c8cc64c4617f1d27b9ee43b7aded3a98f29cb15",
   "dimensions": [
-    656,
-    656
+    512,
+    512
   ],
   "mode": "RGBA",
-  "sha256": "fc8fae9170bb754b06498e96b0dc27d674d9d028bbbaf71e799ded55d78d4eb2",
-  "decoded_rgba_sha256": "fb0a4805ac64f8c672f6ef899e4b8acf3906e205a6eab9f83609bc71642b8476",
-  "git_blob_sha": "ce397a14145ef7ee3dd14c38ffc7561ab6da87c1",
-  "tool": "ImageMagick 7.1.2-34 Q16 x64",
-  "original_tile_provenance": {
+  "decoded_rgba_sha256": "d6179d7e9c9799ea4490f526f108c30879b8c456d50080069c8a096c66e308a6",
+  "previous_asset_provenance": {
     "app": "ClipStrike",
     "asset": "assets/branding/ClipStrike.png",
-    "method": "Lossless rectangular extraction of original pixels with ImageMagick. No scaling, recoloring, tracing, generation, transparency fabrication or animal changes. Original cream outside rounded corners retained. Labels excluded.",
-    "coordinate_system": "Origin top-left; crop bounds [left, top, right, bottom), right/bottom exclusive.",
-    "source_sha256": "511411a7067620626aa7ca176ef259a994395a391128db66d7c80c9418c4e3b2",
-    "crop_bounds": [
-      32,
-      0,
-      688,
-      656
-    ],
+    "method": "Measured rounded alpha mask applied to the original 656x656 logo tile, then translated by whole pixels to center its visible bounds. Original visible RGB and masked visible RGBA were verified unchanged.",
+    "source_tile": {
+      "repository": "Gerbzz/ClipStrike",
+      "commit": "d57b36ef96ad00217060913e10eb4ecd355c6d1b",
+      "path": "assets/branding/ClipStrike.png",
+      "sha256": "b98b2fad3c7fae44a563f62012d0e2bebbfd030ddc779d0dd9ed25acae416dc4",
+      "git_blob_sha": "25f315bfe88689eca3f90b04d284ace4a9efc50a"
+    },
+    "mask_and_centering": {
+      "inset_pixels": 1.5,
+      "masked_alpha_bbox": [
+        9,
+        25,
+        627,
+        630
+      ],
+      "centered_alpha_bbox": [
+        19,
+        25,
+        637,
+        630
+      ],
+      "integer_translation": [
+        10,
+        0
+      ],
+      "padding_ltrb": [
+        19,
+        25,
+        19,
+        26
+      ],
+      "original_visible_rgb_exact": true,
+      "masked_visible_rgba_exact": true,
+      "transparent_corners": true
+    },
     "dimensions": [
       656,
       656
     ],
-    "sha256": "b98b2fad3c7fae44a563f62012d0e2bebbfd030ddc779d0dd9ed25acae416dc4",
-    "decoded_rgb_sha256": "ba9cf8121f7637f722f7c4f423cf7f61b21744bfac56f2b8ae046fbd3cdce8b6",
-    "pixel_equality_verified": true,
-    "git_blob_sha": "25f315bfe88689eca3f90b04d284ace4a9efc50a"
+    "mode": "RGBA",
+    "sha256": "fc8fae9170bb754b06498e96b0dc27d674d9d028bbbaf71e799ded55d78d4eb2",
+    "decoded_rgba_sha256": "fb0a4805ac64f8c672f6ef899e4b8acf3906e205a6eab9f83609bc71642b8476",
+    "git_blob_sha": "ce397a14145ef7ee3dd14c38ffc7561ab6da87c1",
+    "tool": "ImageMagick 7.1.2-34 Q16 x64",
+    "original_tile_provenance": {
+      "app": "ClipStrike",
+      "asset": "assets/branding/ClipStrike.png",
+      "method": "Lossless rectangular extraction of original pixels with ImageMagick. No scaling, recoloring, tracing, generation, transparency fabrication or animal changes. Original cream outside rounded corners retained. Labels excluded.",
+      "coordinate_system": "Origin top-left; crop bounds [left, top, right, bottom), right/bottom exclusive.",
+      "source_sha256": "511411a7067620626aa7ca176ef259a994395a391128db66d7c80c9418c4e3b2",
+      "crop_bounds": [
+        32,
+        0,
+        688,
+        656
+      ],
+      "dimensions": [
+        656,
+        656
+      ],
+      "sha256": "b98b2fad3c7fae44a563f62012d0e2bebbfd030ddc779d0dd9ed25acae416dc4",
+      "decoded_rgb_sha256": "ba9cf8121f7637f722f7c4f423cf7f61b21744bfac56f2b8ae046fbd3cdce8b6",
+      "pixel_equality_verified": true,
+      "git_blob_sha": "25f315bfe88689eca3f90b04d284ace4a9efc50a"
+    }
   }
 }

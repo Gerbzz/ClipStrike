@@ -47,17 +47,9 @@ use serde_json::json;
 /// Reverse-DNS app id: Linux `.desktop` file, hicolor icon name and Wayland app id.
 const APP_ID: &str = "local.clipstrike.editor";
 
-/// An original, code-drawn icon; no upstream ArtCraft marks are embedded.
+/// Approved artwork resized from its full canvas, preserving centering and padding.
 fn app_icon() -> egui::IconData {
-    let mut rgba = Vec::with_capacity(64 * 64 * 4);
-    for y in 0i32..64 {
-        for x in 0i32..64 {
-            let play = (19..=46).contains(&x) && (y - 32).abs() <= (x - 19) / 2;
-            let color = if play { [255, 154, 64, 255] } else { [24, 28, 37, 255] };
-            rgba.extend_from_slice(&color);
-        }
-    }
-    egui::IconData { rgba, width: 64, height: 64 }
+    egui::IconData { rgba: include_bytes!("../../../assets/branding/ClipStrike-128.rgba").to_vec(), width: 128, height: 128 }
 }
 
 /// Keep ClipStrike preferences, autosaves and recovery separate from ClipStrike.
