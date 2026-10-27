@@ -17,7 +17,7 @@ FilmStrike (formerly ClipStrike) is a desktop workspace for turning source foota
 
 ## Name and compatibility
 
-FilmStrike is the new display name; this is not a new project format or installation. Existing `.fcproj` projects, `.cstrike` imports, media paths, saved settings and recovery data remain unchanged. Build and launch using the existing `clipstrike` executable names below; a `filmstrike` executable is not introduced. The repository remains `Gerbzz/ClipStrike`. See [rename compatibility](docs/FILMSTRIKE_RENAME.md) for preserved identifiers.
+FilmStrike is the new display name; this is not a new project format or installation. Existing `.fcproj` projects, `.cstrike` imports, media paths, saved settings and recovery data remain unchanged. Build and launch using the existing `clipstrike` executable names below; a `filmstrike` executable is not introduced. The repository is `Gerbzz/FilmStrike`. See [rename compatibility](docs/FILMSTRIKE_RENAME.md) for preserved identifiers.
 
 ## Rust direction and migration status
 
