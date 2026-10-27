@@ -55,7 +55,7 @@ class RenameContract(unittest.TestCase):
         readme = read('README.md')
         self.assertIn('FilmStrike (formerly ClipStrike)', readme)
         self.assertIn('--bin clipstrike', readme)
-        self.assertIn('assets/branding/ClipStrike.png', readme)
+        self.assertIn('src="docs/assets/FilmStrike-readme.webp"', readme)
         self.assertIn('historical image', readme)
 
 if __name__ == '__main__':

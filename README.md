@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/branding/ClipStrike.png" alt="Approved FilmStrike kingfisher logo" width="160" height="160">
+  <img src="docs/assets/FilmStrike-readme.webp" alt="FilmStrike kingfisher icon" width="160" height="160">
 </p>
 
 <h1 align="center">FilmStrike</h1>
